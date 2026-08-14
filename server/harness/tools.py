@@ -384,12 +384,21 @@ class Toolbox:
 
     def _atomic_write(self, p: Path, content: str) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
+        # Preserve the file's existing mode; new files get the normal 0644. mkstemp creates
+        # 0600, and a 0600 server.js copied into the app image is UNREADABLE to its non-root
+        # `node` user — the container then crash-loops on boot with EACCES. (Observed live:
+        # the agent had to work around it by chmod'ing in the Dockerfile.)
+        try:
+            mode = p.stat().st_mode & 0o777
+        except OSError:
+            mode = 0o644
         fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".tmp-", suffix=p.suffix)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(content)
                 fh.flush()
                 os.fsync(fh.fileno())
+            os.chmod(tmp, mode)
             os.replace(tmp, p)          # atomic within the same filesystem
         except Exception:
             try:

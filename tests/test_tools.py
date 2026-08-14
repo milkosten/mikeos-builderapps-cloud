@@ -209,6 +209,15 @@ async def main() -> int:
     check("write_file creates", out.startswith("created public/app.js"), out[:120])
     leftovers = [f for f in os.listdir(os.path.join(WS, "public")) if f.startswith(".tmp-")]
     check("no temp files left behind", not leftovers, str(leftovers))
+    # mkstemp makes 0600; a 0600 server.js is unreadable to the app image's non-root `node`
+    # user and crash-loops the container on boot. New files must be world-readable.
+    mode = os.stat(os.path.join(WS, "public", "app.js")).st_mode & 0o777
+    check("new file is 0644, not mkstemp's 0600", mode == 0o644, oct(mode))
+    os.chmod(os.path.join(WS, "server.js"), 0o640)
+    await tb.call("edit_file", {"path": "server.js", "old_string": "const express",
+                                "new_string": "const express /* kept */"})
+    mode = os.stat(os.path.join(WS, "server.js")).st_mode & 0o777
+    check("edit preserves the existing mode", mode == 0o640, oct(mode))
     check("changed-file set is tracked",
           tb.changed.get("public/app.js") == "created"
           and tb.changed.get("server.js") == "modified", str(tb.changed))
