@@ -93,6 +93,12 @@ PROTECTED = (
     "current_work.json",
 )
 PROTECTED_PREFIXES = (".git/", "docs/assistants/")   # incl. its own SOUL: not self-editable
+# The ONE exception, and only because WE wrote it: `mirror_soul()` copies this assistant's
+# SOUL into the repo before the coding agent runs, so the persona is reviewable in a diff
+# next to the app it serves. Without this the gate refuses the beat's own bookkeeping as if
+# the agent had edited its own soul — which it still cannot do, because only the exact path
+# mirror_soul() just wrote is forgiven, and its content came from the control plane.
+SOUL_MIRRORED: list[str] = []
 MAX_CHANGED_FILES = int(os.environ.get("MAX_CHANGED_FILES", "12"))
 MAX_DIFF_BYTES = int(os.environ.get("MAX_DIFF_BYTES", "220000"))
 
@@ -616,7 +622,11 @@ def run_pi(task: str, grounding: str) -> dict:
 # 3. THE GATE — what Pi produced, before anything is committed
 # ---------------------------------------------------------------------------
 def changed_files() -> list[str]:
-    rc, out = sh(["git", "status", "--porcelain"])
+    # `-uall` is load-bearing. Plain `--porcelain` COLLAPSES an untracked directory into one
+    # entry ("?? docs/") instead of listing the files inside it, so the gate below would be
+    # matching protected-path rules against a DIRECTORY name — which matches different things
+    # than the files in it. Not hypothetical: it discarded a complete, working beat.
+    rc, out = sh(["git", "status", "--porcelain", "-uall"])
     if rc != 0:
         return []
     files = []
@@ -676,6 +686,8 @@ def gate_changes() -> dict:
         return {"ok": False, "empty": True, "files": [],
                 "detail": "the coding agent changed nothing"}
     for f in files:
+        if f in SOUL_MIRRORED:
+            continue                       # our own SOUL mirror, written before Pi ran
         if f in PROTECTED or any(f.startswith(p) for p in PROTECTED_PREFIXES):
             return {"ok": False, "files": files,
                     "detail": f"refused: `{f}` is a protected platform file — "
@@ -888,6 +900,9 @@ def mirror_soul(context: dict) -> str:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         with open(dest, "w", encoding="utf-8") as f:
             f.write(body)
+        # Recorded ONLY once we have actually written it, so the gate forgives exactly the
+        # file this function produced and nothing else under docs/assistants/.
+        SOUL_MIRRORED.append(str(rel).lstrip("/"))
         return f"wrote {rel} ({len(body)} chars) — it ships with the next commit"
     except OSError as e:
         return "soul mirror failed: " + str(e)[:200]

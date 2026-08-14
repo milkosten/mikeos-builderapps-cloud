@@ -515,9 +515,16 @@ def cmd_activity(args) -> int:
 
 
 def cmd_beat(args) -> int:
-    """Kick one beat now, then (by default) follow what it does."""
-    r = api("POST", f"/api/projects/{args.project}/assistants/{args.assistant}/beat", {})
-    print(f"{GRN('beat')} {r.get('beat_id')} started")
+    """Kick one beat now, then (by default) follow what it does.
+
+    `--task` is the CLI's half of the browser's `@Developer <text>`: same endpoint, same
+    body, same beat. Without it the assistant decides for itself what is worth doing; with
+    it, a human already has.
+    """
+    body = {"task": args.task} if args.task else {}
+    r = api("POST", f"/api/projects/{args.project}/assistants/{args.assistant}/beat", body)
+    print(f"{GRN('beat')} {r.get('beat_id')} started"
+          + (f"  — asked: {args.task[:100]}" if args.task else ""))
     if args.no_follow:
         return 0
     args.limit, args.interval, args.follow = 3, 2.5, True
@@ -620,6 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("beat", help="run one beat now and watch it work")
     s.add_argument("project")
     s.add_argument("assistant", type=int)
+    s.add_argument("--task", help="what to ask it to do — the CLI's `@Name <text>`")
     s.add_argument("--no-follow", action="store_true")
     s.add_argument("--wait", type=float, default=1800, help="seconds to follow")
     s.set_defaults(fn=cmd_beat)

@@ -104,6 +104,50 @@ def main() -> int:
         git(repo, "reset", "-q")
         git(repo, "checkout", "--", ".")
 
+        # REGRESSION — this one cost a real, complete beat. `git status --porcelain`
+        # COLLAPSES an untracked directory into a single entry, so a brand-new
+        # `docs/assistants/` was reported as the directory itself, matched the
+        # protected-prefix rule, and the gate discarded an entire working change. Two things
+        # must hold: files are listed individually (`-uall`), and the SOUL mirror that the
+        # BEAT PROGRAM itself wrote is not mistaken for the agent reaching into a protected
+        # path.
+        # It has to be a repo where `docs/assistants/` does NOT yet exist in HEAD — that is
+        # the whole point: the directory is brand new, so git collapses it.
+        with tempfile.TemporaryDirectory() as tmp2:
+            fresh = os.path.join(tmp2, "repo")
+            os.makedirs(fresh)
+            git(fresh, "init", "-q")
+            git(fresh, "config", "user.email", "t@t")
+            git(fresh, "config", "user.name", "t")
+            os.makedirs(os.path.join(fresh, "docs"))
+            for rel, body in (("server.js", "const a = 1;\n"), ("docs/VISION.md", "v\n")):
+                with open(os.path.join(fresh, rel), "w") as f:
+                    f.write(body)
+            git(fresh, "add", "-A")
+            git(fresh, "commit", "-qm", "init")
+            beat.REPO = fresh
+            beat.SOUL_MIRRORED.clear()
+            os.makedirs(os.path.join(fresh, "docs", "assistants"))
+            with open(os.path.join(fresh, "docs/assistants/developer.SOUL.md"), "w") as f:
+                f.write("# soul\n")
+            beat.SOUL_MIRRORED.append("docs/assistants/developer.SOUL.md")
+            with open(os.path.join(fresh, "server.js"), "w") as f:
+                f.write("const a = 1;\nconst feature = true;\n")
+            g = beat.gate_changes()
+            check("a NEW untracked directory is listed as its FILES, not as the directory",
+                  "docs/assistants/developer.SOUL.md" in g.get("files", []),
+                  f"got {g.get('files')} — plain --porcelain would say 'docs/assistants/'")
+            check("the beat's own SOUL mirror does not trip the protected-path rule",
+                  g.get("ok"), g.get("detail", ""))
+            with open(os.path.join(fresh, "docs/assistants/sneaky.md"), "w") as f:
+                f.write("x\n")
+            g = beat.gate_changes()
+            check("but any OTHER file under docs/assistants/ is still refused",
+                  not g.get("ok") and "protected" in g.get("detail", ""),
+                  "the agent still cannot edit its own soul")
+            beat.SOUL_MIRRORED.clear()
+        beat.REPO = repo
+
         # The agent was TOLD not to commit, but it has a bash tool and "told not to" is a
         # request. If it commits anyway, `git status` is clean and a naive gate would say
         # "changed nothing" and throw the work away. It must be folded back instead.
