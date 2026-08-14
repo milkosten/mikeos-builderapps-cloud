@@ -167,6 +167,20 @@ def test_no_secret_leak():
     check("the log tail is capped", len(tail) < 8400 and tail.endswith("x"),
           "the TAIL is kept — the crash is at the end, not the beginning")
 
+    # Measured on the first real failure: one MODULE_NOT_FOUND stack, printed four times by a
+    # crash-looping container, ate 3.5 KB of an 8 KB envelope.
+    loop = ("Error: Cannot find module './lib/notes-store'\n"
+            "    at Module._load (node:internal/modules/cjs/loader:1038:27)\n"
+            "Node.js v20.20.2\n") * 12 + "MEANWHILE: redis connection refused\n"
+    squashed = deployer._collapse_repeats(loop)
+    check("a crash loop is collapsed", squashed.count("Cannot find module") == 2,
+          f"kept {squashed.count('Cannot find module')} copies")
+    check("the collapse is reported, not silent", "collapsed" in squashed,
+          "'it printed this 30 times' IS the diagnosis — the container is crash-looping")
+    check("a line the repeats would have pushed out survives",
+          "redis connection refused" in squashed,
+          "the whole point: the budget goes to DISTINCT evidence")
+
 
 def test_bounds_are_declared():
     from server import repair, shipper

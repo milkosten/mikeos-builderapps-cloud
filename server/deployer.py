@@ -438,8 +438,41 @@ def _redact_logs(text: str, secrets: Optional[dict] = None) -> str:
     return _URL_CRED_RE.sub(lambda m: m.group("scheme") + "***:***@", out)
 
 
+def _collapse_repeats(text: str, keep: int = 2) -> str:
+    """Collapse lines a crash-LOOPING container has already said.
+
+    Measured, not guessed: the first real failed deploy spent 3.5 KB of its 8 KB envelope on
+    ONE `MODULE_NOT_FOUND` stack printed four times, because `restart: unless-stopped` keeps
+    restarting a container that dies at boot. That budget is the assistant's only view of the
+    problem, so filling it with the same trace over and over actively costs it the context it
+    needs — and the surrounding lines, which might have named a SECOND fault, are what get
+    pushed out.
+
+    The count of what was collapsed stays, because "it printed this 40 times" is itself the
+    diagnosis: the container is not merely broken, it is crash-looping.
+    """
+    kept: list[str] = []
+    seen: dict[str, int] = {}
+    dropped = 0
+    for line in (text or "").splitlines():
+        key = line.strip()
+        if not key:
+            kept.append(line)
+            continue
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > keep:
+            dropped += 1
+            continue
+        kept.append(line)
+    if dropped:
+        kept.append(f"…[{dropped} repeated log line(s) collapsed — the container is "
+                    f"restarting in a loop and printing the same failure each time]")
+    return "\n".join(kept)
+
+
 def _tail(text: str, limit: int = _MAX_ENVELOPE_LOG) -> str:
-    text = text or ""
+    """The LAST `limit` bytes. The crash is at the end of a log, never at the beginning."""
+    text = _collapse_repeats(text or "")
     return text if len(text) <= limit else "…(truncated)…\n" + text[-limit:]
 
 
