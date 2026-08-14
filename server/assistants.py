@@ -542,9 +542,13 @@ async def start_beat(assistant_id: int, project_id: str, trigger_kind: str) -> i
 async def finish_beat(beat_id: int, *, status: str, thought: str = "",
                       actions: Optional[list] = None, log: str = "", tokens: int = 0,
                       cost_usd: float = 0.0, duration_ms: int = 0) -> None:
+    # `cost_usd` is numeric(12,6) and asyncpg's numeric codec wants a Decimal, not a float.
+    # Declaring the parameter as float8 and casting in SQL lets the caller pass an ordinary
+    # float without a DataError — and without the caller having to know the column type.
     res = await pool().execute(
         "UPDATE builderapps.assistant_beats SET status=$2, thought=$3, actions=$4::jsonb, "
-        "log=$5, tokens=$6, cost_usd=$7, duration_ms=$8, finished_at=now() WHERE id=$1",
+        "log=$5, tokens=$6, cost_usd=$7::float8::numeric, duration_ms=$8, "
+        "finished_at=now() WHERE id=$1",
         beat_id, status[:16], (thought or "")[:8000], json.dumps(actions or []),
         (log or "")[:20000], int(tokens or 0), float(cost_usd or 0.0), int(duration_ms or 0))
     if res != "UPDATE 1":
