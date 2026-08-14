@@ -64,6 +64,13 @@ services:
       ASSISTANT_CONTROL_URL: http://mikeos-builderapps:8000
       ASSISTANT_WORKSPACES_ROOT: /opt/builderapps/assistants
       ASSISTANT_RUNTIME_CONTEXT: /opt/mikeos-builderapps-cloud/assistant-runtime
+      # --- phase 30: the assistant that SHIPS CODE ---------------------------------
+      # A coding beat runs a whole Pi session, then a docker build, then the health gate,
+      # so the outer wall is minutes rather than seconds.
+      ASSISTANT_BEAT_TIMEOUT_SEC: ${ASSISTANT_BEAT_TIMEOUT_SEC:-2400}
+      # THE spend backstop. Pi has no step, turn or cost cap of its own, so the control
+      # plane's LLM proxy stops answering once one beat has spent this much.
+      ASSISTANT_BEAT_COST_CAP_USD: ${ASSISTANT_BEAT_COST_CAP_USD:-1.50}
     # Docker's default 10s SIGTERM->SIGKILL window is shorter than uvicorn's graceful
     # shutdown, so the app was being killed before its lifespan shutdown could run and
     # RELEASE ownership of in-flight runs. With room to shut down cleanly, an interrupted run

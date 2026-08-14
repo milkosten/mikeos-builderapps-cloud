@@ -56,13 +56,19 @@ ASSISTANT_ROOT = os.environ.get("ASSISTANT_WORKSPACES_ROOT", "/opt/builderapps/a
 NETWORK = os.environ.get("DEPLOY_NETWORK", "deploy_default")
 CONTROL_URL = os.environ.get("ASSISTANT_CONTROL_URL", "http://mikeos-builderapps:8000")
 
-BEAT_TIMEOUT_SEC = int(os.environ.get("ASSISTANT_BEAT_TIMEOUT_SEC", "420"))
+# A beat that CODES is legitimately long: perceive (~20s) + one reasoning round (~25s) +
+# a full Pi session (up to 780s) + commit/push + waiting out a docker build and the health
+# gate (up to 900s). 420s was right when a beat could only comment. The container enforces
+# its own inner limits (PI_TIMEOUT_SEC, DEPLOY_WAIT_SEC); this is the outer wall.
+BEAT_TIMEOUT_SEC = int(os.environ.get("ASSISTANT_BEAT_TIMEOUT_SEC", "2400"))
 SCHED_INTERVAL_SEC = float(os.environ.get("ASSISTANT_SCHED_SEC", "60"))
 ENABLED = os.environ.get("ASSISTANTS_ENABLED", "1").strip() not in ("0", "false", "no")
 # The container runs as this uid; its workspace dir is chowned to match.
 RUN_UID = int(os.environ.get("ASSISTANT_UID", "10001"))
 
-MEM_LIMIT = os.environ.get("ASSISTANT_MEM", "1g")
+# Node + a coding agent holding a repo's worth of context needs more headroom than the
+# comment-only beat did; an OOM-killed beat looks like a mysterious rc=137 with no report.
+MEM_LIMIT = os.environ.get("ASSISTANT_MEM", "2g")
 CPU_LIMIT = os.environ.get("ASSISTANT_CPUS", "1")
 PIDS_LIMIT = os.environ.get("ASSISTANT_PIDS", "256")
 
@@ -190,7 +196,10 @@ async def launch_beat(assistant: dict, beat_id: int, *, trigger_kind: str) -> tu
         "--user", f"{RUN_UID}:{RUN_UID}",
         "--memory", MEM_LIMIT, "--memory-swap", MEM_LIMIT,
         "--cpus", str(CPU_LIMIT), "--pids-limit", str(PIDS_LIMIT),
-        "--read-only", "--tmpfs", "/tmp:rw,size=256m,mode=1777",
+        # /tmp is the ONLY writable place outside the checkout: Pi's models.json, the
+        # grounding file, and node's scratch all live there. Still a tmpfs on a read-only
+        # rootfs — nothing an agent writes outside its own repo survives the beat.
+        "--read-only", "--tmpfs", "/tmp:rw,size=512m,mode=1777",
         # --- the one writable thing it has: its own checkout ----------------
         "-v", f"{ws}:/workspace",
         # --- identity + config ---------------------------------------------
