@@ -325,7 +325,7 @@ async def kick(assistant: dict) -> Optional[tuple[dict, int]]:
     runs `execute_beat` in the background so the HTTP request does not block for a minute.
     Returns None when a beat is already in flight, so two impatient clicks can never
     double-run an assistant."""
-    claimed = await A.claim(int(assistant["id"]), runner.INSTANCE_ID)
+    claimed = await A.claim(int(assistant["id"]), runner.INSTANCE_ID, any_status=True)
     if not claimed:
         return None
     return claimed, await open_beat(claimed, "manual")
@@ -383,7 +383,7 @@ async def perceive(assistant: dict) -> dict:
             "url": f"https://{project_id}.{os.environ.get('SITES_BASE', 'builderapps.osmike.com')}/",
         },
         "latest_run": {
-            "kind": None, "status": latest.get("status"),
+            "status": latest.get("status"),
             "summary": (latest.get("summary") or "")[:600],
             "error": (latest.get("error") or "")[:600],
             "steps": [{"name": s.get("name"), "status": s.get("status")} for s in steps][-24:],

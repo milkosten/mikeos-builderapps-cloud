@@ -318,16 +318,22 @@ async def assistant_act(body: ActBody, x_assistant_token: str = Header("")) -> d
 async def assistant_record_beat(body: BeatBody, request: Request,
                                 x_assistant_token: str = Header("")) -> dict:
     a = await _from_token(x_assistant_token)
-    beat_id = request.headers.get("x-beat-id") or ""
-    # The container knows its beat id from the env; accept it from the body path too.
-    if not beat_id:
+    raw = (request.headers.get("x-beat-id") or "").strip()
+    beat_id: Optional[int] = None
+    if raw.isdigit():
+        # A beat container may only close ITS OWN beat — a token is scoped to one assistant,
+        # and a beat id is not a capability.
+        if not await A.beat_belongs_to(int(raw), int(a["id"])):
+            raise HTTPException(status_code=403, detail="that beat is not yours")
+        beat_id = int(raw)
+    if beat_id is None:
         beats = await A.list_beats(int(a["id"]), 1)
         running = [b for b in beats if b.get("status") == "running"]
         if not running:
             raise HTTPException(status_code=409, detail="no running beat to record")
-        beat_id = str(running[0]["id"])
+        beat_id = int(running[0]["id"])
     status = body.status if body.status in ("done", "skipped", "failed") else "done"
-    await A.finish_beat(int(beat_id), status=status, thought=body.thought,
+    await A.finish_beat(beat_id, status=status, thought=body.thought,
                         actions=body.actions, log=body.log, tokens=body.tokens,
                         cost_usd=body.cost_usd, duration_ms=body.duration_ms)
-    return {"ok": True, "beat_id": int(beat_id)}
+    return {"ok": True, "beat_id": beat_id}

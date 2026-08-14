@@ -465,12 +465,18 @@ async def due_now(limit: int = 20) -> list[dict]:
     return [_row(r) for r in rows]
 
 
-async def claim(assistant_id: int, owner: str) -> Optional[dict]:
+async def claim(assistant_id: int, owner: str, *, any_status: bool = False) -> Optional[dict]:
     """Atomically take a due assistant. This single UPDATE is the cross-process mutex — two
-    schedulers racing on the same assistant, exactly one wins. Same shape as `claim_run`."""
+    schedulers racing on the same assistant, exactly one wins. Same shape as `claim_run`.
+
+    `any_status=True` is the MANUAL path ("Beat now"): pressing it on a paused assistant must
+    run a beat, otherwise the button silently does nothing and the assistant reads as broken.
+    Pausing stops the *schedule*, it is not a prohibition on being asked directly.
+    """
+    status_clause = "" if any_status else " AND status='active'"
     row = await pool().fetchrow(
         "UPDATE builderapps.assistants SET beat_owner=$2, beat_claimed_at=now() "
-        "WHERE id=$1 AND status='active' AND (beat_owner='' OR beat_owner IS NULL) "
+        "WHERE id=$1" + status_clause + " AND (beat_owner='' OR beat_owner IS NULL) "
         f"RETURNING {_COLS}", assistant_id, owner)
     return _row(row) if row else None
 
@@ -501,14 +507,6 @@ async def sweep_orphaned_claims(owner_not: str) -> int:
         return int(str(res).rsplit(" ", 1)[-1])
     except Exception:  # noqa: BLE001
         return 0
-
-
-async def force_due(assistant_id: int, project_id: str) -> bool:
-    """`POST /beat` — make it due right now regardless of schedule or status."""
-    res = await pool().execute(
-        "UPDATE builderapps.assistants SET next_beat_at=now(), updated_at=now() "
-        "WHERE id=$1 AND project_id=$2", assistant_id, project_id)
-    return res == "UPDATE 1"
 
 
 # ---- beats ----------------------------------------------------------------
@@ -558,6 +556,14 @@ async def list_beats(assistant_id: int, limit: int = 40) -> list[dict]:
         f"SELECT {_BEAT_COLS} FROM builderapps.assistant_beats WHERE assistant_id=$1 "
         "ORDER BY ts DESC LIMIT $2", assistant_id, max(1, min(int(limit), 200)))
     return [_beat_row(r) for r in rows]
+
+
+async def beat_belongs_to(beat_id: int, assistant_id: int) -> bool:
+    """A beat container may only close ITS OWN beat. Without this, a leaked token could
+    finish another assistant's in-flight beat with whatever text it liked."""
+    owner = await pool().fetchval(
+        "SELECT assistant_id FROM builderapps.assistant_beats WHERE id=$1", beat_id)
+    return owner is not None and int(owner) == int(assistant_id)
 
 
 async def last_beat(assistant_id: int) -> Optional[dict]:
