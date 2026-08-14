@@ -113,9 +113,13 @@ def safe_path(project_id: str, relpath: str) -> Path:
     rel = (relpath or "").strip()
     if "\x00" in rel:
         raise BadPath("invalid path")
-    # An absolute path is rejected outright rather than quietly re-rooted — silently turning
-    # "/etc/passwd" into "<workspace>/etc/passwd" would answer 404 and hide the attempt.
-    if rel.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", rel):
+    # A bare "/" is the natural UI idiom for "the repo root" and cannot escape anything, so
+    # it is accepted as the empty path. Every OTHER absolute path is rejected outright rather
+    # than quietly re-rooted — silently turning "/etc/passwd" into "<workspace>/etc/passwd"
+    # would answer 404 and hide the attempt.
+    if rel == "/":
+        rel = ""
+    elif rel.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", rel):
         raise BadPath("absolute paths are not allowed")
     candidate = (root / rel).resolve()
     if candidate != root and not candidate.is_relative_to(root):
