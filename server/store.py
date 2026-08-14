@@ -326,8 +326,25 @@ async def get_messages(project_id: str) -> list[dict]:
 
 async def put_messages(project_id: str, messages: list[dict]) -> int:
     """Replace the project's chat thread with the sanitized `messages`. Returns the count
-    actually stored (never-trust-200: the write is verified to have affected a row)."""
+    actually stored (never-trust-200: the write is verified to have affected a row).
+
+    Guard: an EMPTY thread never overwrites a non-empty one. This endpoint has replace
+    semantics, so a client that PUTs its (still empty) local state on mount — before its
+    restore GET has come back — would otherwise destroy exactly the history this table
+    exists to protect. Losing the user's history is far worse than ignoring one no-op write,
+    so an empty PUT against an existing thread is a no-op.
+    """
     clean = sanitize_messages(messages)
+    if not clean:
+        existing = await pool().fetchval(
+            "SELECT jsonb_array_length(thread) FROM builderapps.messages WHERE project_id=$1",
+            project_id,
+        )
+        if existing:
+            logger.warning(
+                "ignoring empty messages PUT for %s — it would have wiped %d stored entries",
+                project_id, existing)
+            return int(existing)
     res = await pool().execute(
         "INSERT INTO builderapps.messages(project_id, thread, updated_at) "
         "VALUES ($1, $2::jsonb, now()) "
