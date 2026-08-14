@@ -130,11 +130,18 @@ ACT_FLUSH_SEC = float(os.environ.get("ACTIVITY_FLUSH_SEC", "1.5"))
 
 def activity(kind: str, icon: str, text: str, detail: str = "", ok=None,
              flush: bool = False) -> None:
-    """Queue one activity line; batched so a token-by-token stream is not one POST per word."""
-    entry = {"kind": kind, "icon": icon, "text": redact(text)[:400],
+    """Queue one activity line; batched so a token-by-token stream is not one POST per word.
+
+    A `text` line is the agent SPEAKING — its reasoning and its summary of what it did — and
+    that is what a human actually reads in the pane, so it gets room. 400 chars is the right
+    size for a tool label and the wrong size for a paragraph: it cut a conclusion mid-word
+    and hid the remainder behind a hover. The control plane clamps to the same limits.
+    """
+    cap, dcap = (4000, 4000) if kind == "text" else (400, 600)
+    entry = {"kind": kind, "icon": icon, "text": redact(text)[:cap],
              "ts": time.strftime("%H:%M:%S")}
     if detail:
-        entry["detail"] = redact(detail)[:600]
+        entry["detail"] = redact(detail)[:dcap]
     if ok is not None:
         entry["ok"] = bool(ok)
     _ACT_BUF.append(entry)
@@ -958,8 +965,9 @@ def main() -> int:
         cost = float(r.get("cost_usd") or 0.0)
         log(f"reason: {len(planned)} action(s) planned, {tokens} tokens, ${cost:.4f}")
         if thought:
-            activity("text", "🧠", thought[:300],
-                     thought[300:1500] if len(thought) > 300 else "", flush=True)
+            # Whole, in one field. Split across text+detail it broke mid-word and the rest
+            # was only reachable by hovering — see activity()'s note.
+            activity("text", "🧠", thought[:4000], flush=True)
 
         # --- act ------------------------------------------------------------
         for action in planned[:2]:
