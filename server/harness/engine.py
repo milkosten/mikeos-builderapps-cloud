@@ -139,6 +139,22 @@ def _public_state(state: dict) -> dict:
             if isinstance(v, (str, int, bool)) and not _SECRETISH.search(k)}
 
 
+def redact(state: dict, text: str) -> str:
+    """Strip this project's own secrets out of anything we persist or stream.
+
+    A failed step's message is not hand-written — it can be a `compose up` dump or a tail of
+    the app's container logs, and an app that logs its own DATABASE_URL puts the project's
+    Postgres password straight into the step log, the run summary and the SSE stream. We know
+    the exact secret values, so replace them literally rather than trusting a pattern.
+    """
+    if not text:
+        return text
+    for key, val in (state or {}).items():
+        if isinstance(val, str) and len(val) >= 8 and _SECRETISH.search(key):
+            text = text.replace(val, "***")
+    return text
+
+
 async def _prior_steps(run_id: int) -> dict[int, dict]:
     """idx -> step row for everything this run has already recorded.
 
@@ -218,6 +234,7 @@ async def run_partial(project_id: str, run_id: int, steps: list[Step],
                 log = result
             elif isinstance(result, dict):
                 log = json.dumps(result)[:2000]
+            log = redact(ctx.state, log)
             await store.upsert_step(run_id, idx, name, "done", log)
             _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "done",
                                 {"step_name": name})
@@ -236,7 +253,7 @@ async def run_partial(project_id: str, run_id: int, steps: list[Step],
             # The step gave up but cleaned up after itself (see pipeline._s_feature): the
             # workspace is back at the last good commit and the last-good build is on the air.
             # Record it, tell the client honestly, and keep building the rest of the app.
-            await _record_skip(ctx, idx, name, e.reason, e.label or name)
+            await _record_skip(ctx, idx, name, redact(ctx.state, e.reason), e.label or name)
             continue
         except asyncio.TimeoutError:
             msg = (f"step timed out after {step_timeout(name):.0f}s "
@@ -259,13 +276,14 @@ async def run_partial(project_id: str, run_id: int, steps: list[Step],
                 # putting the tree back to its last good state so the next feature builds on
                 # something that works.
                 await _safe_revert(ctx)
-                await _record_skip(ctx, idx, name, str(e)[:300], name)
+                await _record_skip(ctx, idx, name, redact(ctx.state, str(e))[:300], name)
                 continue
-            await store.upsert_step(run_id, idx, name, "failed", str(e)[:8000])
+            msg = redact(ctx.state, str(e))
+            await store.upsert_step(run_id, idx, name, "failed", msg[:8000])
             _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "failed",
-                                {"step_name": name, "error": str(e)[:500]})
-            emit({"type": "error", "idx": idx, "name": name, "message": str(e)})
-            await store.finish_run(run_id, "failed", f"{name}: {e}", run_summary(ctx.state))
+                                {"step_name": name, "error": msg[:500]})
+            emit({"type": "error", "idx": idx, "name": name, "message": msg})
+            await store.finish_run(run_id, "failed", f"{name}: {msg}", run_summary(ctx.state))
             raise
 
     if finish:
