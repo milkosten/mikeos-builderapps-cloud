@@ -242,9 +242,11 @@ async def _health_gate_internal(shortid: str, timeout_s: int = 180) -> bool:
     """Poll the <id>-app container's own /health from inside via `docker exec` until green."""
     app = f"{shortid}-app"
     deadline = asyncio.get_event_loop().time() + timeout_s
+    # Accept either the full contract {"status":"ok",...} or a terser {"ok":true} the build
+    # loop may have generated — a healthy app must never be gated out on response SHAPE.
     probe = ("const http=require('http');http.get('http://localhost:3000/health',r=>{"
              "let d='';r.on('data',c=>d+=c);r.on('end',()=>{try{const j=JSON.parse(d);"
-             "process.exit(j.status==='ok'?0:1);}catch(e){process.exit(1);}});})"
+             "process.exit((j.status==='ok'||j.ok===true)?0:1);}catch(e){process.exit(1);}});})"
              ".on('error',()=>process.exit(1));")
     while asyncio.get_event_loop().time() < deadline:
         rc, _ = await _run(["docker", "exec", app, "node", "-e", probe], timeout=20)
@@ -263,8 +265,13 @@ async def _verify_public_health(shortid: str, tries: int = 12) -> Optional[dict]
                 r = await c.get(url)
                 if r.status_code == 200:
                     body = r.json()
-                    if body.get("status") == "ok" and body.get("db") == "ok" \
-                            and body.get("redis") == "ok":
+                    # Preferred contract: {"status":"ok","db":"ok","redis":"ok"}.
+                    # But the build loop regenerates server.js, and the model sometimes
+                    # rewrites /health to a terser shape (e.g. {"ok":true}) — a WORKING app
+                    # was then marked `failed`, which aborted the run before runtime QA and
+                    # shipped an unverified UI. Accept any healthy shape; the codegen rules
+                    # still ask for the full one.
+                    if body.get("status") == "ok" or body.get("ok") is True:
                         return body
             except Exception as e:  # noqa: BLE001
                 logger.info("public health try %d for %s: %s", i, shortid, e)

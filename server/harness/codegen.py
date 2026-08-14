@@ -36,7 +36,17 @@ NO_SAAS_RULE = (
     "host, no remote images. Everything is inlined or served locally.\n"
     "4. All SQL is parameterized ($1,$2,...). Migrations are idempotent (IF NOT EXISTS). Never "
     "use a reserved SQL keyword as a column name. Timestamps are timestamptz / ISO-8601.\n"
-    "5. Cap request body sizes; never read an unbounded blob into memory."
+    "5. Cap request body sizes; never read an unbounded blob into memory.\n"
+    "6. PLATFORM CONTRACT — `GET /health` belongs to the hosting platform, NOT to the app. It MUST "
+    "always exist and MUST respond with exactly this shape: "
+    "{\"status\":\"ok\",\"db\":\"ok\",\"redis\":\"ok\"} (each value is \"ok\" only when that datastore "
+    "actually answered; use \"down\" otherwise). Never rename it, never change those field names, and "
+    "never drop it when you rewrite server.js. The deployment health-gate reads this exact shape — "
+    "change it and a perfectly working app gets reported as FAILED and never finishes building.\n"
+    "7. Keep client and server response shapes consistent. When the frontend consumes one of your "
+    "own JSON endpoints, unwrap the object before iterating: an endpoint returning {\"items\":[...]} "
+    "must be read as `data.items`, never iterated directly — `data.forEach(...)` on an object throws "
+    "\"forEach is not a function\" and the list silently never renders."
 )
 
 

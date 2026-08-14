@@ -59,7 +59,13 @@ _HISTORY_RUNS = 200      # how many runs' buffers to keep in memory at once
 # means LLM calls + docker builds, so recovery is throttled — it must never stampede the box
 # and take the live control plane down with it. Interactive creates are NOT gated: recovery is
 # background work and must yield to a user who is watching a build right now.
-_RESUME_SLOTS = asyncio.Semaphore(int(os.environ.get("BUILDERAPPS_RESUME_CONCURRENCY", "3")))
+#
+# Tuned DOWN to 2 after observing the first live sweep: each resumed build runs a docker
+# build plus a health gate with a fixed 180s budget, and with three recoveries in flight
+# (alongside interactive builds) apps were coming up just *after* their gate expired — the
+# step failed even though the container went healthy moments later. Recovery must not
+# manufacture failures; if a sweep is slower as a result, that is the correct trade.
+_RESUME_SLOTS = asyncio.Semaphore(int(os.environ.get("BUILDERAPPS_RESUME_CONCURRENCY", "2")))
 
 # run_id -> the task actually executing the pipeline (STRONG refs; never GC'd mid-flight)
 _active: dict[int, asyncio.Task] = {}
