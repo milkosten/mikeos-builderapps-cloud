@@ -197,7 +197,10 @@ async def close_session(sid: str) -> bool:
         async with httpx.AsyncClient(timeout=15, verify=False, auth=_auth()) as c:
             r = await c.delete(f"{chrome.CHROME_POOL_URL}/session/{sid}")
         # 404 means it is already gone, which is the state we wanted.
-        return r.status_code < 400 or r.status_code == 404
+        if r.status_code >= 300 and r.status_code != 404:
+            logger.info("browser: close of session %s returned HTTP %s", sid, r.status_code)
+            return False
+        return True
     except Exception as e:  # noqa: BLE001 — a close that fails must not raise into a beat
         logger.info("browser: could not close session %s: %s", sid, e)
         return False

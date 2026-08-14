@@ -288,11 +288,17 @@ class Browser:
         return self
 
     async def __aexit__(self, *exc) -> bool:
+        # DELETE /session/{id} — there is NO `POST .../close` (it 404s, and the session
+        # then sits on the SHARED pool until its 30-min TTL). Log a bad status: the silent
+        # swallow here is exactly what hid this leak everywhere else.
         try:
             if self.sid and self._client:
-                await self._client.post(f"{chrome.CHROME_POOL_URL}/session/{self.sid}/close")
-        except Exception:  # noqa: BLE001
-            pass
+                r = await self._client.delete(f"{chrome.CHROME_POOL_URL}/session/{self.sid}")
+                if r.status_code >= 300 and r.status_code != 404:
+                    logger.info("chrome-pool: close of session %s returned HTTP %s",
+                                self.sid, r.status_code)
+        except Exception as e:  # noqa: BLE001 — never raise out of cleanup
+            logger.info("chrome-pool: close of session %s failed: %s", self.sid, e)
         if self._client:
             await self._client.aclose()
         return False

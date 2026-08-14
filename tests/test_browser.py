@@ -177,6 +177,22 @@ check("chrome.py closes with DELETE /session/{id}",
       'c.delete(f"{CHROME_POOL_URL}/session/{sid}")' in chrome_src)
 check("the proxy closes with DELETE too",
       'c.delete(f"{chrome.CHROME_POOL_URL}/session/{sid}")' in bp_src)
+
+# The two-file check above is what let the leak survive in server/harness/semantic_qa.py:
+# it closed with POST in a file nobody was grepping. Sweep the WHOLE server tree instead,
+# so any new client inherits the guard automatically.
+_stray = []
+for _dir, _, _files in os.walk(os.path.join(ROOT, "server")):
+    for _f in _files:
+        if not _f.endswith(".py"):
+            continue
+        _p = os.path.join(_dir, _f)
+        _src = open(_p, encoding="utf-8").read()
+        # a REQUEST to .../close (any verb other than delete); docstrings are fine
+        if re.search(r"\.(post|get|put|patch)\(\s*f?\"[^\"]*/session/\{[^}]+\}/close", _src):
+            _stray.append(os.path.relpath(_p, ROOT))
+check("NO file under server/ requests /session/{id}/close (found: %s)" % (_stray or "none"),
+      not _stray)
 api_src = open(os.path.join(ROOT, "server", "assistant_api.py"), encoding="utf-8").read()
 check("a recorded beat releases its sessions",
       "close_beat_sessions(beat_id)" in api_src)
