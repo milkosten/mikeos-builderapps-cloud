@@ -384,12 +384,13 @@ class Toolbox:
 
     def _atomic_write(self, p: Path, content: str) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
-        # Preserve the file's existing mode; new files get the normal 0644. mkstemp creates
-        # 0600, and a 0600 server.js copied into the app image is UNREADABLE to its non-root
-        # `node` user — the container then crash-loops on boot with EACCES. (Observed live:
-        # the agent had to work around it by chmod'ing in the Dockerfile.)
+        # Every file here is copied into the project's image and read by its non-root `node`
+        # user, so it MUST stay world-readable. mkstemp creates 0600, and a 0600 server.js
+        # crash-loops the container on boot with EACCES (observed live — the agent had to work
+        # around it by chmod'ing in the Dockerfile). Keep any extra bits the file already had
+        # (e.g. +x on a script) but always force owner-write + everyone-read.
         try:
-            mode = p.stat().st_mode & 0o777
+            mode = (p.stat().st_mode & 0o777) | 0o644
         except OSError:
             mode = 0o644
         fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".tmp-", suffix=p.suffix)

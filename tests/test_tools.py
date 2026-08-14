@@ -213,11 +213,18 @@ async def main() -> int:
     # user and crash-loops the container on boot. New files must be world-readable.
     mode = os.stat(os.path.join(WS, "public", "app.js")).st_mode & 0o777
     check("new file is 0644, not mkstemp's 0600", mode == 0o644, oct(mode))
-    os.chmod(os.path.join(WS, "server.js"), 0o640)
+    os.chmod(os.path.join(WS, "server.js"), 0o600)
     await tb.call("edit_file", {"path": "server.js", "old_string": "const express",
                                 "new_string": "const express /* kept */"})
     mode = os.stat(os.path.join(WS, "server.js")).st_mode & 0o777
-    check("edit preserves the existing mode", mode == 0o640, oct(mode))
+    check("edit forces world-readable on an owner-only file", mode == 0o644, oct(mode))
+    with open(os.path.join(WS, "public", "hook.js"), "w") as fh:
+        fh.write("const a = 1;\n")
+    os.chmod(os.path.join(WS, "public", "hook.js"), 0o755)
+    await tb.call("edit_file", {"path": "public/hook.js", "old_string": "const a = 1;",
+                                "new_string": "const a = 2;"})
+    mode = os.stat(os.path.join(WS, "public", "hook.js")).st_mode & 0o777
+    check("edit keeps extra bits the file already had", mode == 0o755, oct(mode))
     check("changed-file set is tracked",
           tb.changed.get("public/app.js") == "created"
           and tb.changed.get("server.js") == "modified", str(tb.changed))

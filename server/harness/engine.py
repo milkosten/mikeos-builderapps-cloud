@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,6 +88,18 @@ def _write_current_work(project_id: str, run_id: int, steps: list[Step],
         (d / "current_work.json").write_text(json.dumps(payload, indent=2), "utf-8")
     except Exception as e:  # noqa: BLE001
         logger.info("current_work.json write skipped: %s", e)
+
+
+# ctx.state carries the project's db_password, app_secret and the user's Gitea token so the
+# steps can use them. The terminal `done` SSE event must NOT ship them to the browser (they
+# would land in its memory, in any client-side log, and in whatever captures the stream) —
+# the owner has a dedicated, masked /secrets endpoint for that.
+_SECRETISH = re.compile(r"(password|secret|token|key|credential)", re.I)
+
+
+def _public_state(state: dict) -> dict:
+    return {k: v for k, v in state.items()
+            if isinstance(v, (str, int, bool)) and not _SECRETISH.search(k)}
 
 
 async def _already_done(run_id: int, idx: int) -> bool:
@@ -172,7 +185,7 @@ async def run_partial(project_id: str, run_id: int, steps: list[Step],
     if finish:
         await store.finish_run(run_id, "done")
         emit({"type": "done", "project_id": project_id, "run_id": run_id,
-              "state": {k: v for k, v in ctx.state.items() if isinstance(v, (str, int, bool))}})
+              "state": _public_state(ctx.state)})
     return ctx.state
 
 
