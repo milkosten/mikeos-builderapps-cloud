@@ -20,6 +20,7 @@ app is* and writes *app code*. The SSE vocabulary the SPA consumes is preserved;
 more step_start/step_done pairs plus `commit{...}` and `qa{...}` events.
 """
 import logging
+import os
 import secrets
 from pathlib import Path
 from typing import Callable, Optional
@@ -180,8 +181,23 @@ def _s_data_layer(brief: str):
     return step
 
 
-async def _redeploy(ctx: Ctx) -> None:
+# Fault injection for verifying graceful degradation on a REAL build (phase 28). Off unless
+# BUILDERAPPS_FAULT_FEATURE is set, and it must name BOTH the project and the feature
+# ("<shortid>:<n>"), so it can never fire on someone else's build. It fails the health gate,
+# which is exactly what a genuinely broken feature does.
+def _fault_for(project_id: str, feature_no: int) -> bool:
+    spec = os.environ.get("BUILDERAPPS_FAULT_FEATURE", "").strip()
+    if not spec or ":" not in spec:
+        return False
+    proj, _, num = spec.partition(":")
+    return proj == project_id and num.strip() == str(feature_no)
+
+
+async def _redeploy(ctx: Ctx, feature_no: int = 0) -> None:
     """Rebuild + restart the app stack and run the health gate."""
+    if feature_no and _fault_for(ctx.project_id, feature_no):
+        raise RuntimeError("INJECTED FAULT: health gate failed for this feature "
+                           "(BUILDERAPPS_FAULT_FEATURE)")
     await _load_secrets_into_state(ctx)
     proj = await store.get_project(ctx.project_id)
     await deployer.deploy(
@@ -217,7 +233,7 @@ async def _feature_attempt(ctx: Ctx, idx: int, feature: str, brief: str, *,
         require_change=(attempt == 1), emit=ctx.emit)
     wrote = list(res["changed"])
     try:
-        await _redeploy(ctx)
+        await _redeploy(ctx, idx + 1)
     except Exception as e:  # noqa: BLE001 — feed the error back once inside this attempt
         logger.warning("feature %s build failed, one repair pass: %s", feature, e)
         ctx.emit({"type": "progress", "stage": "build_feature",
@@ -235,7 +251,7 @@ async def _feature_attempt(ctx: Ctx, idx: int, feature: str, brief: str, *,
         for path in fix["changed"]:
             if path not in wrote:
                 wrote.append(path)
-        await _redeploy(ctx)
+        await _redeploy(ctx, idx + 1)
     return {"wrote": wrote, "res": res}
 
 
