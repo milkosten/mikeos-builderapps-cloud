@@ -527,6 +527,16 @@ async def project_domain(project_id: str, request: Request):
     return await introspect.domain(project_id, proj.get("subdomain", ""))
 
 
+# Can the builder put this app in its preview iframe? The SPA cannot answer this itself —
+# framing is refused before any script in the frame runs, and cross-origin response headers
+# are unreadable from JS — so the answer is computed server-side and the Site tab renders an
+# honest explanation instead of the browser's grey "refused to connect".
+@app.get("/api/projects/{project_id}/embeddable")
+async def project_embeddable(project_id: str, request: Request, refresh: bool = False):
+    proj = await _owned(project_id, request)
+    return await introspect.embeddable(project_id, proj.get("subdomain", ""), force=refresh)
+
+
 # ---- 16 non-secret env ----------------------------------------------------
 @app.get("/api/projects/{project_id}/env")
 async def project_env(project_id: str, request: Request):

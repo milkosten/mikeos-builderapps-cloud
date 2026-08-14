@@ -389,6 +389,12 @@ def build_grounding(docs: str, context: dict, survey: str) -> str:
     a = (context or {}).get("assistant") or {}
     proj = (context or {}).get("project") or {}
     beats = (context or {}).get("my_recent_beats") or []
+    # The platform's contracts (the /health shape, staying embeddable in the builder's preview
+    # iframe) arrive from the CONTROL PLANE on every beat — they are deliberately NOT written
+    # out here. This file is baked into an image, so a rule added here would only reach the
+    # fleet on the next `docker build`; one that arrives in /context is live as soon as the
+    # control plane is deployed, and it is the SAME string the build pipeline's codegen uses.
+    rules = str((context or {}).get("platform_rules") or "").strip()
     out = []
     if docs:
         out.append(
@@ -452,7 +458,8 @@ def build_grounding(docs: str, context: dict, survey: str) -> str:
         "The real verification is the health gate: your change is committed, built and "
         "started for real, and if the app does not come up healthy it is rolled back "
         "automatically and your beat is recorded as a failure. So the bar is not 'it looks "
-        "right' — it is 'this boots and works'.\n")
+        "right' — it is 'this boots and works'.\n"
+        + ("\n" + rules + "\n" if rules else ""))
     return "\n\n---\n\n".join(out)
 
 

@@ -12,7 +12,11 @@ What stays here:
   prompt (agentic loop included): fully self-hosted Node+Postgres+Redis, no third-party SaaS,
   plus the platform contracts that got learned the hard way — rule 6 (the `/health` shape the
   deploy gate reads), rule 7 (never rename an existing endpoint's response keys to fix a
-  frontend bug) and rule 8 (never hand-roll a migration runner).
+  frontend bug), rule 8 (never hand-roll a migration runner) and rule 9 (stay embeddable in
+  the builder's preview iframe — harden with CSP `frame-ancestors`, never `X-Frame-Options`).
+* **`PLATFORM_CONTRACTS`** — rules 6 and 9 on their own, for the *assistants*' coding agent,
+  which is a different runtime (a container, not this process) and so is handed them over the
+  wire rather than importing this module.
 * **`write_strategy_docs`** / **`design_schema`** — one focused `gpu.chat` call each. The
   generated migration is run through the same syntax gate the agent's edits face, so a
   non-idempotent or truncated first migration can never reach the boot path.
@@ -29,6 +33,56 @@ from server.harness.backlog import MAX_FEATURES as _MAX_BACKLOG
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# The PLATFORM CONTRACTS — the two things an app owes its host rather than its users.
+#
+# Both were learned the same way: a perfectly healthy app was reported as broken because it
+# changed something the platform reads. They are defined once, here, and composed into
+# NO_SAAS_RULE (rules 6 and 9) AND shipped to the assistants' coding agent (`PLATFORM_CONTRACTS`
+# -> /api/assistant/context -> the Pi grounding), so there is exactly one wording to keep true.
+# ---------------------------------------------------------------------------
+HEALTH_CONTRACT = (
+    "`GET /health` belongs to the hosting platform, NOT to the app. It MUST "
+    "always exist and MUST respond with exactly this shape: "
+    "{\"status\":\"ok\",\"db\":\"ok\",\"redis\":\"ok\"} (each value is \"ok\" only when that datastore "
+    "actually answered; use \"down\" otherwise). Never rename it, never change those field names, and "
+    "never drop it when you rewrite server.js. The deployment health-gate reads this exact shape — "
+    "change it and a perfectly working app gets reported as FAILED and never finishes building."
+)
+
+# NOTE ON WORDING: the origin below is the REAL, literal origin of the builder — it is not a
+# sample to be adapted, renamed or substituted (a previous rule used a made-up example value
+# and the model dutifully copied the example into a real endpoint). It is spelled out as a
+# requirement for that reason.
+EMBED_CONTRACT = (
+    "The builder shows this app to its owner INSIDE AN IFRAME on the page "
+    "https://builderapps.osmike.com — so the app MUST stay embeddable by that one origin. "
+    "Hardening the app is right and welcome, but it has to be done with the header that can "
+    "express an exception:\n"
+    "  * If you send a Content-Security-Policy, its `frame-ancestors` directive MUST allow the "
+    "builder. Write it exactly like this, with this exact origin — it is the real builder "
+    "origin, not a placeholder to replace with your own value:\n"
+    "        frame-ancestors 'self' https://builderapps.osmike.com\n"
+    "  * NEVER send `frame-ancestors 'none'`.\n"
+    "  * NEVER send an `X-Frame-Options` header at all — not DENY, not SAMEORIGIN. That header "
+    "cannot express \"allow this one other origin\" (its ALLOW-FROM form is dead in Chrome), and "
+    "browsers enforce it IN ADDITION to the CSP, so it silently overrides the frame-ancestors "
+    "allowance you just wrote. CSP `frame-ancestors` is the only correct clickjacking control "
+    "here; a helmet-style default that emits X-Frame-Options must have that header turned off.\n"
+    "Get this wrong and the owner's preview pane shows the browser's \"refused to connect\" "
+    "error, and an app that is serving 200s and passing its health check looks completely dead."
+)
+
+# What an assistant's coding agent is told about the platform. Same words as rules 6 and 9,
+# without the numbering that only makes sense inside NO_SAAS_RULE.
+PLATFORM_CONTRACTS = (
+    "## Platform contracts (the hosting platform's, not the app's)\n\n"
+    "Breaking either of these makes a working app look broken to its owner. They are not "
+    "style preferences and they are not negotiable.\n\n"
+    "- **Health endpoint.** " + HEALTH_CONTRACT + "\n\n"
+    "- **Stay embeddable.** " + EMBED_CONTRACT
+)
+
 # The constraint that must appear in EVERY codegen system prompt.
 NO_SAAS_RULE = (
     "ABSOLUTE ARCHITECTURE RULES (never violate):\n"
@@ -44,12 +98,7 @@ NO_SAAS_RULE = (
     "4. All SQL is parameterized ($1,$2,...). Migrations are idempotent (IF NOT EXISTS). Never "
     "use a reserved SQL keyword as a column name. Timestamps are timestamptz / ISO-8601.\n"
     "5. Cap request body sizes; never read an unbounded blob into memory.\n"
-    "6. PLATFORM CONTRACT — `GET /health` belongs to the hosting platform, NOT to the app. It MUST "
-    "always exist and MUST respond with exactly this shape: "
-    "{\"status\":\"ok\",\"db\":\"ok\",\"redis\":\"ok\"} (each value is \"ok\" only when that datastore "
-    "actually answered; use \"down\" otherwise). Never rename it, never change those field names, and "
-    "never drop it when you rewrite server.js. The deployment health-gate reads this exact shape — "
-    "change it and a perfectly working app gets reported as FAILED and never finishes building.\n"
+    "6. PLATFORM CONTRACT — " + HEALTH_CONTRACT + "\n"
     "7. Client and server response shapes MUST match, and the SERVER's existing shape is the source "
     "of truth. When the frontend consumes one of your own JSON endpoints, first read what that "
     "endpoint actually returns, then unwrap that exact key before iterating (if it returns "
@@ -66,7 +115,8 @@ NO_SAAS_RULE = (
     "the whole build. To add schema, ONLY add a new numbered file like `migrations/002_feature.sql`. "
     "Create each table exactly once across all migrations (never both `notes` and `public.notes`), "
     "always `IF NOT EXISTS`, and never ALTER or re-shape the scaffold's existing `app_meta` table. Any "
-    "`ON CONFLICT (col)` you write REQUIRES a matching UNIQUE/PRIMARY KEY constraint on that column."
+    "`ON CONFLICT (col)` you write REQUIRES a matching UNIQUE/PRIMARY KEY constraint on that column.\n"
+    "9. PLATFORM CONTRACT — " + EMBED_CONTRACT
 )
 
 

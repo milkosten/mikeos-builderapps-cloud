@@ -641,7 +641,140 @@ async def domain(project_id: str, subdomain: str) -> dict:
         info.update(facts)
     except Exception as e:  # noqa: BLE001
         logger.info("cert probe for %s failed: %s", host, e)
+    info.update(await embeddable(project_id, host))
     return info
+
+
+# --------------------------------------------------------------------------
+# 15b — can the builder actually put this app in its preview iframe?
+# --------------------------------------------------------------------------
+# Why this is computed HERE and not in the browser: framing is refused by the browser
+# BEFORE any script in the frame runs, and the SPA cannot read another origin's response
+# headers, so there is no client-side signal at all — an app that blocks framing is
+# indistinguishable from one that is simply down. Both render as Chrome's grey "refused to
+# connect", which is how a healthy, 200-serving app came to look completely broken.
+# So the control plane fetches the app's own headers (it already does exactly this for the
+# public health gate) and hands the answer to the UI as a fact, with the reason in words.
+BUILDER_ORIGIN = os.environ.get("PUBLIC_BASE", "https://builderapps.osmike.com").rstrip("/")
+
+_EMBED_TTL = 60.0                    # seconds; a repaint must never mean a new HTTP request
+_embed_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _origin_matches(token: str, origin: str) -> bool:
+    """Does one CSP frame-ancestors source expression allow `origin` (scheme://host)?
+
+    Only the forms that can legitimately appear here are honoured. Anything unrecognised is
+    NOT treated as a match — guessing generously would put us right back at a dead grey frame
+    with the UI insisting everything is fine.
+    """
+    token = token.strip().strip(";").lower()
+    origin = origin.lower()
+    if not token:
+        return False
+    if token in ("*", "https:", "https://*"):
+        return True
+    scheme, _, host = origin.partition("://")
+    # A source may omit the scheme (`builderapps.osmike.com`) — CSP then matches any scheme.
+    tok_scheme, _, tok_host = token.partition("://")
+    if not tok_host:
+        tok_host, tok_scheme = tok_scheme, ""
+    if tok_scheme and tok_scheme.rstrip(":") not in ("", scheme):
+        return False
+    tok_host = tok_host.rstrip("/").split("/")[0]
+    if tok_host == host:
+        return True
+    # `*.osmike.com` — a wildcard matches ONE OR MORE leading labels, never the bare domain.
+    if tok_host.startswith("*."):
+        return host.endswith(tok_host[1:]) and host != tok_host[2:]
+    return False
+
+
+def _frame_ancestors(csp: str) -> Optional[str]:
+    """The frame-ancestors directive's source list, or None when the policy has none."""
+    for directive in (csp or "").split(";"):
+        parts = directive.strip().split()
+        if parts and parts[0].lower() == "frame-ancestors":
+            return " ".join(parts[1:]).strip()
+    return None
+
+
+def _verdict(headers: Any) -> dict:
+    """Turn one response's headers into {embeddable, reason, ...}. Header-only; no body."""
+    def get(name: str) -> str:
+        try:                                    # httpx.Headers joins repeats with ", "
+            return str(headers.get(name, "") or "").strip()
+        except Exception:                       # noqa: BLE001 — a plain dict works too
+            return str((headers or {}).get(name, "") or "").strip()
+
+    xfo = get("x-frame-options")
+    csp = get("content-security-policy")
+    ancestors = _frame_ancestors(csp)
+    out = {"embeddable": True, "reason": "", "x_frame_options": xfo or None,
+           "frame_ancestors": ancestors, "builder_origin": BUILDER_ORIGIN}
+
+    # X-Frame-Options first: the browser enforces it IN ADDITION to the CSP, so a policy that
+    # correctly allows the builder is still overridden by a stray DENY/SAMEORIGIN.
+    if xfo and xfo.lower().split(",")[0].strip() in ("deny", "sameorigin"):
+        out["embeddable"] = False
+        out["reason"] = (
+            f"The app sends `X-Frame-Options: {xfo}`. That header cannot allow one specific "
+            f"other origin (ALLOW-FROM is dead in Chrome), so it blocks the builder's preview "
+            f"outright — and the browser enforces it even when the CSP is right. The app "
+            f"should drop the header and say `frame-ancestors 'self' {BUILDER_ORIGIN}` in its "
+            f"Content-Security-Policy instead.")
+        return out
+
+    if ancestors is not None:
+        allowed = any(_origin_matches(t, BUILDER_ORIGIN) for t in ancestors.split())
+        if not allowed:
+            out["embeddable"] = False
+            out["reason"] = (
+                f"The app's Content-Security-Policy says `frame-ancestors {ancestors}`, which "
+                f"does not allow {BUILDER_ORIGIN}. Ask it to use "
+                f"`frame-ancestors 'self' {BUILDER_ORIGIN}`.")
+            return out
+        out["reason"] = f"CSP frame-ancestors allows {BUILDER_ORIGIN}."
+        return out
+
+    out["reason"] = "The app sends no framing restrictions."
+    return out
+
+
+async def embeddable(project_id: str, subdomain: str = "", *, force: bool = False) -> dict:
+    """{embeddable, reason, x_frame_options, frame_ancestors, checked} for the app's own page.
+
+    Cheap and cached (60s): the Site tab asks on open and after a deploy, never on a repaint.
+    A probe that cannot complete returns `embeddable: true` with `checked: false` — "we could
+    not check" must degrade to showing the iframe, because claiming an app blocks embedding
+    when it might simply be booting would be its own lie.
+    """
+    assert_shortid(project_id)
+    host = subdomain or f"{project_id}.{SITES_BASE}"
+    now = asyncio.get_event_loop().time()
+    hit = _embed_cache.get(host)
+    if hit and not force and (now - hit[0]) < _EMBED_TTL:
+        return hit[1]
+
+    import httpx
+    out: dict
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as c:
+            # GET, not HEAD: security headers are routinely attached to real responses only,
+            # and plenty of Express apps answer HEAD from a route that sets nothing.
+            r = await c.get(f"https://{host}/", headers={"Accept": "text/html"})
+        out = _verdict(r.headers)
+        out["checked"] = True
+        out["status_code"] = r.status_code
+    except Exception as e:  # noqa: BLE001
+        out = {"embeddable": True, "checked": False, "x_frame_options": None,
+               "frame_ancestors": None, "builder_origin": BUILDER_ORIGIN,
+               "reason": f"could not read the app's headers ({type(e).__name__})"}
+    _embed_cache[host] = (now, out)
+    if len(_embed_cache) > 500:                 # bounded: this map is never a leak
+        for k in list(_embed_cache)[:200]:
+            _embed_cache.pop(k, None)
+    return out
 
 
 # --------------------------------------------------------------------------

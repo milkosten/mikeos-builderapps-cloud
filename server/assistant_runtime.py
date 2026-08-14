@@ -47,6 +47,7 @@ from typing import Any, Optional
 
 from server import assistants as A
 from server import chrome, gitea, gpu, runner, store, usage
+from server.harness import codegen
 
 logger = logging.getLogger(__name__)
 
@@ -438,6 +439,12 @@ async def perceive(assistant: dict, *, include_soul: bool = False) -> dict:
             for b in prior]
     except Exception:  # noqa: BLE001
         ctx["my_recent_beats"] = []
+    # The platform's own contracts, sent to the container rather than baked into its image:
+    # a beat is a DIFFERENT runtime (it cannot import server.harness), and these rules change
+    # when the platform changes, not when that image is next rebuilt. Same words the build
+    # pipeline's codegen prompts carry, so an assistant cannot unknowingly "harden" away
+    # something the pipeline is contractually required to keep.
+    ctx["platform_rules"] = codegen.PLATFORM_CONTRACTS
     if include_soul:
         # Only for the container's GET /context, so it can mirror the SOUL into the repo at
         # `docs/assistants/<role>.SOUL.md` — the SOUL should live in git next to the app it
@@ -551,6 +558,10 @@ async def reason(assistant: dict, context: dict, workspace_report: str = "",
            "checked out — it reads and edits the files itself. Your job is to pick the ONE "
            "most valuable change and brief it precisely.\n\n"
            if A.has(assistant, "edit_code") else "")
+        # The contracts belong here too, not only in the coding agent's grounding: the
+        # decision to "add clickjacking protection" is taken HERE, and a brief that asks for
+        # the wrong header produces a correct-looking change that breaks the owner's preview.
+        + "---\n" + codegen.PLATFORM_CONTRACTS + "\n\n---\n\n"
         + "Available actions:\n" + _action_menu(assistant) + "\n\n"
         "Rules:\n"
         "- Reply with JSON only: {\"thought\": str, \"actions\": [...], \"done\": bool}.\n"
