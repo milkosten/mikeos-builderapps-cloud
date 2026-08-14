@@ -691,6 +691,22 @@ def discard_changes() -> None:
     sh(["git", "clean", "-fd"])
 
 
+def current_sha() -> str:
+    """The commit the checkout is on right now, or "" if that cannot be read."""
+    rc, out = sh(["git", "rev-parse", "HEAD"])
+    return out.strip()[:40] if rc == 0 else ""
+
+
+def files_in_range(base: str, head: str) -> list[str]:
+    """The files a range of commits touched — how we see work Pi already committed."""
+    if not base or not head or base == head:
+        return []
+    rc, out = sh(["git", "diff", "--name-only", f"{base}..{head}"])
+    if rc != 0:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
 def uncommit_agent_commits() -> int:
     """If the coding agent committed by itself, put its work back in the working tree.
 
@@ -720,16 +736,38 @@ def uncommit_agent_commits() -> int:
     return ahead
 
 
-def gate_changes() -> dict:
+def gate_changes(head_before: str = "") -> dict:
     """Inspect what the coding agent actually did and decide whether it may be committed.
 
     Pi is free-form by design, so this is where the bounds live. A violation discards the
     WHOLE beat's work rather than committing the acceptable part of it: a half-applied change
     is how you get an app that starts but is subtly wrong, which is worse than no change.
+
+    JUDGE THE BEAT BY WHETHER THE REPO ADVANCED, NOT BY WHETHER THE TREE IS DIRTY.
+    `uncommit_agent_commits()` folds back commits that are ahead of `origin/HEAD`, which
+    covers Pi committing locally. It does NOT cover Pi committing *and pushing*: the push
+    moves the origin/HEAD remote-tracking ref too, so there is nothing "ahead", the working
+    tree is clean, and this gate used to conclude "the coding agent changed nothing" — a
+    beat that fixed a broken deploy and shipped the fix (eae5291) was recorded `status=failed`
+    on exactly that path. `assistant_beats.status` drives the UI, the repair-episode logic and
+    any future auto-retry, so a successful repair that looks failed eventually drives a wrong
+    decision. Comparing HEAD against `head_before` sees the work wherever it ended up.
     """
     uncommit_agent_commits()
     files = changed_files()
     if not files:
+        # Nothing in the tree — but did the repo move? If so, Pi committed AND pushed, and
+        # the beat succeeded. We cannot re-gate work that is already on the remote (discarding
+        # it would mean a force-push over the record), so the checks below are reported rather
+        # than enforced; the honest status is what matters here.
+        head_now = current_sha()
+        if head_before and head_now and head_now != head_before:
+            moved = files_in_range(head_before, head_now)
+            log(f"gate: the working tree is clean but HEAD moved {head_before[:8]}..{head_now[:8]} "
+                f"({len(moved)} file(s)) — the coding agent committed and pushed its own work")
+            return {"ok": True, "already_committed": True, "files": moved,
+                    "sha": head_now, "base": head_before,
+                    "detail": f"the coding agent committed and pushed {len(moved)} file(s) itself"}
         return {"ok": False, "empty": True, "files": [],
                 "detail": "the coding agent changed nothing"}
     for f in files:
@@ -960,11 +998,14 @@ def act_code(action: dict, context: dict, docs: str, survey: str) -> dict:
     grounding = build_grounding(docs, context, survey, app_url)
     log(f"code: handing a {len(task)}-char task to Pi with a {len(grounding)}-char grounding")
     activity("phase", "🛠", f"starting on: {task[:160]}", flush=True)
+    # Where the repo stood BEFORE Pi ran. This — not the dirtiness of the tree — is what
+    # tells us whether the beat produced anything, because Pi commits and pushes directly.
+    head_before = current_sha()
     pi = run_pi(task, grounding, app_url)
     log(f"code: Pi exited rc={pi['rc']} after {pi['seconds']}s, {pi['tools']} tool call(s)")
     tail = pi["output"][-1200:]
 
-    gate = gate_changes()
+    gate = gate_changes(head_before)
     if not gate["ok"]:
         discard_changes()
         activity("result", "✗", gate["detail"][:200],
@@ -980,7 +1021,13 @@ def act_code(action: dict, context: dict, docs: str, survey: str) -> dict:
     message = str(action.get("message") or "").strip() or f"feat: {task[:60]}"
     if not message.lower().startswith(("feat", "fix", "chore", "docs", "refactor", "test")):
         message = "feat: " + message
-    pushed = commit_and_push(message)
+    if gate.get("already_committed"):
+        # Pi committed and pushed it itself. There is nothing left to commit; the work is
+        # on the remote. Take its sha and carry on to the ship step — the beat succeeded.
+        pushed = {"ok": True, "sha": gate.get("sha", ""),
+                  "detail": "the coding agent committed and pushed it itself"}
+    else:
+        pushed = commit_and_push(message)
     if not pushed.get("ok") or not pushed.get("sha"):
         return {"ok": False, "coded": True, "pushed": False,
                 "files": gate["files"], "stat": gate.get("stat", ""),

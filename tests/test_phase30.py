@@ -162,6 +162,31 @@ def main() -> int:
               "reset --soft puts it back in the working tree so the ONE gate sees it")
         git(repo, "reset", "-q", "--hard", "origin/HEAD")
 
+        # ...and if it commits AND PUSHES, origin/HEAD moves with it, so there is nothing
+        # "ahead" to fold back and the tree is clean. The gate used to call that "changed
+        # nothing" — a beat that fixed a broken deploy and shipped the fix (eae5291) was
+        # recorded status=failed on exactly this path. Judge it by whether HEAD advanced.
+        head_before = beat.current_sha()
+        with open(os.path.join(repo, "server.js"), "w") as f:
+            f.write("const a = 1;\nconst pushed = true;\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "the agent committed and pushed")
+        git(repo, "branch", "-f", "origin/HEAD")          # the push moved the remote ref too
+        check("the working tree really is clean here",
+              beat.changed_files() == [] and beat.uncommit_agent_commits() == 0,
+              "this is the state the old gate mis-read as a no-op")
+        g = beat.gate_changes(head_before)
+        check("a beat whose agent committed AND pushed is a SUCCESS, not 'changed nothing'",
+              g.get("ok") and g.get("already_committed") and not g.get("empty"),
+              "the repo advanced; that is the definition of the beat having done something")
+        check("and it reports the files those commits touched",
+              g.get("files") == ["server.js"] and g.get("sha") == beat.current_sha())
+        check("a GENUINE no-op is still reported honestly",
+              beat.gate_changes(beat.current_sha()).get("empty") is True,
+              "HEAD did not move and the tree is clean — nothing happened, say so")
+        check("an unknown head_before cannot invent success",
+              beat.gate_changes("").get("empty") is True)
+
         # The file-count cap: a "change" that rewrites the world is a rewrite, not a change.
         beat.MAX_CHANGED_FILES = 3
         for i in range(5):
