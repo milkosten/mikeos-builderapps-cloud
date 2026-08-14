@@ -109,6 +109,26 @@ async def list_projects(user_id: str) -> list[dict]:
 
 
 # ---- project_secrets ------------------------------------------------------
+async def project_subnet(project_id: str) -> str:
+    """The project's own private /24, allocated once and pinned (phase 28).
+
+    Docker's default address pools top out at ~31 networks; the 21st app on 242 could not be
+    created at all. Handing compose an EXPLICIT ipam subnet from the (entirely unused)
+    10.0.0.0/8 space sidesteps the pool completely — no dockerd restart, no bouncing 110
+    production containers. 10.100.0.0 .. 10.255.255.0 as /24s = ~40 000 projects.
+    """
+    idx = await pool().fetchval(
+        "UPDATE builderapps.projects "
+        "SET net_index = COALESCE(net_index, nextval('builderapps.project_net_seq')::int) "
+        "WHERE id=$1 RETURNING net_index", project_id)
+    if idx is None:
+        raise RuntimeError(f"project_subnet: no project row for {project_id}")
+    n = int(idx) - 1
+    if n < 0 or n >= 156 * 256:
+        raise RuntimeError(f"project_subnet: allocation {idx} is outside 10.100-255.x")
+    return f"10.{100 + (n // 256)}.{n % 256}.0/24"
+
+
 async def put_secret(project_id: str, key: str, value: str) -> None:
     value_enc = crypto.encrypt(value)
     res = await pool().execute(

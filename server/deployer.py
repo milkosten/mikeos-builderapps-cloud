@@ -72,9 +72,15 @@ def _reject_bind_mounts(service_name: str, volumes) -> list:
     return out
 
 
-def normalize_compose(raw_yaml: str, shortid: str) -> str:
+def normalize_compose(raw_yaml: str, shortid: str, subnet: Optional[str] = None) -> str:
     """Return a normalized compose YAML string for project <shortid>. Raises NormalizeError
-    on any isolation violation."""
+    on any isolation violation.
+
+    `subnet` pins the project's private network to an EXPLICIT /24 (see store.project_subnet).
+    Without it Docker picks from its default address pools, which hold only ~31 networks in
+    total — 242 exhausted them at ~20 apps and every further build died at deploy_skeleton
+    with "all predefined address pools have been fully subnetted".
+    """
     doc = yaml.safe_load(raw_yaml)
     if not isinstance(doc, dict) or "services" not in doc:
         raise NormalizeError("compose has no services")
@@ -156,7 +162,9 @@ def normalize_compose(raw_yaml: str, shortid: str) -> str:
         "services": new_services,
         "networks": {
             DEPLOY_NETWORK: {"external": True},
-            proj_net: {"driver": "bridge"},
+            proj_net: ({"driver": "bridge",
+                        "ipam": {"driver": "default", "config": [{"subnet": subnet}]}}
+                       if subnet else {"driver": "bridge"}),
         },
     }
     return yaml.safe_dump(out_doc, sort_keys=False)
@@ -190,12 +198,34 @@ async def _ensure_vol_dirs(shortid: str) -> None:
         Path(f"{VOL_ROOT}/{shortid}/{sub}").mkdir(parents=True, exist_ok=True)
 
 
+async def _subnet_for(shortid: str) -> Optional[str]:
+    """The explicit /24 to write into the compose, or None to let Docker choose.
+
+    An ALREADY-RUNNING project keeps whatever subnet its network was created with: compose
+    refuses to start a stack whose declared ipam disagrees with the live network, so a
+    pre-existing app must never be handed a freshly allocated block. New projects get one from
+    the control plane (10.100+.x.0/24) because Docker's own pools are exhausted on 242.
+    """
+    net = f"{shortid}_proj-{shortid}"
+    rc, out = await _run(
+        ["docker", "network", "inspect", net, "--format",
+         "{{range .IPAM.Config}}{{.Subnet}}{{end}}"], timeout=30)
+    if rc == 0 and out.strip():
+        return out.strip().splitlines()[0].strip()
+    try:
+        return await store.project_subnet(shortid)
+    except Exception as e:  # noqa: BLE001 — never block a deploy on the allocator
+        logger.warning("subnet allocation failed for %s, using docker's pool: %s", shortid, e)
+        return None
+
+
 async def deploy(shortid: str, workspace: Path, *, db_password: str, app_secret: str,
                  title: str) -> dict:
     """Normalize + build + up + health-gate + public-route verify. Records a deployments row.
     Returns {ok, deployment_id, public_health}."""
     raw = (workspace / "docker-compose.yml").read_text("utf-8")
-    normalized = normalize_compose(raw, shortid)
+    subnet = await _subnet_for(shortid)
+    normalized = normalize_compose(raw, shortid, subnet)
     norm_path = workspace / "docker-compose.normalized.yml"
     norm_path.write_text(normalized, "utf-8")
     compose_hash = hashlib.sha256(normalized.encode()).hexdigest()[:16]
