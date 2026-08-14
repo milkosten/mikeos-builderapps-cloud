@@ -517,11 +517,15 @@ def _on_pi_event(ev: dict, seen: dict) -> None:
     elif t == "message_update":
         ame = ev.get("assistantMessageEvent") or {}
         if ame.get("type") == "text_end":
-            # The agent's own words at the end of a turn — its reasoning, verbatim.
+            # The agent's own words at the end of a turn — its reasoning, verbatim, in ONE
+            # field. Splitting it at char 300 into text+detail put the break mid-word and
+            # left the remainder as a hover-only tooltip: a human reading the pane saw
+            # "…is a platform-ingress-layer iss" and had to hunt for the rest. Its reasoning
+            # is the most valuable thing a beat produces (and the only way to catch it
+            # reasoning confidently and wrongly), so it is sent whole and rendered whole.
             content = str(ame.get("content") or "").strip()
             if content:
-                activity("text", "💬", content[:300],
-                         content[300:1200] if len(content) > 300 else "")
+                activity("text", "💬", content[:4000])
     elif t == "auto_retry_start":
         activity("phase", "⟳", "the model call failed — retrying")
     elif t == "compaction_start":

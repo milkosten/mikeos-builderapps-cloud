@@ -610,6 +610,14 @@ async def finish_beat(beat_id: int, *, status: str, thought: str = "",
 _ACTIVITY_KINDS = ("phase", "tool", "text", "result")
 
 
+# How much of one line survives. A tool call is machinery and a short label is plenty; the
+# agent's own WORDS are the thing a human is actually reading, and clamping those to 400
+# chars is what produced a reasoning paragraph that stopped mid-word ("…is a platform-
+# ingress-layer iss") with the rest reachable only by hovering. Give reasoning room.
+_TEXT_CAP = {"text": 4000}
+_DETAIL_CAP = {"text": 4000}
+
+
 def sanitize_activity(items: Any) -> list[dict]:
     """Keep only the shape the feed renders, clamped. The container is trusted to report
     honestly but not to bound itself — an agent's own output is untrusted input like any
@@ -621,14 +629,15 @@ def sanitize_activity(items: Any) -> list[dict]:
         text = str(it.get("text") or "").strip()
         if not text:
             continue
+        kind = (str(it.get("kind") or "tool") if str(it.get("kind")) in _ACTIVITY_KINDS
+                else "tool")
         entry = {
-            "kind": (str(it.get("kind") or "tool") if str(it.get("kind")) in _ACTIVITY_KINDS
-                     else "tool"),
+            "kind": kind,
             "icon": str(it.get("icon") or "")[:4],
-            "text": text[:400],
+            "text": text[:_TEXT_CAP.get(kind, 400)],
         }
         if it.get("detail"):
-            entry["detail"] = str(it["detail"])[:600]
+            entry["detail"] = str(it["detail"])[:_DETAIL_CAP.get(kind, 600)]
         if it.get("ok") is not None:
             entry["ok"] = bool(it["ok"])
         if it.get("ts"):
@@ -681,7 +690,11 @@ async def recent_activity(project_id: str, limit: int = 6) -> list[dict]:
             "name": d.get("name") or "", "role": d.get("role") or "",
             "status": d.get("status") or "", "trigger_kind": d.get("trigger_kind") or "",
             "user_ask": (d.get("user_ask") or "")[:MAX_ASK_CHARS],
-            "thought": (d.get("thought") or "")[:2000],
+            # The whole thought, not a prefix. The pane renders it inline as the assistant's
+            # conclusion; a truncated conclusion is worse than none, because a WRONG one
+            # that trails off looks plausible ("An SSL error is a platform-ingress-layer
+            # iss…" — it was in fact the app's own CSP blocking the preview iframe).
+            "thought": (d.get("thought") or "")[:8000],
             "activity": d.get("activity") or [],
             "cost_usd": float(d.get("cost_usd") or 0),
             "ts": d.get("ts"), "finished_at": d.get("finished_at"),
