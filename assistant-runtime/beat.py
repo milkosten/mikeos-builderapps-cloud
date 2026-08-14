@@ -59,8 +59,8 @@ def call(method: str, path: str, body=None, timeout: float = 240.0):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         CONTROL_URL + path, data=data, method=method,
-        headers={"X-Assistant-Token": TOKEN, "Content-Type": "application/json",
-                 "Accept": "application/json"})
+        headers={"X-Assistant-Token": TOKEN, "X-Beat-Id": BEAT_ID,
+                 "Content-Type": "application/json", "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read().decode("utf-8", "replace")

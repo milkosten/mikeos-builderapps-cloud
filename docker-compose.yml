@@ -58,6 +58,12 @@ services:
       ARTIFACTS_ROOT: /opt/builderapps/artifacts
       BUILDERAPPS_VOL_ROOT: /data/builderapps/vol
       DEPLOY_NETWORK: deploy_default
+      # --- per-project AI assistants (phase 29) ------------------------------------
+      # Where a beat container reaches the control plane: the internal container name on
+      # the shared deploy network. No public hop, no TLS to terminate, nothing exposed.
+      ASSISTANT_CONTROL_URL: http://mikeos-builderapps:8000
+      ASSISTANT_WORKSPACES_ROOT: /opt/builderapps/assistants
+      ASSISTANT_RUNTIME_CONTEXT: /opt/mikeos-builderapps-cloud/assistant-runtime
     # Docker's default 10s SIGTERM->SIGKILL window is shorter than uvicorn's graceful
     # shutdown, so the app was being killed before its lifespan shutdown could run and
     # RELEASE ownership of in-flight runs. With room to shut down cleanly, an interrupted run
@@ -72,6 +78,13 @@ services:
       - /opt/builderapps/artifacts:/opt/builderapps/artifacts
       # project data volumes (pgdata/redis) live here; created by the deployer
       - /data/builderapps/vol:/data/builderapps/vol
+      # phase 29: each assistant's own cached git checkout. SAME path both sides, because the
+      # control plane creates+chowns the dir and then bind-mounts it into the beat container
+      # by HOST path — the daemon resolves `-v` against the host, not against us.
+      - /opt/builderapps/assistants:/opt/builderapps/assistants
+      # the assistant-runtime image's build context, so the control plane can build it on
+      # first use instead of needing a manual step on the host. Read-only: it is source.
+      - /opt/mikeos-builderapps-cloud/assistant-runtime:/opt/mikeos-builderapps-cloud/assistant-runtime:ro
     networks: [deploy_default]
     mem_limit: 1g
     cpus: 2

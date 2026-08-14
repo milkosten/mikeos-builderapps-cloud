@@ -21,7 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from server import db, deployer, gitea, introspect, naming, runner, store, workspace, usage
+from server import (assistant_api, assistant_runtime, db, deployer, gitea, introspect,
+                    naming, runner, store, workspace, usage)
 from server.harness import pipeline
 from server.identity import authenticate, current_user
 
@@ -58,12 +59,25 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001 — never block startup on recovery
         logger.exception("boot sweep failed")
     runner.start_janitor()
+    # SAME RECOVERY CONTRACT FOR ASSISTANTS (phase 29). A redeploy kills every beat
+    # container's supervisor; without this the assistant row stays claimed and never beats
+    # again — the exact bug class that once stranded builds.
+    try:
+        await assistant_runtime.sweep_on_boot()
+    except Exception:  # noqa: BLE001 — never block startup on recovery
+        logger.exception("assistant boot sweep failed")
+    assistant_runtime.start_scheduler()
     yield
+    await assistant_runtime.shutdown()
     await runner.shutdown()
     await db.close_pool()
 
 
 app = FastAPI(title="mikeos-builderapps-cloud", lifespan=lifespan)
+
+# Per-project AI assistants (phase 29). A router, not more routes here — its paths land in
+# /openapi.json exactly as if they were declared on the app.
+app.include_router(assistant_api.router)
 
 _CORS_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS", "https://builderapps.osmike.com").split(",") if o.strip()]
