@@ -470,7 +470,12 @@ async def project_deployments(project_id: str, request: Request):
     return {"deployments": [
         {"id": r["id"], "image_tag": r["image_tag"], "status": r["status"],
          "health": r["health"], "started_at": r["started_at"],
-         "finished_at": r["finished_at"]}
+         "finished_at": r["finished_at"],
+         # WHICH commit, and WHO caused it. Recorded since phase 30, and pointless if the
+         # API keeps it to itself: "an unattended agent shipped this one" is exactly the
+         # fact a human opening the Deployments tab needs to see.
+         "git_sha": r.get("git_sha") or "",
+         "assistant_id": r.get("assistant_id"), "beat_id": r.get("beat_id")}
         for r in rows
     ]}
 
