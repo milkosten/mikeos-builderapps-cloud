@@ -195,17 +195,69 @@ _MIN_FILE_BUDGET = 6000
 _TOKENS_PER_CHAR = 0.5   # generous; JSON-escaped source is dense
 
 
+def _strip_literals(src: str) -> str:
+    """Remove comments and string/template literals so bracket counting sees CODE only.
+
+    Counting raw characters cannot tell code from text: a COMPLETE file containing
+    `console.error("fatal on startup:", e)` or `// cache (TTL 300s)` easily ends up with
+    an unbalanced raw paren count. That false positive discarded a valid 5 KB server.js on
+    all three attempts and failed an entire build ("not even the smallest app worked").
+    """
+    out = []
+    i, n = 0, len(src)
+    quote = None          # ' " or `
+    comment = None        # "line" or "block"
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if comment == "line":
+            if ch == "\n":
+                comment = None
+                out.append(ch)
+            i += 1
+            continue
+        if comment == "block":
+            if ch == "*" and nxt == "/":
+                comment = None
+                i += 2
+                continue
+            i += 1
+            continue
+        if quote:
+            if ch == "\\":
+                i += 2            # skip the escaped char
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            comment = "line"; i += 2; continue
+        if ch == "/" and nxt == "*":
+            comment = "block"; i += 2; continue
+        if ch in "'\"`":
+            quote = ch; i += 1; continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _looks_truncated(path: str, content: str) -> bool:
     """Heuristic truncation check — the Kimi-bug guard. A file whose braces/tags are wildly
     unbalanced, or that ends mid-token, is treated as truncated and discarded."""
     if not content or not content.strip():
         return True
     c = content
-    # balanced-ish braces/parens for code files
+    # balanced-ish braces/parens for code files — counted on CODE ONLY (see _strip_literals);
+    # parens/braces inside strings and comments are not structure.
     if path.endswith((".js", ".ts", ".json", ".css")):
-        if c.count("{") - c.count("}") not in range(-1, 3):
+        code = _strip_literals(c) if not path.endswith(".json") else c
+        # Now that literals are stripped, real code should balance almost exactly, so the
+        # tolerance can be tight enough to catch a file that stops mid-body. (Parens stay a
+        # little looser: regex literals aren't stripped and can leave a stray bracket.)
+        if code.count("{") - code.count("}") not in range(-1, 2):
             return True
-        if c.count("(") - c.count(")") not in range(-2, 3):
+        if code.count("(") - code.count(")") not in range(-2, 3):
             return True
     if path.endswith((".html", ".htm")):
         low = c.lower()
