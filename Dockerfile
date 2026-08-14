@@ -15,11 +15,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
+# The codegen agent's syntax gate runs `node --check` on every .js it writes or edits
+# (phase 24 — a syntactically broken result is REJECTED, never written). Copy just the node
+# binary, from the same major version the generated apps run on (their images are
+# node:20-alpine), so a check is one ~30 ms subprocess instead of a container start per edit.
+# python:3.12-slim is bookworm and already ships libstdc++6, which is all node needs.
+# server/harness/syntax.py falls back to `docker run --rm -i node:20-alpine node --check` if
+# this binary is ever missing, so an older image degrades in speed, not in correctness.
+COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server/ ./server/
 COPY migrations/ ./migrations/
+COPY tests/ ./tests/
 
 EXPOSE 8000
 # ONE worker, deliberately. Pipeline runs are now durable in-process background tasks
