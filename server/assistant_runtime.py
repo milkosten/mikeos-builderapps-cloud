@@ -407,7 +407,12 @@ async def perceive(assistant: dict, *, include_soul: bool = False) -> dict:
         except Exception:  # noqa: BLE001
             ctx["usage"] = {}
     try:
-        prior = await A.list_beats(int(assistant["id"]), 3)
+        # Its own memory — but NEVER the beat it is executing right now. Handing an agent a
+        # row that says `running` with no thought makes it reason about its own in-flight
+        # self ("my last beat has no results yet, so let me redo it"), which is exactly the
+        # kind of confused, duplicated work a memory is supposed to prevent.
+        prior = [b for b in await A.list_beats(int(assistant["id"]), 6)
+                 if b.get("status") != "running"][:3]
         ctx["my_recent_beats"] = [
             {"ts": str(b.get("ts") or ""), "status": b.get("status"),
              "thought": (b.get("thought") or "")[:400],
