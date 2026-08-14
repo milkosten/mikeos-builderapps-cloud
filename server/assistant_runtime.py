@@ -442,6 +442,34 @@ async def perceive(assistant: dict, *, include_soul: bool = False) -> dict:
             for d in (await store.list_deployments(project_id, 3))
         ],
     }
+
+    # THE SHARED BOARD (phase 32). Every assistant sees the project's live workspace on every
+    # beat, deterministically — it is not a tool the model has to remember to reach for. This
+    # is what stops two assistants rebuilding the same thing and what lets one pick up a bug
+    # another filed.
+    #
+    # POSITION MATTERS. `reason()` serializes this whole dict and hard-slices it at 14,000
+    # chars, and json.dumps preserves insertion order — so anything added at the END is the
+    # first thing thrown away on exactly the busy projects this block exists for. It goes
+    # near the front, and it is kept deliberately small (20 live items, titles clipped) so it
+    # is cheap enough to always carry.
+    #
+    # `open_only` + `newest_first` are load-bearing too: fetching the first N rows by id and
+    # THEN dropping the closed ones spends the whole window on history, so a project with a
+    # finished backlog would hand the agents an empty board and nothing would fail.
+    try:
+        live_items = await W.list_items(project_id, limit=20, open_only=True,
+                                        newest_first=True)
+        ctx["workspace"] = {
+            "counts": await W.counts(project_id),
+            "open_items": [{"id": i["id"], "kind": i["kind"], "status": i["status"],
+                            "title": i["title"][:120],
+                            "by": i.get("created_by_name") or i.get("created_by")}
+                           for i in live_items],
+        }
+    except Exception as e:  # noqa: BLE001 — perception must never fail a beat
+        logger.info("workspace board unavailable for %s: %s", project_id, e)
+
     try:
         thread = await store.get_raw_thread(project_id)
         ctx["recent_thread"] = [
@@ -474,23 +502,6 @@ async def perceive(assistant: dict, *, include_soul: bool = False) -> dict:
     # pipeline's codegen prompts carry, so an assistant cannot unknowingly "harden" away
     # something the pipeline is contractually required to keep.
     ctx["platform_rules"] = codegen.PLATFORM_CONTRACTS
-    # THE SHARED BOARD (phase 32). Every assistant sees the project's workspace on every
-    # beat, deterministically — it is not a tool the model has to remember to reach for.
-    # This is what stops two assistants rebuilding the same thing and what lets one pick up
-    # a bug another filed. Only the LIVE items (open/in_progress/blocked) are sent: a
-    # finished feature is history, and history is what makes a context window expensive.
-    try:
-        board = await W.list_items(project_id, limit=60)
-        live_items = [i for i in board if i.get("status") not in W.CLOSED_STATUSES]
-        ctx["workspace"] = {
-            "counts": await W.counts(project_id),
-            "open_items": [{"id": i["id"], "kind": i["kind"], "status": i["status"],
-                            "title": i["title"][:160],
-                            "by": i.get("created_by_name") or i.get("created_by")}
-                           for i in live_items[:30]],
-        }
-    except Exception as e:  # noqa: BLE001 — perception must never fail a beat
-        logger.info("workspace board unavailable for %s: %s", project_id, e)
     if include_soul:
         # Only for the container's GET /context, so it can mirror the SOUL into the repo at
         # `docs/assistants/<role>.SOUL.md` — the SOUL should live in git next to the app it

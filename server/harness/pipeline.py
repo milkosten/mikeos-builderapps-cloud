@@ -19,6 +19,7 @@ Structural work (repo/compose/deploy/git) stays deterministic. The LLM (Kimi) de
 app is* and writes *app code*. The SSE vocabulary the SPA consumes is preserved; new steps add
 more step_start/step_done pairs plus `commit{...}` and `qa{...}` events.
 """
+import hashlib
 import logging
 import os
 import secrets
@@ -73,19 +74,47 @@ async def _ws_seed_backlog(project_id: str, items: list[str]) -> int:
 
 
 async def _ws_status(project_id: str, idx: int, status: str, note: str = "") -> None:
-    """Move one seeded feature. `idx` is 1-based, matching the `build_NN` step name."""
+    """Move one seeded feature. `idx` is 1-based, matching the `build_NN` step name.
+
+    VERIFY THE WRITE. `set_status` returns None — not an exception — when that `ext_key` was
+    never seeded, so a try/except alone would report a silent no-op as a success: the house
+    rule about never trusting an implicit success, applied to the tracker whose entire job is
+    making invisible work visible. It can genuinely happen: `_ws_seed_backlog` swallows its
+    own per-item failures, and a run resumed past a `done` parse_backlog step never seeds at
+    all. Seed it on the spot rather than silently losing the feature.
+    """
+    ext_key = f"build_{idx:02d}"
     try:
-        await W.set_status(project_id, f"build_{idx:02d}", _WS_ACTOR, status, note=note)
-    except Exception as e:  # noqa: BLE001
-        logger.info("workspace status for %s build_%02d skipped: %s", project_id, idx, e)
+        moved = await W.set_status(project_id, ext_key, _WS_ACTOR, status, note=note)
+        if moved is None:
+            logger.warning("workspace: %s %s was never seeded — creating it now",
+                           project_id, ext_key)
+            await W.upsert_by_ext_key(project_id, ext_key, _WS_ACTOR, kind="feature",
+                                      title=f"feature {idx}", status=status)
+            await W.set_status(project_id, ext_key, _WS_ACTOR, status, note=note)
+    except Exception as e:  # noqa: BLE001 — the tracker must never take a build down
+        logger.info("workspace status for %s %s skipped: %s", project_id, ext_key, e)
 
 
-async def _ws_bug(project_id: str, title: str, body: str) -> None:
+async def _ws_bug(project_id: str, sig: str, title: str, body: str) -> None:
     """File a runtime-QA finding as a `bug` item — QA output that lives only in a run record
-    is QA output nobody reads twice."""
+    is QA output nobody reads twice.
+
+    KEYED BY THE FINDING, not created blind. `_s_qa` runs on every create AND every update
+    run, so a persistent finding (a 404 on a favicon, a noisy third-party script) would
+    otherwise file an identical bug every single time: ten runs, thirty duplicate rows, and a
+    board that answers "what is broken?" with the same three lines over and over. Worse,
+    `perceive()` feeds the open board into every assistant's context, so the duplicates would
+    also make the agents re-investigate work already done.
+
+    The key is a hash of the finding's own text, so "the same problem" collapses to one row
+    that simply keeps its status and its comments across runs.
+    """
+    key = "qa_" + hashlib.sha1(sig.encode("utf-8", "replace")).hexdigest()[:16]
     try:
-        await W.create_item(project_id, _WS_ACTOR, kind="bug", title=title[:W.MAX_TITLE],
-                            body_md=body[:8000], status="open")
+        await W.upsert_by_ext_key(project_id, key, _WS_ACTOR, kind="bug",
+                                  title=title[:W.MAX_TITLE], body_md=body[:8000],
+                                  status="open")
     except Exception as e:  # noqa: BLE001
         logger.info("workspace bug for %s skipped: %s", project_id, e)
 
@@ -477,17 +506,27 @@ def _s_qa(brief: str):
         # can pick up on its next beat, comment on, and close.
         if not report["clean"]:
             for msg in (report.get("errors") or [])[:10]:
-                await _ws_bug(ctx.project_id, f"JS console error: {str(msg)[:200]}",
+                await _ws_bug(ctx.project_id, f"console:{msg}",
+                              f"JS console error: {str(msg)[:200]}",
                               f"Found by runtime QA on {url} after {report['rounds']} "
                               f"round(s).\n\n```\n{str(msg)[:3000]}\n```")
             for msg in (report.get("network") or [])[:10]:
-                await _ws_bug(ctx.project_id, f"Failed request: {str(msg)[:200]}",
+                await _ws_bug(ctx.project_id, f"network:{msg}",
+                              f"Failed request: {str(msg)[:200]}",
                               f"Found by runtime QA on {url}.\n\n```\n{str(msg)[:3000]}\n```")
             for f in (report.get("semantic") or [])[:10]:
-                label = f.get("flow") or f.get("name") or "flow" if isinstance(f, dict) else str(f)
+                # `semantic_qa.run()` returns `{"findings": [str, ...]}` and runtime_qa
+                # passes that list straight through, so these are STRINGS. The dict branch
+                # is defensive only — and the parentheses are load-bearing: without them
+                # Python reads `A or B or (C if cond else D)`, which evaluates `f.get` on a
+                # str and raises AttributeError *outside* `_ws_bug`'s try/except, i.e. the
+                # tracker would take the build down. That is the one thing these helpers
+                # exist not to do.
                 if isinstance(f, dict) and f.get("passed"):
                     continue
-                await _ws_bug(ctx.project_id, f"Flow does not work end-to-end: {str(label)[:180]}",
+                label = (f.get("flow") or f.get("name") or "flow") if isinstance(f, dict) else str(f)
+                await _ws_bug(ctx.project_id, f"flow:{label}",
+                              f"Flow does not work end-to-end: {str(label)[:180]}",
                               f"Found by runtime QA on {url}: a record was seeded and the "
                               f"page did not render it.\n\n```\n{str(f)[:3000]}\n```")
         status = "clean" if report["clean"] else "live-with-warnings"

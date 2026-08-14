@@ -141,7 +141,7 @@ def test_no_key_in_the_image():
     check("the tool refuses to run without the per-beat environment",
           "WORKSPACE_API_KEY / PROJECT_ID are not set" in WS and "inside a beat" in WS)
     check("the workspace skill is only offered when the key actually arrived",
-          'endswith("/workspace") and not WORKSPACE_API_KEY' in BEAT,
+          'os.path.basename(skill_dir) == "workspace" and not WORKSPACE_API_KEY' in BEAT,
           "a skill that tells an agent to run a tool that will fail is worse than no skill")
 
 
@@ -178,7 +178,14 @@ def test_pipeline_drives_the_board():
           "this is the payoff: 'the pipeline quietly dropped a feature' stops being "
           "invisible to the user")
     check("the skip note reaches the item body, not only the trail",
-          "**Blocked:** " in STORE and "body + add" in STORE)
+          "**Blocked:** " in STORE and 'fields["body_md"] = (body + line)[:MAX_BODY]' in STORE)
+    check("the body append is idempotent on the EXACT line, not a 60-char prefix",
+          "if line not in body:" in STORE,
+          "a prefix test matched whenever two notes shared an opening and dropped the one "
+          "that actually explained the outcome")
+    check("a QA finding is keyed by the finding, so a re-run does not duplicate it",
+          "upsert_by_ext_key" in PIPELINE and "hashlib.sha1(sig" in PIPELINE,
+          "_s_qa runs on every create AND update run; unkeyed creates pile up identical bugs")
     check("items are keyed so a RESUMED run updates instead of duplicating",
           "upsert_by_ext_key" in STORE and 'f"build_{i + 1:02d}"' in PIPELINE)
     check("a resume never rewrites a status backwards",
@@ -198,8 +205,12 @@ def test_the_agents_can_actually_reach_it():
     check("every assistant SEES the board every beat, deterministically",
           'ctx["workspace"]' in RUNTIME and "open_items" in RUNTIME,
           "a capability only the LLM remembers to use is a capability that never fires")
-    check("only live items are sent (a finished feature is history, not context)",
-          "W.CLOSED_STATUSES" in RUNTIME)
+    check("only live items are sent, filtered in SQL and newest-first",
+          "open_only=True" in RUNTIME and "newest_first=True" in RUNTIME)
+    check("the board is placed EARLY in the context, before the 14k serialization cap bites",
+          RUNTIME.index('ctx["workspace"]') < RUNTIME.index('ctx["platform_rules"]'),
+          "json.dumps preserves insertion order and reason() hard-slices at 14000 chars, so "
+          "anything appended last is the first thing discarded")
     check("writing to the board is offered to EVERY assistant, ungated",
           "workspace_add" in RUNTIME and "with no capability gate" in RUNTIME,
           "the read-only assistants are exactly the ones whose whole output is findings")
@@ -229,7 +240,16 @@ def test_house_rules():
           "epoch ms into a cloud is the 'HTTP 200, zero rows' bug class")
     check("SQL is parameterized — no f-string interpolation of a VALUE",
           "$1" in STORE and "%s" not in STORE
-          and 'f"%{' not in STORE.replace('f"%{q[:200]}%"', ""))
+          # the ONE f-string near SQL builds a LIKE *pattern* that is then bound as $n
+          and 'f"%{' not in STORE.replace('f"%{_like(q[:200])}%"', ""))
+    check("LIKE metacharacters in a search term are escaped, with an ESCAPE clause",
+          "def _like(" in STORE and "ESCAPE" in STORE,
+          "an unescaped `_` is a wildcard: searching `on_click` also matches `onXclick`, "
+          "and a bare `%` turns a search into a full board dump — all with HTTP 200")
+    check("the live board is filtered in SQL, not after the LIMIT",
+          "open_only" in STORE and "NOT (status = ANY(" in STORE,
+          "filtering after LIMIT spends the window on history and hands the agents an "
+          "empty board once a project's backlog is finished")
     check("a write is verified, never assumed",
           "returned no row" in STORE)
     check("list/search are bounded",

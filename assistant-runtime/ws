@@ -286,7 +286,23 @@ def main() -> int:
                     "record of who changed what.",
         epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--json", action="store_true", help="machine-readable output")
-    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # `--json` has to live on EVERY subparser as well as the root, because argparse only
+    # accepts a root-level optional BEFORE the subcommand — so `ws list --json`, which is the
+    # form every example here teaches and the only one anyone would guess, was an
+    # "unrecognized arguments" error with exit 2. Exit 2 is this tool's "I could not run",
+    # so an agent would have concluded `ws` was broken and stopped using the tracker
+    # altogether. A parent parser puts the flag in both places.
+    # `default=argparse.SUPPRESS` is the whole trick: a subparser writes its defaults into
+    # the SAME namespace the root parser already filled, so a plain `store_true` here would
+    # reset `ws --json list` back to False — trading one broken form for the other. SUPPRESS
+    # makes the subparser's copy write only when the flag is actually present, so BOTH
+    # positions work. (Verified for all four orderings.)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=lambda **kw: (
+        argparse.ArgumentParser(parents=[common], **kw)))
 
     l = sub.add_parser("list", help="list items (filter by kind/status/assignee/text)")
     l.add_argument("--kind", default=""); l.add_argument("--status", default="")

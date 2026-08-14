@@ -137,15 +137,23 @@ async def project_for_key(key: str) -> Optional[str]:
     """
     if not key or not key.startswith("wsk_"):
         return None
+    sha = _sha(key)
     pid = await pool().fetchval(
-        "SELECT project_id FROM builderapps.workspace_keys WHERE key_sha=$1", _sha(key))
+        "SELECT project_id FROM builderapps.workspace_keys WHERE key_sha=$1", sha)
     if pid:
-        # Best-effort freshness stamp; a failure here must never fail the request.
+        # Best-effort freshness stamp — and DELIBERATELY THROTTLED. This function runs on
+        # every single workspace request, and `workspace_keys` has exactly one row per
+        # project, so an unconditional UPDATE turns the tenancy check (a read) into a write
+        # on the same row from every beat and every tab poll: dead tuples on a one-row table,
+        # lock contention between concurrent beats, and a check that can never be served
+        # anywhere but the primary. Hourly resolution is all "when was this key last used?"
+        # ever needed, so the predicate does the throttling in the database.
         try:
             await pool().execute(
-                "UPDATE builderapps.workspace_keys SET last_used_at=now() WHERE key_sha=$1",
-                _sha(key))
-        except Exception:  # noqa: BLE001
+                "UPDATE builderapps.workspace_keys SET last_used_at=now() "
+                "WHERE key_sha=$1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 hour')",
+                sha)
+        except Exception:  # noqa: BLE001 — a stamp must never fail a request
             logger.debug("workspace key last_used_at stamp failed", exc_info=True)
     return str(pid) if pid else None
 
@@ -256,26 +264,50 @@ async def get_by_ext_key(project_id: str, ext_key: str) -> Optional[dict]:
     return _row(r) if r else None
 
 
+def _like(term: str) -> str:
+    """Escape a user's search text so LIKE metacharacters are LITERAL.
+
+    Without this, `ws search rate_limit` treats `_` as "any character" and quietly returns
+    `rate-limit` and `rateXlimit` too — while making it impossible to search for a real
+    identifier like `on_click` or `body_md`. A query of a bare `%` becomes "match every row",
+    i.e. a search that silently turns into a full board dump. And a trailing backslash
+    escapes the wildcard we append, so the pattern matches nothing. All three fail as WRONG
+    RESULTS with HTTP 200 — never as an error — which is the worst way for a search to break.
+    """
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 async def list_items(project_id: str, *, kind: str = "", status: str = "",
                      assignee: str = "", q: str = "", limit: int = 200,
-                     offset: int = 0) -> list[dict]:
-    """Filtered list. Every filter is optional and every one is a bound parameter."""
+                     offset: int = 0, open_only: bool = False,
+                     newest_first: bool = False) -> list[dict]:
+    """Filtered list. Every filter is optional and every one is a bound parameter.
+
+    `open_only` excludes the closed statuses IN THE QUERY rather than in the caller. That
+    distinction is not cosmetic: filtering after a `LIMIT` means the limit is spent on
+    history, so once a project has more finished items than the cap, "the live board" comes
+    back empty and whoever asked for it goes blind with no error to notice.
+    """
     where = ["project_id = $1"]
     args: list[Any] = [project_id]
     if kind:
         args.append(kind[:40]); where.append(f"kind = ${len(args)}")
     if status:
         args.append(status[:40]); where.append(f"status = ${len(args)}")
+    if open_only:
+        args.append(list(CLOSED_STATUSES)); where.append(f"NOT (status = ANY(${len(args)}::text[]))")
     if assignee:
         args.append(assignee[:120]); where.append(f"assignee = ${len(args)}")
     if q:
-        args.append(f"%{q[:200]}%")
-        where.append(f"(title ILIKE ${len(args)} OR body_md ILIKE ${len(args)})")
+        args.append(f"%{_like(q[:200])}%")
+        where.append(f"(title ILIKE ${len(args)} ESCAPE '\\' "
+                     f"OR body_md ILIKE ${len(args)} ESCAPE '\\')")
     args.append(min(int(limit or 200), MAX_LIST))
     args.append(max(int(offset or 0), 0))
+    order = "updated_at DESC, id DESC" if newest_first else "id"
     rows = await pool().fetch(
         f"SELECT {_COLS} FROM builderapps.workspace_items WHERE {' AND '.join(where)} "
-        f"ORDER BY id LIMIT ${len(args) - 1} OFFSET ${len(args)}", *args)
+        f"ORDER BY {order} LIMIT ${len(args) - 1} OFFSET ${len(args)}", *args)
     return [_row(r) for r in rows]
 
 
@@ -354,20 +386,27 @@ async def set_status(project_id: str, ext_key: str, actor: Actor, status: str,
     item = await get_by_ext_key(project_id, ext_key)
     if not item:
         return None
-    updated = await update_item(int(item["id"]), project_id, actor, status=status)
+
+    # The reason belongs in the BODY, not only in the trail — an item you have to open the
+    # history to understand is an item nobody understands. Composed here and passed to the
+    # single `update_item` call rather than written by a second UPDATE afterwards: the
+    # pipeline calls this three or four times per feature and ~50 times per build, and the
+    # old shape cost a re-SELECT and a second write every time.
+    fields: dict[str, Any] = {"status": status}
+    if note:
+        body = item.get("body_md") or ""
+        line = ("\n\n**Blocked:** " + note[:1500]) if status == "blocked" \
+            else ("\n\n_" + note[:1500] + "_")
+        # Idempotent on a resumed run: compare the EXACT line we are about to append, not a
+        # 60-character prefix of the note. The prefix test matched whenever two notes shared
+        # an opening — e.g. a retry note and the final `blocked` note — and silently dropped
+        # the one that actually explained the outcome.
+        if line not in body:
+            fields["body_md"] = (body + line)[:MAX_BODY]
+
+    updated = await update_item(int(item["id"]), project_id, actor, **fields)
     if note:
         await add_event(int(item["id"]), project_id, actor, "note", note=note)
-        # The reason belongs in the body too — an item you have to open the trail to
-        # understand is an item nobody understands.
-        body = (updated or item).get("body_md") or ""
-        marker = "\n\n**Blocked:** " if status == "blocked" else "\n\n_"
-        add = f"{marker}{note[:1500]}" + ("" if status == "blocked" else "_")
-        if note[:60] not in body:
-            await pool().execute(
-                "UPDATE builderapps.workspace_items SET body_md=left($3, $4), updated_at=now() "
-                "WHERE id=$1 AND project_id=$2",
-                int(item["id"]), project_id, body + add, MAX_BODY)
-            updated = await get_item(int(item["id"]), project_id)
     return updated
 
 

@@ -35,6 +35,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from server import assistant_api
 from server import assistants as A
 from server import introspect, store
 from server import workspace_store as W
@@ -138,18 +139,15 @@ async def _actor_from_headers(request: Request, project_id: str) -> W.Actor:
 
 
 async def _owner_only(project_id: str, request: Request) -> dict:
-    """For the routes a shared key must NOT reach (revealing the key itself)."""
-    user_id = await authenticate(request)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    try:
-        introspect.assert_shortid(project_id)
-    except introspect.BadPath:
-        raise HTTPException(status_code=404, detail="not found")
-    proj = await store.get_project(project_id, user_id)
-    if not proj:
-        raise HTTPException(status_code=404, detail="not found")
-    return proj
+    """For the routes a shared key must NOT reach (revealing the key itself).
+
+    Deliberately the SAME function the assistants router uses, not a fourth hand-written
+    copy of authenticate -> assert_shortid -> get_project -> 404. That check is the tenancy
+    boundary; every copy of it is somewhere a future change (a new auth mode, an org model,
+    an audit log on ownership failures) can be forgotten, and a forgotten copy still returns
+    a plausible answer, so nothing fails loudly.
+    """
+    return await assistant_api._owned(project_id, request)
 
 
 # ---------------------------------------------------------------------------

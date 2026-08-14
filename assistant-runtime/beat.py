@@ -71,9 +71,15 @@ BROWSER_TIMEOUT_SEC = int(os.environ.get("BROWSER_TIMEOUT_SEC", "180"))
 WORKSPACE_API_KEY = os.environ.get("WORKSPACE_API_KEY", "")
 # Every skill directory we hand Pi explicitly. A LIST, not one path: phase 31 shipped one
 # skill and hardcoded it, and phase 32's second skill would have silently replaced it.
-PI_SKILLS = [s for s in os.environ.get(
+# `PI_SKILLS_DIR` (singular) is still honoured — it was the phase-31 override, and renaming
+# an env var without a fallback means any deployment still setting it is silently ignored
+# and gets the defaults instead. Entries are STRIPPED: `a, b` would otherwise keep the
+# leading space and `os.path.isdir` would quietly drop the second skill.
+PI_SKILLS = [s.strip().rstrip("/") for s in os.environ.get(
     "PI_SKILLS_DIRS",
-    "/app/skills/browser-verify,/app/skills/workspace").split(",") if s.strip()]
+    os.environ.get("PI_SKILLS_DIR",
+                   "/app/skills/browser-verify,/app/skills/workspace")).split(",")
+    if s.strip()]
 
 # House rule: never slurp a file into RAM without a cap.
 FILE_CAP = 200 * 1024
@@ -623,8 +629,12 @@ def run_pi(task: str, grounding: str, app_url: str = "", assistant_name: str = "
     ]
     for skill_dir in PI_SKILLS:
         # The workspace skill is only offered when the key to use it actually arrived. A
-        # skill that tells an agent to run a tool that will fail is worse than no skill.
-        if skill_dir.endswith("/workspace") and not WORKSPACE_API_KEY:
+        # skill that tells an agent to run a tool that will fail is worse than no skill —
+        # `ws` exits 2 on every call without the key, and an agent that hits that concludes
+        # the tracker is broken. Matched on the directory NAME, not on a path suffix: a
+        # trailing slash or a relocated skills root would defeat `endswith("/workspace")`
+        # and re-enable exactly the case this guard exists to prevent.
+        if os.path.basename(skill_dir) == "workspace" and not WORKSPACE_API_KEY:
             continue
         if os.path.isdir(skill_dir):
             cmd += ["--skill", skill_dir]
