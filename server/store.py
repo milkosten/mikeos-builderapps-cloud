@@ -130,6 +130,25 @@ async def get_secret(project_id: str, key: str) -> Optional[str]:
     return crypto.decrypt(enc) if enc else None
 
 
+async def list_secrets(project_id: str) -> list[dict]:
+    """[{key, value}] with the PLAINTEXT value — callers MUST mask before returning it to a
+    client, and must never log it. Bounded to 200 rows."""
+    rows = await pool().fetch(
+        "SELECT secret_key FROM builderapps.project_secrets WHERE project_id=$1 "
+        "ORDER BY secret_key LIMIT 200", project_id,
+    )
+    out = []
+    for r in rows:
+        key = r["secret_key"]
+        try:
+            value = await get_secret(project_id, key) or ""
+        except Exception as e:  # noqa: BLE001 — never leak the value into the log
+            logger.warning("could not decrypt secret %s for %s: %s", key, project_id, type(e).__name__)
+            value = ""
+        out.append({"key": key, "value": value})
+    return out
+
+
 # ---- deployments ----------------------------------------------------------
 async def create_deployment(project_id: str, image_tag: str = "",
                             compose_hash: str = "") -> int:
@@ -141,6 +160,16 @@ async def create_deployment(project_id: str, image_tag: str = "",
     if dep_id is None:
         raise RuntimeError("create_deployment returned no id")
     return int(dep_id)
+
+
+async def list_deployments(project_id: str, limit: int = 50) -> list[dict]:
+    rows = await pool().fetch(
+        "SELECT id,image_tag,status,health,started_at,finished_at "
+        "FROM builderapps.deployments WHERE project_id=$1 "
+        "ORDER BY started_at DESC LIMIT $2",
+        project_id, max(1, min(int(limit), 200)),
+    )
+    return [dict(r) for r in rows]
 
 
 async def finish_deployment(dep_id: int, status: str, health: str = "") -> None:
@@ -309,6 +338,33 @@ async def put_messages(project_id: str, messages: list[dict]) -> int:
     if not res.endswith(("INSERT 0 1", "UPDATE 1")):
         raise RuntimeError(f"put_messages did not affect a row: {res!r}")
     return len(clean)
+
+
+async def all_steps_for_project(project_id: str) -> list[dict]:
+    """Every step of every run for the project, oldest run first (the durable record of what
+    the pipeline has actually executed). Bounded."""
+    rows = await pool().fetch(
+        "SELECT s.run_id, s.idx, s.name, s.status, s.log, s.ts "
+        "FROM builderapps.pipeline_steps s "
+        "JOIN builderapps.pipeline_runs r ON r.id = s.run_id "
+        "WHERE r.project_id = $1 ORDER BY r.created_at, s.idx LIMIT 1000",
+        project_id,
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_raw_thread(project_id: str) -> list[dict]:
+    """The stored thread entries verbatim (role/text/ts/meta) — used by /qa, which needs the
+    structured `meta` the sanitized message view drops."""
+    thread = await pool().fetchval(
+        "SELECT thread FROM builderapps.messages WHERE project_id=$1", project_id
+    )
+    if isinstance(thread, str):
+        try:
+            thread = json.loads(thread)
+        except Exception:  # noqa: BLE001
+            return []
+    return [t for t in thread if isinstance(t, dict)] if isinstance(thread, list) else []
 
 
 async def steps_for_latest_run(project_id: str) -> dict:

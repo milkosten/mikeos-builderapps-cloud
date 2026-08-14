@@ -260,7 +260,11 @@ def _s_qa(brief: str):
         await store.append_message(ctx.project_id, "qa", report.get("critic", ""),
                                    {"clean": report["clean"], "rounds": report["rounds"],
                                     "errors": report["errors"][:20],
-                                    "network": report["network"][:20]})
+                                    "network": report["network"][:20],
+                                    # the QA tab reads server_errors — persist them properly
+                                    # instead of leaving it to infer from `network`.
+                                    "server_errors": (report.get("server_errs") or "")
+                                    .splitlines()[:20]})
         await _commit(ctx, "qa: runtime QA results")
         status = "clean" if report["clean"] else "live-with-warnings"
         return f"QA {status} after {report['rounds']} round(s); critic: {report['critic'][:200]}"

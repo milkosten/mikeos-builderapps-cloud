@@ -291,6 +291,21 @@ async def stop(shortid: str) -> None:
     await _run(args + ["stop"], timeout=120)
 
 
+async def start(shortid: str) -> None:
+    """Bring a stopped stack back up. `up -d` (not `start`) so a stack whose containers were
+    removed is recreated; it needs the .env for ${DB_PASSWORD}, which the workspace already
+    holds from the last deploy."""
+    f = await _compose_file(shortid)
+    args = ["docker", "compose", "-p", shortid] + (["-f", str(f)] if f else [])
+    if f:
+        from server import workspace as ws
+        rc, out = await _run(args + ["up", "-d"], cwd=ws.path_for(shortid), timeout=300)
+        if rc == 0:
+            return
+        logger.warning("compose up for %s failed, falling back to start: %s", shortid, out[-300:])
+    await _run(args + ["start"], timeout=180)
+
+
 async def restart(shortid: str) -> None:
     f = await _compose_file(shortid)
     args = ["docker", "compose", "-p", shortid] + (["-f", str(f)] if f else [])

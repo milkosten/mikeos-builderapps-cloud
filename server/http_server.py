@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from server import db, gitea, store
+from server import db, deployer, gitea, introspect, store, workspace
 from server.harness import pipeline
 from server.identity import authenticate, current_user
 
@@ -106,6 +106,10 @@ class MessagesBody(BaseModel):
     """The durable chat thread. Sanitized server-side (store.sanitize_messages) — the client
     may send anything; only {role,text} survives."""
     messages: list[dict] = Field(default_factory=list)
+
+
+class LifecycleBody(BaseModel):
+    action: str = Field(..., min_length=1, max_length=16)
 
 
 # ---- SSE plumbing ---------------------------------------------------------
@@ -288,3 +292,208 @@ async def put_project_messages(project_id: str, body: MessagesBody, request: Req
         raise HTTPException(status_code=404, detail="not found")
     stored = await store.put_messages(project_id, body.messages)
     return {"ok": True, "stored": stored}
+
+
+# ===========================================================================
+# Project introspection — the builder UI's tabs (Goals/Code/Database/…)
+#
+# Every route below is dual-authed AND ownership-checked through `_owned()`, which is also
+# where the project id is validated against ^[0-9a-z]{6}$ *before* it can reach a docker or
+# psql argv. Another user's project is indistinguishable from a missing one: 404.
+# Each list endpoint returns an EMPTY list rather than 404/500 when the project simply has
+# no data yet — the pipeline may still be running.
+# ===========================================================================
+async def _owned(project_id: str, request: Request) -> dict:
+    """Authenticate, validate the id shape, and confirm the caller owns the project."""
+    user_id = await _auth_and_provision(request)
+    try:
+        introspect.assert_shortid(project_id)
+    except introspect.BadPath:
+        raise HTTPException(status_code=404, detail="not found")
+    proj = await store.get_project(project_id, user_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="not found")
+    return proj
+
+
+def _bad_path(e: Exception) -> HTTPException:
+    return HTTPException(status_code=400, detail=str(e) or "invalid path")
+
+
+# ---- 1/2 docs -------------------------------------------------------------
+@app.get("/api/projects/{project_id}/docs")
+async def project_docs(project_id: str, request: Request):
+    await _owned(project_id, request)
+    return {"docs": introspect.list_docs(project_id)}
+
+
+@app.get("/api/projects/{project_id}/docs/{name}")
+async def project_doc(project_id: str, name: str, request: Request):
+    await _owned(project_id, request)
+    try:
+        doc = introspect.read_doc(project_id, name)
+    except introspect.BadPath as e:
+        raise _bad_path(e)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    return doc
+
+
+# ---- 3/4 repo tree + file content -----------------------------------------
+@app.get("/api/projects/{project_id}/files")
+async def project_files(project_id: str, request: Request, path: str = ""):
+    await _owned(project_id, request)
+    try:
+        return {"entries": introspect.list_files(project_id, path)}
+    except introspect.BadPath as e:
+        raise _bad_path(e)
+
+
+@app.get("/api/projects/{project_id}/file")
+async def project_file(project_id: str, request: Request, path: str = ""):
+    await _owned(project_id, request)
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    try:
+        f = introspect.read_file(project_id, path)
+    except introspect.BadPath as e:
+        raise _bad_path(e)
+    if f is None:
+        raise HTTPException(status_code=404, detail="file not found")
+    return f
+
+
+# ---- 5 the project's own database -----------------------------------------
+@app.get("/api/projects/{project_id}/database")
+async def project_database(project_id: str, request: Request):
+    await _owned(project_id, request)
+    db_password = await store.get_secret(project_id, "db_password")
+    return await introspect.database(project_id, db_password)
+
+
+# ---- 6 secrets ------------------------------------------------------------
+@app.get("/api/projects/{project_id}/secrets")
+async def project_secrets(project_id: str, request: Request, reveal: int = 0):
+    """Masked by default. `?reveal=1` returns the real values — only ever to the owner, who
+    is the only caller that gets this far, and the values are never logged."""
+    await _owned(project_id, request)
+    items = await store.list_secrets(project_id)
+    return {"secrets": [
+        {"key": s["key"], "masked": introspect.mask_secret(s["value"]),
+         "value": s["value"] if reveal else None}
+        for s in items
+    ]}
+
+
+# ---- 7 logs ---------------------------------------------------------------
+@app.get("/api/projects/{project_id}/logs")
+async def project_logs(project_id: str, request: Request, tail: int = 200):
+    await _owned(project_id, request)
+    return {"lines": await introspect.logs(project_id, tail)}
+
+
+# ---- 8 commits ------------------------------------------------------------
+@app.get("/api/projects/{project_id}/commits")
+async def project_commits(project_id: str, request: Request, limit: int = 30):
+    proj = await _owned(project_id, request)
+    return {"commits": await introspect.commits(
+        project_id, proj.get("gitea_owner", ""), proj.get("gitea_repo", ""), limit)}
+
+
+# ---- 9 deployments --------------------------------------------------------
+@app.get("/api/projects/{project_id}/deployments")
+async def project_deployments(project_id: str, request: Request):
+    await _owned(project_id, request)
+    rows = await store.list_deployments(project_id)
+    return {"deployments": [
+        {"id": r["id"], "image_tag": r["image_tag"], "status": r["status"],
+         "health": r["health"], "started_at": r["started_at"],
+         "finished_at": r["finished_at"]}
+        for r in rows
+    ]}
+
+
+# ---- 10 runtime QA --------------------------------------------------------
+@app.get("/api/projects/{project_id}/qa")
+async def project_qa(project_id: str, request: Request):
+    await _owned(project_id, request)
+    thread = await store.get_raw_thread(project_id)
+    qa_entries = [t for t in thread if str(t.get("role", "")).lower() == "qa"]
+    steps = await store.all_steps_for_project(project_id)
+    qa_steps = [s for s in steps if s.get("name") == "runtime_qa"]
+    return {"rounds": introspect.qa_rounds(qa_entries, qa_steps)}
+
+
+# ---- 11 backlog -----------------------------------------------------------
+@app.get("/api/projects/{project_id}/backlog")
+async def project_backlog(project_id: str, request: Request):
+    await _owned(project_id, request)
+    steps = await store.all_steps_for_project(project_id)
+    return {"items": introspect.backlog(project_id, steps)}
+
+
+# ---- 12 routes ------------------------------------------------------------
+@app.get("/api/projects/{project_id}/routes")
+async def project_routes(project_id: str, request: Request):
+    await _owned(project_id, request)
+    return {"routes": introspect.routes(project_id)}
+
+
+# ---- 13 metrics -----------------------------------------------------------
+@app.get("/api/projects/{project_id}/metrics")
+async def project_metrics(project_id: str, request: Request):
+    await _owned(project_id, request)
+    return {"containers": await introspect.metrics(project_id)}
+
+
+# ---- 14 cache -------------------------------------------------------------
+@app.get("/api/projects/{project_id}/cache")
+async def project_cache(project_id: str, request: Request):
+    await _owned(project_id, request)
+    return await introspect.cache(project_id)
+
+
+# ---- 15 domain + TLS ------------------------------------------------------
+@app.get("/api/projects/{project_id}/domain")
+async def project_domain(project_id: str, request: Request):
+    proj = await _owned(project_id, request)
+    return await introspect.domain(project_id, proj.get("subdomain", ""))
+
+
+# ---- 16 non-secret env ----------------------------------------------------
+@app.get("/api/projects/{project_id}/env")
+async def project_env(project_id: str, request: Request):
+    await _owned(project_id, request)
+    return {"env": await introspect.env(project_id)}
+
+
+# ---- 17 lifecycle ---------------------------------------------------------
+@app.post("/api/projects/{project_id}/lifecycle")
+async def project_lifecycle(project_id: str, body: LifecycleBody, request: Request):
+    """stop | start | restart | destroy. `destroy` also marks the project row and reaps the
+    workspace checkout and the data volumes. The returned status is OBSERVED from docker,
+    not assumed."""
+    await _owned(project_id, request)
+    action = (body.action or "").strip().lower()
+    if action not in introspect.LIFECYCLE_ACTIONS:
+        raise HTTPException(status_code=400, detail="action must be one of "
+                            + "|".join(introspect.LIFECYCLE_ACTIONS))
+    try:
+        if action == "stop":
+            await deployer.stop(project_id)
+            await store.set_project_status(project_id, "stopped")
+        elif action == "start":
+            await deployer.start(project_id)
+            await store.set_project_status(project_id, "live")
+        elif action == "restart":
+            await deployer.restart(project_id)
+            await store.set_project_status(project_id, "live")
+        else:  # destroy
+            await deployer.destroy(project_id)
+            await introspect.reap_volumes(project_id)
+            workspace.cleanup(project_id)
+            await store.set_project_status(project_id, "destroyed")
+    except Exception as e:  # noqa: BLE001
+        logger.exception("lifecycle %s failed for %s", action, project_id)
+        raise HTTPException(status_code=500, detail=f"{action} failed: {e}")
+    return {"ok": True, "status": await introspect.observed_status(project_id)}
