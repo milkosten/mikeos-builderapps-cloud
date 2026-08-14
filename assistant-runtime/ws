@@ -151,9 +151,14 @@ def cmd_list(args) -> int:
     if not items:
         print("no items match. `ws new --kind feature --title '...'` creates one.")
         return OK
+    # The counts are the WHOLE board's, not the filtered view's — so say so. Printed
+    # unlabelled next to `ws list --kind doc`, "1 item(s)  done:1 open:2" reads as a
+    # contradiction, and a tool that looks like it is lying stops being used.
     counts = (res.get("counts") or {}).get("by_status") or {}
-    print(f"{len(items)} item(s)   " +
-          "  ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    tally = "  ".join(f"{k}:{v}" for k, v in sorted(counts.items()))
+    filtered = any([args.kind, args.status, args.assignee, args.q])
+    print(f"{len(items)} item(s)" + (" matching your filter" if filtered else "")
+          + (f"   |   whole board: {tally}" if tally else ""))
     print("")
     for it in items:
         print(one_line(it))
