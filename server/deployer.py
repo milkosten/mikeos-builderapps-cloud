@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -198,6 +199,18 @@ async def _ensure_vol_dirs(shortid: str) -> None:
         Path(f"{VOL_ROOT}/{shortid}/{sub}").mkdir(parents=True, exist_ok=True)
 
 
+_SLOW_DEP_RE = re.compile(
+    r"dependency \S* ?failed to start"
+    r"|container .* is unhealthy"
+    r"|health check .*(timeout|failed)",
+    re.I)
+
+
+def _is_slow_dependency(compose_output: str) -> bool:
+    """True when `compose up` gave up waiting on db/redis rather than hitting a real fault."""
+    return bool(_SLOW_DEP_RE.search(compose_output or ""))
+
+
 async def _subnet_for(shortid: str) -> Optional[str]:
     """The explicit /24 to write into the compose, or None to let Docker choose.
 
@@ -247,6 +260,16 @@ async def deploy(shortid: str, workspace: Path, *, db_password: str, app_secret:
                 await store.finish_deployment(dep_id, "failed", out[-2000:])
                 raise RuntimeError(f"compose build failed: {out[-1500:]}")
         rc, out = await _run(compose_base + ["up", "-d"], cwd=workspace, env=env, timeout=300)
+        if rc != 0 and _is_slow_dependency(out):
+            # "dependency failed to start" is almost never a broken app: on a box whose RAID6
+            # array is saturated, a first-boot `initdb` simply outruns the db healthcheck's
+            # 12x10s budget and compose gives up while Postgres is still coming up. A slow
+            # start is not a failure (the same lesson already applied to the internal health
+            # gate). Give it a breath and try once more — the second `up` finds a healthy db.
+            logger.warning("compose up for %s hit a slow dependency; retrying once", shortid)
+            await asyncio.sleep(45)
+            rc, out = await _run(compose_base + ["up", "-d"], cwd=workspace, env=env,
+                                 timeout=300)
         if rc != 0:
             await store.finish_deployment(dep_id, "failed", out[-2000:])
             raise RuntimeError(f"compose up failed: {out[-1500:]}")
