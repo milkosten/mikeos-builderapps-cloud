@@ -1,7 +1,7 @@
 """Offline tests for semantic QA (phase 28).
 
 Replays the exact bug that slipped through the old QA — the link shortener that rendered
-"No links yet" while rows sat in Postgres — with a FAKE app (httpx + chrome monkeypatched),
+"No links yet" while rows sat in Postgres — with a FAKE app behind a fake Browser session,
 and proves the three-way verdict localizes each break:
 
     write fails      -> "creating a record failed"
@@ -62,15 +62,15 @@ class FakeApp:
         path = url.split("builderapps.osmike.com", 1)[-1] or "/"
         if method == "POST" and path == "/api/links":
             if self.mode == "write_fails":
-                return FakeResponse(422, '{"error":"invalid input syntax for type integer"}')
+                return 422, '{"error":"invalid input syntax for type integer"}'
             marker = (json or {}).get("title", "")
             self.rows.append(marker)
-            return FakeResponse(201, '{"id":7,"title":"%s"}' % marker)
+            return 201, '{"id":7,"title":"%s"}' % marker
         if method == "GET" and path == "/api/links":
             if self.mode == "read_missing":
-                return FakeResponse(200, '{"links":[]}')
-            return FakeResponse(200, '{"links":%s}' % json_dumps(self.rows))
-        return FakeResponse(404, "not found")
+                return 200, '{"links":[]}'
+            return 200, '{"links":%s}' % json_dumps(self.rows)
+        return 404, "not found"
 
 
 def json_dumps(rows):
@@ -82,29 +82,38 @@ FLOW = [{"name": "shorten a URL and see it listed", "method": "POST", "path": "/
          "list": "/api/links", "page": "/"}]
 
 
-async def _run_with(mode: str, page_text: str) -> dict:
+async def _run_with(mode: str, page_text) -> dict:
+    """Drive run_flows against a fake app through a fake single-session Browser.
+
+    The transport under test is the SAME browser for seed + render (see semantic_qa.Browser):
+    a fake session object stands in for chrome-pool, so the three-way verdict is exercised
+    without a real Chrome.
+    """
     app = FakeApp(mode)
 
-    class FakeClient:
+    class FakeBrowser:
+        def __init__(self, base_url):
+            self.base = base_url
+
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, *a):
             return False
 
-        async def request(self, method, url, json=None, **kw):
-            return await app.request(method, url, json=json)
+        async def request(self, method, path, body=None):
+            return await app.request(method, self.base + path, json=body)
+
+        async def page_text(self, path):
+            return page_text(app) if callable(page_text) else page_text
 
     import server.harness.semantic_qa as sq
-    real_client, real_eval = sq.httpx.AsyncClient, chrome.eval_js
-    sq.httpx.AsyncClient = lambda *a, **k: FakeClient()
-    chrome.eval_js = lambda url, expr, **k: _async(page_text(app) if callable(page_text)
-                                                   else page_text)
+    real = sq.browser_factory
+    sq.browser_factory = FakeBrowser
     try:
         return await sq.run_flows(PROJECT, "https://sem001.builderapps.osmike.com", FLOW)
     finally:
-        sq.httpx.AsyncClient = real_client
-        chrome.eval_js = real_eval
+        sq.browser_factory = real
 
 
 async def _async(v):

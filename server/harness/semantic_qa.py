@@ -27,6 +27,12 @@ The three-way outcome is the whole value — it localizes the bug for the repair
 Flows come from `docs/UX.md` + the app's real routes, so QA tests what the app was *meant* to
 do rather than a generic guess. Everything is best-effort about capturing and strict about
 reporting: an inconclusive probe is never reported as a pass.
+
+**The seed and the render share ONE browser session.** Seeding over a server-side HTTP client
+put the app's session cookie in that client's jar, and the render check then opened a fresh,
+logged-OUT browser — so on any app with a login every flow "failed" and QA cried wolf (three
+of four measured builds). The seed is now a `fetch(..., credentials:'same-origin')` from
+inside the page, so the render sees exactly the session a real user would.
 """
 import asyncio
 import json
@@ -152,24 +158,95 @@ def _same_route(template: str, concrete: str) -> bool:
     return all(seg.startswith(":") or seg == other for seg, other in zip(a, b))
 
 
-async def _json_request(client: httpx.AsyncClient, method: str, url: str,
-                        body: Optional[dict] = None) -> tuple[int, str]:
-    try:
-        r = await client.request(method, url, json=body)
-        return r.status_code, (r.text or "")[:4000]
-    except Exception as e:  # noqa: BLE001
-        return 0, f"request failed: {e}"
+class Browser:
+    """One chrome-pool session used for BOTH the seed and the render check.
+
+    This has to be the same session, or the check is meaningless on any app with a login:
+    seeding over a server-side HTTP client puts the session cookie in *that* client's jar,
+    then rendering in a fresh browser shows a logged-OUT page and every flow "fails". The
+    seed therefore runs as `fetch(..., credentials:'same-origin')` from inside the page, so
+    whatever cookie the app sets is the browser's own and the render sees the same session a
+    real user would.
+
+    `fetch` is async and chrome-pool's /eval is synchronous, so a request is kicked off into
+    `window.__qa_seed` and then polled.
+    """
+
+    def __init__(self, base_url: str):
+        self.base = base_url.rstrip("/")
+        self.sid: Optional[str] = None
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def __aenter__(self) -> "Browser":
+        self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, verify=False,
+                                         auth=(chrome.CHROME_POOL_USER, chrome.CHROME_POOL_PASS))
+        r = await self._client.post(f"{chrome.CHROME_POOL_URL}/session")
+        r.raise_for_status()
+        j = r.json() or {}
+        self.sid = j.get("sessionId") or j.get("id")
+        if not self.sid:
+            raise RuntimeError("chrome-pool gave no session id")
+        await self.goto("/")
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        try:
+            if self.sid and self._client:
+                await self._client.post(f"{chrome.CHROME_POOL_URL}/session/{self.sid}/close")
+        except Exception:  # noqa: BLE001
+            pass
+        if self._client:
+            await self._client.aclose()
+        return False
+
+    async def _eval(self, expression: str) -> Any:
+        r = await self._client.post(f"{chrome.CHROME_POOL_URL}/session/{self.sid}/eval",
+                                    json={"expression": expression})
+        return (r.json() or {}).get("value")
+
+    async def goto(self, path: str) -> None:
+        await self._client.post(f"{chrome.CHROME_POOL_URL}/session/{self.sid}/navigate",
+                                json={"url": self.base + (path or "/"), "acceptCookies": True})
+        await asyncio.sleep(1.2)
+
+    async def request(self, method: str, path: str,
+                      body: Optional[dict] = None) -> tuple[int, str]:
+        """Issue an API call FROM THE PAGE, carrying the browser's own cookies."""
+        opts = {"method": method, "credentials": "same-origin",
+                "headers": {"Content-Type": "application/json"}}
+        if body is not None:
+            opts["body"] = json.dumps(body)
+        kick = ("(function(){window.__qa_seed=null;"
+                f"fetch({json.dumps(path)},{json.dumps(opts)})"
+                ".then(function(r){return r.text().then(function(t){"
+                "window.__qa_seed={status:r.status,text:t.slice(0,4000)};});})"
+                ".catch(function(e){window.__qa_seed={status:0,text:'fetch failed: '+e};});"
+                "return 'sent';})()")
+        try:
+            await self._eval(kick)
+            for _ in range(20):                    # up to ~10s
+                await asyncio.sleep(0.5)
+                raw = await self._eval("JSON.stringify(window.__qa_seed)")
+                if isinstance(raw, str) and raw and raw != "null":
+                    got = json.loads(raw)
+                    return int(got.get("status") or 0), str(got.get("text") or "")
+            return 0, "request timed out in the browser"
+        except Exception as e:  # noqa: BLE001
+            return 0, f"request failed: {e}"
+
+    async def page_text(self, path: str) -> str:
+        """The page's visible text, retried — a list is usually fetched after load."""
+        await self.goto(path)
+        for attempt in range(RENDER_ATTEMPTS):
+            text = await self._eval(
+                "(document.body && document.body.innerText || '').slice(0,20000)")
+            if isinstance(text, str) and text.strip():
+                return text
+            await asyncio.sleep(1.5 * (attempt + 1))
+        return ""
 
 
-async def _rendered_text(url: str) -> str:
-    """The page's visible text, retried — a list is usually fetched after load."""
-    for attempt in range(RENDER_ATTEMPTS):
-        text = await chrome.eval_js(
-            url, "(document.body && document.body.innerText || '').slice(0,20000)")
-        if isinstance(text, str) and text.strip():
-            return text
-        await asyncio.sleep(1.5 * (attempt + 1))
-    return ""
+browser_factory = Browser        # swapped out by the offline tests
 
 
 async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
@@ -181,14 +258,12 @@ async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
     exactly which of the three links in the chain broke.
     """
     result: Dict[str, Any] = {"findings": [], "checked": 0, "passed": 0, "detail": []}
-    base = base_url.rstrip("/")
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+    async with browser_factory(base_url) as br:
         for flow in flows:
             marker = _marker()
             body = _inject(flow["body"], marker)
-            url = base + flow["path"]
             result["checked"] += 1
-            status, text = await _json_request(client, flow["method"], url, body)
+            status, text = await br.request(flow["method"], flow["path"], body)
             step = {"flow": flow["name"], "marker": marker, "create_status": status}
 
             # 1. the WRITE path — never trust 200 alone: the record must come back with an id
@@ -204,7 +279,7 @@ async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
             list_path = flow.get("list")
             api_has = None
             if list_path:
-                lstatus, ltext = await _json_request(client, "GET", base + list_path)
+                lstatus, ltext = await br.request("GET", list_path)
                 if 200 <= lstatus < 300:
                     api_has = marker in ltext
                     if not api_has:
@@ -224,8 +299,7 @@ async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
                     continue
 
             # 3. the RENDER — the only assertion that catches "No links yet" with rows in the DB
-            page = base + (flow.get("page") or "/")
-            shown = await _rendered_text(page)
+            shown = await br.page_text(flow.get("page") or "/")
             if not shown:
                 result["detail"].append({**step, "verdict": "page_unreadable"})
                 result["findings"].append(
