@@ -14,3 +14,8 @@ cryptography>=42.0.0
 
 # compose normalizer (parse/rewrite docker-compose.yml)
 PyYAML>=6.0
+
+# phase 34: the Discuss room reads PDFs the user points it at. chrome-pool downloads the
+# bytes; this extracts the text, because Chrome renders a PDF in a viewer whose DOM snapshot
+# says nothing about the document.
+pypdf>=4.2.0

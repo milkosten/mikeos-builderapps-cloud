@@ -23,8 +23,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from server import (assistant_api, assistant_runtime, browser_proxy, budget, db, deployer,
-                    gitea, identity, introspect, llm_proxy, messaging, naming, runner, store,
-                    workspace, workspace_api, usage, ws_hub)
+                    discuss, discuss_api, gitea, identity, introspect, llm_proxy, messaging,
+                    naming, runner, store, workspace, workspace_api, usage, ws_hub)
 from server.harness import pipeline
 from server.identity import authenticate, current_user
 
@@ -110,6 +110,13 @@ app.include_router(browser_proxy.router)
 # routes are published in /openapi.json and the Workspace tab is just one of its clients.
 app.include_router(workspace_api.router)
 
+# The pre-build DISCUSSION room (phase 34). Its own router and its own table, because a
+# discussion is not a project: it has no repo, no subnet, no subdomain and no container, and
+# the moment it pretends otherwise something will try to deploy a conversation. It ends by
+# handing `POST /api/projects` a real BRIEF instead of the one sentence the pipeline used to
+# have to guess a whole product from.
+app.include_router(discuss_api.router)
+
 _CORS_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS", "https://builderapps.osmike.com").split(",") if o.strip()]
 app.add_middleware(
@@ -154,6 +161,11 @@ async def _auth_and_provision(request: Request) -> str:
 class CreateBody(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=8000)
     title: Optional[str] = None
+    # Phase 34. When this names a discussion the caller owns, the SERVER composes the brief
+    # from that discussion's canvas + thread and builds from THAT — the client's `prompt` is
+    # then only a fallback. Composed server-side on purpose: the brief is the whole value of
+    # a discussion, and a browser is the wrong place to assemble (or truncate) it.
+    discussion_id: Optional[str] = None
 
 
 class UpdateBody(BaseModel):
@@ -253,6 +265,24 @@ async def create_project(body: CreateBody, request: Request):
     user_id = await _auth_and_provision(request)
     email = getattr(request.state, "user_email", None)
 
+    # PHASE 34: build from the DISCUSSION, not from the sentence. `compose_brief` turns the
+    # canvas (vision, audience, agreed features, stack, explicit non-goals) plus the
+    # transcript into the text that becomes `projects.prompt` — which is exactly what
+    # `_s_strategy` reads when it writes VISION.md/ICP.md. This is the whole point of the
+    # phase: the pipeline stops guessing what it was never told.
+    prompt = body.prompt
+    title_hint = body.title
+    disc = None
+    if body.discussion_id:
+        disc = await discuss.get(body.discussion_id, user_id)   # ownership-checked
+        if not disc:
+            raise HTTPException(status_code=404, detail="discussion not found")
+        prompt = discuss.compose_brief(disc)
+        # A name that was AGREED beats a name invented from the prompt. This is the
+        # `DanaWhitfield` bug at its root: the namer only ever saw one sentence, so it named
+        # the product after the persona it imagined. Here it has been told.
+        title_hint = discuss.field(disc.get("canvas") or {}, "name") or body.title
+
     shortid = await store.alloc_shortid()
     gitea_user = gitea.gitea_username_for(user_id)
     repo_name = f"app-{shortid}"
@@ -260,14 +290,27 @@ async def create_project(body: CreateBody, request: Request):
     # the pipeline) so the topbar dropdown and the Apps list read well from the first render.
     # Bounded + best-effort: a naming failure degrades to a deterministic slug, never a 500.
     usage.set_context(shortid, None, "name")     # attribute the naming tokens to this project
-    title = naming.clean(body.title) or await naming.name_for(body.prompt)
+    title = naming.clean(title_hint) or await naming.name_for(prompt)
 
     await store.create_project(
         id=shortid, user_id=user_id, gitea_owner=gitea_user, gitea_repo=repo_name,
-        subdomain=f"{shortid}.{SITES_BASE}", title=title, prompt=body.prompt,
+        subdomain=f"{shortid}.{SITES_BASE}", title=title, prompt=prompt,
         status="creating", pipeline="create",
     )
-    run_id = await store.create_run(shortid, "create", body.prompt, total_steps=7)
+    if disc:
+        try:
+            await discuss.link_project(disc["id"], shortid)
+            # The thinking is part of what the app cost. Carried over as ONE `discuss` row so
+            # the Usage tab accounts for the conversation as well as the build, instead of the
+            # discussion's spend vanishing the moment it produced something.
+            if float(disc.get("cost_usd") or 0) > 0:
+                await store.record_usage(
+                    project_id=shortid, run_id=None, step="discuss", model="discussion",
+                    prompt_tokens=0, completion_tokens=0, cached_tokens=0,
+                    cost_usd=float(disc["cost_usd"]), cost_estimated=False)
+        except Exception:  # noqa: BLE001 — bookkeeping must never fail a build
+            logger.exception("linking discussion %s to %s failed", disc.get("id"), shortid)
+    run_id = await store.create_run(shortid, "create", prompt, total_steps=7)
 
     emit = runner.emitter(run_id)
     await runner.start(
