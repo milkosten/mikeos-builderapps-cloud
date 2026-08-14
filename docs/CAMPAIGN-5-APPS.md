@@ -39,19 +39,49 @@ exactly the 5 chips a real user would click:
 | # | Prompt | Project | Submitted via UI | Build | Verified in browser | Pipeline fixes needed |
 |---|---|---|---|---|---|---|
 | 1 | URL shortener + analytics | `iukghl` (run 34) | yes | **done** — 12/12 features, 0 skipped, ~28 min | **PASS** — created `/mikecamp1` in the UI, followed the redirect (landed on wikipedia), reloaded the dashboard: row persisted with `clicks=1`; `/links/4` stats page renders totals + 30-day chart + the recent-click row; `/health` `{"status":"ok","db":"ok","redis":"ok"}`; zero console/network errors | **none** (unattended) |
-| 2 | Team standup + digest | — | — | — | — | — |
+| 2 | Team standup + digest | `3lq510` (run 35) | yes | **done** — 12/12 features, 0 skipped, ~22 min | **PASS (with a caveat)** — registered a member, posted yesterday/today/blockers, reloaded: the board renders my entry server-side; `POST /api/digests/generate` produces a correct digest of both members. Caveat: the digest has **no page** — it exists only as an API. `/health` green, zero console/network errors | **none** (unattended) |
 | 3 | Expense tracker + chart + CSV | — | — | — | — | — |
 | 4 | Changelog + admin + RSS | — | — | — | — | — |
 | 5 | Job board + applications | — | — | — | — | — |
 
-**Status: 1 / 5**
+**Status: 2 / 5**
 
 ## Pipeline fixes made during the campaign
 (append: symptom → root cause → fix → commit)
+
+### 1. QA sent the browser to a literal `/links/:id`
+- **Symptom (app 1, `iukghl`):** `runtime_qa` = `live-with-warnings`; critic said the detail page
+  renders "Link not found". Browsing it by hand shows totals, the 30-day chart and the recent-clicks
+  table — the app was fine.
+- **Root cause:** `plan_flows` may answer `page: "/links/:id"`, and `run_flows` navigated to that
+  string **literally**. `_ID_RE` had been written for exactly this substitution and was never wired
+  up, so every detail-page flow was guaranteed to "fail" and hand the repair agent a fabricated bug.
+- **Fix:** `_resolve_page()` fills `:id` / `{id}` / `__ID__` from the create response and falls back
+  to the index when there is no id — a weaker assertion beats a false accusation.
+- **Commit:** `d2a46ee`.
+
+### 2. QA read its OWN unique-constraint collision as "registration is broken"
+- **Symptom (app 2, `3lq510`):** `live-with-warnings`, **0/3 flows rendered**, critic: *"Registration
+  is broken (HTTP 409 on a fresh email), which cascades into all authenticated flows"*. Registering
+  by hand works; entries persist and render. Two QA rounds were burned chasing it.
+- **Root cause:** the planner emits literal values (`qa@example.com`, a fixed short code) and the
+  marker only goes into the one display field. The second flow — or the second round on the same app
+  — re-posts the same email, the app correctly answers 409, and every later authenticated flow then
+  401s because no session exists.
+- **Fix:** emails are always uniquified per seed (`local+MARKER@domain`); a `409`/"already exists"
+  reply retries the create **once** with every short string suffixed, skipping dates/numbers/booleans
+  (suffixing those would turn a 409 into a real 422).
+- **Commit:** `3cccb52`.
 
 ### Observations that did NOT need a fix
 - **App 1, `runtime_qa` reported `live-with-warnings`** — the critic claimed the
   "create link and verify on detail page" flow was broken (`/links/:id` renders "Link not found").
   Manual browser check says the detail page is fine (it renders totals, the 30-day chart and the
   recent-clicks table). The QA critic was wrong, not the app. Watch whether this repeats — a critic
-  that cries wolf is the thing that once wasted a repair round.
+  that cries wolf is the thing that once wasted a repair round. **Fixed — see fix 1.**
+- **App 2 shipped the daily digest as an API with no page.** `POST /api/digests/generate`,
+  `GET /api/digests` and `GET /api/digests/:date` all work and return a correct digest, but nothing
+  in `public/` links to them, so a user cannot reach the feature. The primary flow (post standup →
+  board renders it → survives reload) is fully working, so this is scored a pass, but it is a real
+  gap: a requirement stated in the prompt landed backend-only. Worth a planner fix if it recurs
+  (not fixed mid-campaign — it is a codegen-quality issue, not a build failure).
