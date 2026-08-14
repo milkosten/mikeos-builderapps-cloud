@@ -42,9 +42,15 @@ exactly the 5 chips a real user would click:
 | 2 | Team standup + digest | `3lq510` (run 35) | yes | **done** — 12/12 features, 0 skipped, ~22 min | **PASS (with a caveat)** — registered a member, posted yesterday/today/blockers, reloaded: the board renders my entry server-side; `POST /api/digests/generate` produces a correct digest of both members. Caveat: the digest has **no page** — it exists only as an API. `/health` green, zero console/network errors | **none** (unattended) |
 | 3 | Expense tracker + chart + CSV | `cj1qbm` (run 36) | yes | **done** — 12/12 features, 0 skipped, ~18 min | **PASS** — registered, added a $123.45 Dining expense (`MIKECAMP3-COFFEE`), reloaded: the row, the *Spending by category* SVG bar chart and the month total all render from the server; `←/→` month nav works; `GET /api/export.csv?month=2026-08` returns real CSV (`2026-08-14,Dining,123.45,MIKECAMP3-COFFEE`); `/health` green, zero console errors | **none** (unattended) |
 | 4 | Changelog + admin + RSS | `xvynod` (37) **FAIL**<br>`sgj9go` (38) **FAIL**<br>`04thhm` (39) **PASS** | yes (x3) | 3rd attempt: **done** — 14/14 features, 0 skipped, ~24 min | **PASS on attempt 3** — signed into `/admin` as the seeded admin, published `v9.9.9 / MIKECAMP4-RELEASE`, reloaded the public `/`: the release and its markdown body render server-side; `/rss.xml` is valid RSS 2.0 containing the same item; `/health` green, zero console errors. **Attempts 1-2 were failures** (see fixes 4 and 5) | **fix 4** + **fix 5** |
-| 5 | Job board + applications | — | — | — | — | — |
+| 5 | Job board + applications | `cvu1kl` (run 40) | yes | **done** — 14/14 features, 0 skipped, ~26 min | **PASS** — registered `MIKECAMP5-COMPANY`, posted `MIKECAMP5-ROLE`, saw it on the public board, applied to it as a candidate (`MIKECAMP5-APPLICANT` + cover note), reloaded the employer dashboard: `1 applicant`, and *View applicants* renders the candidate's name, email and cover note from Postgres; `/health` green, zero console errors | **none** (unattended) |
 
-**Status: 4 / 5**  (app 4 took three attempts — two genuine build failures, two pipeline fixes)
+**Status: 5 / 5 verified.** Honest accounting: **7 builds submitted, 5 apps green, 2 failures**
+(both on prompt 4). Unattended success rate **5/7 = 71 %**; per-prompt **5/5** once the two
+pipeline bugs the failures exposed were fixed. Prompts 1, 2, 3 and 5 each passed **first time,
+with no intervention of any kind**. No app was ever touched, patched, restarted or rescued.
+
+One interruption, not scored: the coordinator restarted `dockerd` on 242 between builds (0 runs
+in flight). Apps 1-3 came back with their data intact and were re-verified afterwards.
 
 ## Pipeline fixes made during the campaign
 (append: symptom → root cause → fix → commit)
@@ -120,6 +126,18 @@ exactly the 5 chips a real user would click:
   exist to prevent. An app whose frontend the agent actually wrote is untouched.
 - **Commit:** `4439efb` (+ `tests/test_placeholder.py`).
 
+### 6. A nested create path was posted with a literal `:id`
+- **Symptom (app 5, `cvu1kl`):** `live-with-warnings`, critic: *"the candidate apply flow is broken:
+  `POST /api/jobs/:id/apply` returned HTTP 400 'invalid job id'"*. Applying through the browser works
+  — the application is stored and appears in the employer's dashboard with its cover note.
+- **Root cause:** the same defect as fix 1, on the *create* path. `plan_flows` may answer a `:param`
+  route (`_same_route` matches by shape) and `run_flows` POSTed it literally, so the app saw the
+  string `:id` where a job id belongs.
+- **Fix:** a placeholder in the create path is filled from the parent collection (the flow's `list`,
+  else the path up to the placeholder). If no parent exists the flow is `inconclusive_no_parent` —
+  neither a pass nor a bug.
+- **Commit:** `ef4af34`. Shipped after the last build, so covered by unit tests, not a live build.
+
 ### Observations that did NOT need a fix
 - **App 1, `runtime_qa` reported `live-with-warnings`** — the critic claimed the
   "create link and verify on detail page" flow was broken (`/links/:id` renders "Link not found").
@@ -137,3 +155,36 @@ exactly the 5 chips a real user would click:
   the app has no public registration — only an admin login. Semantic QA can seed an app that lets
   it register, but not one with a bootstrapped admin account. That is a real blind spot; it produced
   warnings rather than a wrong verdict, so it was left alone during the campaign.
+
+## Verdict
+
+**5 / 5 working applications, all submitted through the real UI via chrome-pool, all verified
+semantically in the browser (create a record → reload → assert it is rendered from Postgres).**
+
+It took **7 builds** to get 5 apps. The two failures were both the changelog prompt, and both were
+real product failures rather than infrastructure flakiness:
+
+1. the backlog was **truncated** at 12 while the plan asked for 14, so the admin editor and the RSS
+   feed were never built — and the run still reported "12 of 12 features built";
+2. the finished app served the builder's **"your app is being built" placeholder** as its public home
+   page, because `express.static` shadows a server-rendered `/`.
+
+Both are now impossible: the cap folds instead of truncating (and the prompt quotes the same
+constant), and `final_deploy` deletes a placeholder that shadows the app's own `/` — or fails the
+run outright when nothing serves `/` at all.
+
+The other four fixes were all the same disease in the QA layer: **QA accusing a healthy app**
+(a literal `:id` in a page path, its own 409 email collision, a required query parameter, a literal
+`:id` in a create path). Four of the seven builds finished `live-with-warnings` for reasons that
+were entirely QA's own, which burns repair rounds and — worse — points the repair agent at code that
+is not broken.
+
+**Not fixed, and worth knowing:**
+- **Semantic QA cannot log in as an admin.** An app with a bootstrapped admin account and no public
+  registration (both changelog builds) fails every seeded flow with 401. It produces warnings, not a
+  wrong verdict, so it was left alone — but it means QA is blind on exactly the apps where the
+  editor is the product.
+- **A capability can still land backend-only.** App 2's daily digest works perfectly as an API and
+  has no page. Fix 4's prompt rule ("every page under `## Pages` needs its own backlog item; an
+  endpoint with no page is a feature the user cannot use") is aimed at this, and app 4's third
+  attempt and app 5 both shipped complete UIs — but one build is not proof.
