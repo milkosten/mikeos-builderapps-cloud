@@ -93,8 +93,33 @@ def _s_secrets():
     return step
 
 
-def _s_deploy(stage_detail: str, commit_status: str):
+def _drop_build_placeholder(ctx: Ctx) -> None:
+    """The finished app must never still serve the "your app is being built" holding page.
+
+    `express.static("public")` is mounted before the app's routes, so a server-rendered
+    `app.get("/")` is shadowed by the template's untouched `public/index.html`. That is exactly
+    how the campaign's changelog site shipped with the builder's placeholder as its public home
+    page while `/health` was green and finalize said "14 of 14 features built".
+
+    * `shadowing` — the app has its own `/`: delete the holding page, it has done its job.
+    * `only` — nothing serves `/` at all: the home page was never built. Fail loudly here
+      rather than hand the user a placeholder and call it live.
+    """
+    state = workspace.placeholder_state(ctx.project_id)
+    if state == "shadowing":
+        workspace.drop_placeholder(ctx.project_id)
+        ctx.emit({"type": "progress", "stage": "deploy",
+                  "detail": "removed the build placeholder that was shadowing the app's own /"})
+    elif state == "only":
+        raise RuntimeError(
+            "the app still serves the 'your app is being built' placeholder at / and defines "
+            "no route of its own for it — the home page was never built")
+
+
+def _s_deploy(stage_detail: str, commit_status: str, *, final: bool = False):
     async def step(ctx: Ctx):
+        if final:
+            _drop_build_placeholder(ctx)
         await _load_secrets_into_state(ctx)
         await store.set_project_status(ctx.project_id, commit_status)
         ctx.emit({"type": "progress", "stage": "deploy", "detail": stage_detail})
@@ -516,7 +541,8 @@ async def run_create(project_id: str, run_id: int, user_id: str, email: Optional
             tail_steps: list[Step] = [("data_layer", _s_data_layer(brief))]
             for i, feat in enumerate(backlog_items):
                 tail_steps.append((f"build_{i+1:02d}", _s_feature(i, feat, brief)))
-            tail_steps.append(("final_deploy", _s_deploy("redeploying the finished stack", "deploying")))
+            tail_steps.append(("final_deploy", _s_deploy("redeploying the finished stack",
+                                                         "deploying", final=True)))
             tail_steps.append(("runtime_qa", _s_qa(brief)))
             tail_steps.append(("finalize", _s_finalize()))
 

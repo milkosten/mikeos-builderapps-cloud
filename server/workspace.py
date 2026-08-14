@@ -7,6 +7,7 @@ from the user's Gitea account. File reads are size-capped (never slurp a big blo
 import asyncio
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -153,6 +154,45 @@ def write_file(project_id: str, relpath: str, content: str) -> None:
         raise ValueError("path escapes workspace")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, "utf-8")
+
+
+# ---- the build placeholder ------------------------------------------------
+# The template ships `public/index.html` as a "your app is being built" holding page so the
+# subdomain shows something friendly during the ~20 minutes of the build. `express.static` is
+# mounted BEFORE the app's own routes, so if the agent writes a server-rendered `app.get("/")`
+# and never touches that file, the finished product serves the holding page forever — the
+# public home page of the campaign's changelog site was the builder's placeholder, and both the
+# health gate (which only reads /health) and `finalize` ("14 of 14 features built") called it a
+# success.
+_PLACEHOLDER_MARK = "Your app is being built"
+_ROOT_ROUTE_RE = re.compile(r"""app\.(get|use)\(\s*["']/["']""")
+
+
+def _serves_own_root(project_id: str) -> bool:
+    """True when the app defines its own `/` handler (so the static file is shadowing it)."""
+    try:
+        src = read_file_capped(project_id, "server.js") or ""
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(_ROOT_ROUTE_RE.search(src))
+
+
+def placeholder_state(project_id: str) -> str:
+    """`gone` | `shadowing` | `only` — what the build holding page is doing to this app."""
+    p = path_for(project_id) / "public" / "index.html"
+    if not p.is_file():
+        return "gone"
+    try:
+        if _PLACEHOLDER_MARK not in p.read_text("utf-8", "replace"):
+            return "gone"
+    except OSError:
+        return "gone"
+    return "shadowing" if _serves_own_root(project_id) else "only"
+
+
+def drop_placeholder(project_id: str) -> None:
+    (path_for(project_id) / "public" / "index.html").unlink(missing_ok=True)
+    logger.info("removed the build placeholder shadowing / in %s", project_id)
 
 
 def cleanup(project_id: str) -> None:
