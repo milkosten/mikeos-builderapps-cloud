@@ -1,0 +1,70 @@
+# mikeos-builderapps-cloud on 242 — the control plane behind builderapps-api.osmike.com.
+#
+# api + its OWN Postgres. The api mounts the host docker socket (it IS the deployer) and the
+# workspaces dir at the SAME host path on both sides (so `docker compose -f <hostpath> build`
+# streams the correct build context to the host daemon). Joins deploy_default so the shared
+# Caddy reverse-proxies builderapps-api.osmike.com -> this container.
+services:
+  mikeos-builderapps-db:
+    image: postgres:18
+    container_name: mikeos-builderapps-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mikeos
+      POSTGRES_PASSWORD: ${BUILDERAPPS_DB_PASSWORD:-mikeos_builderapps_local}
+      POSTGRES_DB: mikeos_builderapps
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - /data/builderapps/control-pg:/var/lib/postgresql/data
+    networks: [deploy_default]
+    mem_limit: 1g
+    cpus: 1
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mikeos -d mikeos_builderapps"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  mikeos-builderapps:
+    build: .
+    image: mikeos-builderapps:latest
+    container_name: mikeos-builderapps
+    restart: unless-stopped
+    depends_on:
+      mikeos-builderapps-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://mikeos:${BUILDERAPPS_DB_PASSWORD:-mikeos_builderapps_local}@mikeos-builderapps-db:5432/mikeos_builderapps
+      GITEA_URL: ${GITEA_URL:-https://gitea.osmike.com}
+      GITEA_ADMIN_USER: ${GITEA_ADMIN_USER}
+      GITEA_ADMIN_TOKEN: ${GITEA_ADMIN_TOKEN}
+      OLLAMA_GPU_URL: ${OLLAMA_GPU_URL:-ollama://mikeos:uB49VXwMDy7R2JE0H7mI@81.8.177.182:11443}
+      # OpenRouter (Kimi) — AUTHORIZED for builderapps. Key lives in .env on the host only.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      BUILDERAPPS_LLM_MODEL: ${BUILDERAPPS_LLM_MODEL:-moonshotai/kimi-k3}
+      CHROME_POOL_URL: ${CHROME_POOL_URL:-https://chrome-pool.osmike.com}
+      CHROME_POOL_USER: ${CHROME_POOL_USER:-mikeos}
+      CHROME_POOL_PASS: ${CHROME_POOL_PASS:-uB49VXwMDy7R2JE0H7mI}
+      MIKEOSCOMPUTERS_URL: ${MIKEOSCOMPUTERS_URL:-https://account.osmike.com}
+      ACCOUNT_OSMIKE_ISSUER: ${ACCOUNT_OSMIKE_ISSUER:-https://account.osmike.com}
+      SECRETS_KEY: ${SECRETS_KEY}
+      PUBLIC_BASE: ${PUBLIC_BASE:-https://builderapps.osmike.com}
+      SITES_BASE: ${SITES_BASE:-builderapps.osmike.com}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://builderapps.osmike.com}
+      WORKSPACES_ROOT: /opt/builderapps/workspaces
+      BUILDERAPPS_VOL_ROOT: /data/builderapps/vol
+      DEPLOY_NETWORK: deploy_default
+    volumes:
+      # the deployer shells out `docker compose` against the HOST daemon
+      - /var/run/docker.sock:/var/run/docker.sock
+      # SAME path both sides so build contexts resolve on the host daemon
+      - /opt/builderapps/workspaces:/opt/builderapps/workspaces
+      # project data volumes (pgdata/redis) live here; created by the deployer
+      - /data/builderapps/vol:/data/builderapps/vol
+    networks: [deploy_default]
+    mem_limit: 1g
+    cpus: 2
+
+networks:
+  deploy_default:
+    external: true
