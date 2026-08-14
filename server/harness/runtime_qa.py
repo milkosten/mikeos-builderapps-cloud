@@ -3,8 +3,9 @@
 The designer runtime-QA loop, scaled to full-stack apps:
   1. chrome-pool opens the LIVE url, exercises the UI, captures console errors + failed
      network requests + a screenshot; we also tail the <id>-app container logs for server 500s.
-  2. If anything's wrong, feed errors + relevant source + a screenshot note to Kimi to localize
-     the fault and produce a BOUNDED fix (full files); apply, rebuild+redeploy, re-run.
+  2. If anything's wrong, hand the errors to the agentic loop (phase 26): it reads the real
+     code, tails the container's own logs, and lands a bounded, syntax-checked edit; then we
+     rebuild+redeploy and re-run.
   3. Loop up to `max_rounds` (2). Stop when clean or the budget is exhausted.
   4. Completeness critic: ask which UX-doc flow is untested/broken and record it (never declare
      done prematurely — never-trust-200 for UX too).
@@ -18,11 +19,9 @@ import re
 from typing import Callable, Dict, List, Optional
 
 from server import chrome, deployer, gpu, workspace
-from server.harness import codegen
+from server.harness import agentic
 
 logger = logging.getLogger(__name__)
-
-_APP_SOURCE_FILES = ["server.js", "public/index.html", "db/migrate.js"]
 
 
 async def _tail_app_logs(shortid: str, tail: int = 80) -> str:
@@ -43,50 +42,28 @@ async def _tail_app_logs(shortid: str, tail: int = 80) -> str:
     return "\n".join(bad[-30:])
 
 
-def _read_sources(shortid: str) -> Dict[str, str]:
-    files: Dict[str, str] = {}
-    for rel in _APP_SOURCE_FILES:
-        try:
-            c = workspace.read_file_capped(shortid, rel)
-            if c is not None:
-                files[rel] = c
-        except Exception:  # noqa: BLE001
-            pass
-    # include migrations (small)
-    import os
-    mig_dir = workspace.path_for(shortid) / "migrations"
-    if mig_dir.is_dir():
-        for f in sorted(os.listdir(mig_dir)):
-            if f.endswith(".sql"):
-                try:
-                    files[f"migrations/{f}"] = (mig_dir / f).read_text("utf-8", "replace")[:6000]
-                except Exception:  # noqa: BLE001
-                    pass
-    return files
-
-
 async def _autofix(shortid: str, brief: str, tech_plan: str,
-                   errors: List[str], network: List[str], server_errs: str) -> List[str]:
-    """Ask Kimi to localize + fix. Applies full-file output to the workspace. Returns the list
-    of files it wrote (may be empty if it couldn't produce a bounded fix)."""
-    sources = _read_sources(shortid)
+                   errors: List[str], network: List[str], server_errs: str,
+                   *, run_id: int = 0, round_no: int = 1) -> List[str]:
+    """Localize + fix with the agentic loop. Returns the files it actually changed.
+
+    The agent reads the real code (and can `app_logs` the container itself) instead of being
+    handed a source dump and asked for whole files back — which is what let a QA "fix" quietly
+    rewrite an endpoint's response keys and move the bug somewhere else.
+    """
     problem = (
-        "The live app has runtime problems. Fix them with the SMALLEST change.\n\n"
         f"Console/JS errors:\n{chr(10).join(errors[:15]) or '(none)'}\n\n"
         f"Failed network requests (status url):\n{chr(10).join(network[:15]) or '(none)'}\n\n"
         f"Server-side error log lines:\n{server_errs[:2000] or '(none)'}\n"
     )
-    files = await codegen.generate_files(
-        brief=brief, tech_plan=tech_plan, feature=problem,
-        current_files=sources, recent_changes=["runtime QA autofix"],
-        minimal=True,
-    )
-    written: List[str] = []
-    for path, content in files.items():
-        if path in sources or path.startswith(("server", "public/", "migrations/", "db/")):
-            workspace.write_file(shortid, path, content)
-            written.append(path)
-    return written
+    res = await agentic.run_agent(
+        project_id=shortid, run_id=run_id, step=f"qa_autofix_r{round_no}",
+        brief=brief, tech_plan=tech_plan,
+        task="The live app has runtime problems. Find the real cause and fix it with the "
+             "smallest possible change.",
+        extra=problem, recent_changes=["runtime QA autofix"], mode="fix",
+        require_change=False)
+    return list(res["changed"])
 
 
 async def run_qa(
@@ -94,6 +71,7 @@ async def run_qa(
     db_password: str, app_secret: str, title: str,
     emit: Callable[[dict], None], max_rounds: int = 2,
     commit_fix: Optional[Callable[[str], "asyncio.Future"]] = None,
+    run_id: int = 0,
 ) -> dict:
     """Run the QA + autofix loop. Returns a report dict:
        {clean: bool, rounds: int, errors:[...], network:[...], server_errs:str,
@@ -125,7 +103,8 @@ async def run_qa(
               "detail": f"round {rnd}: fixing {len(errors)} js + {len(network)} net + "
                         f"{'server' if server_errs else 'no-server'} errors"})
         try:
-            fixed = await _autofix(shortid, brief, tech_plan, errors, network, server_errs)
+            fixed = await _autofix(shortid, brief, tech_plan, errors, network,
+                                   server_errs, run_id=run_id, round_no=rnd)
         except Exception as e:  # noqa: BLE001
             logger.warning("autofix generation failed for %s: %s", shortid, e)
             fixed = []

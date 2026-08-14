@@ -53,6 +53,9 @@ services:
       SITES_BASE: ${SITES_BASE:-builderapps.osmike.com}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://builderapps.osmike.com}
       WORKSPACES_ROOT: /opt/builderapps/workspaces
+      # every raw LLM response + tool transcript lands here BEFORE it is parsed,
+      # so a rejected reply can never destroy 20 minutes of work (phase 27)
+      ARTIFACTS_ROOT: /opt/builderapps/artifacts
       BUILDERAPPS_VOL_ROOT: /data/builderapps/vol
       DEPLOY_NETWORK: deploy_default
     # Docker's default 10s SIGTERM->SIGKILL window is shorter than uvicorn's graceful
@@ -65,6 +68,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # SAME path both sides so build contexts resolve on the host daemon
       - /opt/builderapps/workspaces:/opt/builderapps/workspaces
+      # agentic codegen transcripts — same path both sides, like the workspaces
+      - /opt/builderapps/artifacts:/opt/builderapps/artifacts
       # project data volumes (pgdata/redis) live here; created by the deployer
       - /data/builderapps/vol:/data/builderapps/vol
     networks: [deploy_default]

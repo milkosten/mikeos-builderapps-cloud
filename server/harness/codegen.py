@@ -1,24 +1,30 @@
-"""LLM codegen helpers for the create/update pipelines (phases 13/15/18).
+"""LLM codegen helpers for the create pipeline (phase 13/15) — prose and schema only.
 
-Kimi (via server.gpu.chat) writes the *content*: the strategy docs, the schema, and each
-feature's file set. Everything structural (which files, the compose, the deploy, git) stays
-deterministic in the pipeline. Two hard-won rules are baked in here:
+What lives here is the work that genuinely *is* "write me a document": the six strategy docs
+and the first data-model migration. **Per-feature code generation moved out** to
+`server.harness.agentic`, which drives a tool-using loop (read/grep/edit) instead of asking
+for whole files back as one JSON blob — see HARNESS-TOOLS.md for why every failure this
+platform hit traced back to that one decision.
 
-* **The no-external-SaaS rule** — a HARD system-prompt constraint repeated into every codegen
-  call: the plan/app must be fully self-hosted on Node+Postgres+Redis. No Auth0/Stripe/
-  cookie-consent/analytics/email SaaS — we build all of it ourselves.
-* **The truncation guard (the "Kimi bug")** — a file that comes back without its closing
-  fence, or empty, is DISCARDED and retried with a larger token budget scaled to the file's
-  size. We never write a half-file to disk.
+What stays here:
+
+* **`NO_SAAS_RULE`** — the hard architecture contract repeated into EVERY codegen system
+  prompt (agentic loop included): fully self-hosted Node+Postgres+Redis, no third-party SaaS,
+  plus the platform contracts that got learned the hard way — rule 6 (the `/health` shape the
+  deploy gate reads), rule 7 (never rename an existing endpoint's response keys to fix a
+  frontend bug) and rule 8 (never hand-roll a migration runner).
+* **`write_strategy_docs`** / **`design_schema`** — one focused `gpu.chat` call each. The
+  generated migration is run through the same syntax gate the agent's edits face, so a
+  non-idempotent or truncated first migration can never reach the boot path.
 
 All model output is parsed defensively (strip code fences, tolerate prose around JSON).
 """
 import json
 import logging
-import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from server import gpu
+from server.harness import syntax
 
 logger = logging.getLogger(__name__)
 
@@ -175,194 +181,29 @@ async def design_schema(brief: str, tech_plan: str) -> Dict[str, str]:
         "- Primary keys explicit (bigserial or uuid).\n"
         "Respond as JSON: {\"summary\":\"one line\",\"sql\":\"<the full migration SQL>\"}."
     )
-    reply = await gpu.chat(
-        [{"role": "system", "content": sys}, {"role": "user", "content": user}],
-        schema={"type": "object"}, temperature=0.2, num_predict=2000, timeout=300,
-    )
-    data = _extract_json(reply)
-    sql = (data.get("sql") or "").strip()
-    if not sql or "create table" not in sql.lower():
-        raise ValueError("schema design returned no CREATE TABLE")
-    return {"sql": sql, "summary": (data.get("summary") or "app data schema").strip()}
-
-
-# ---- phase 15/18: per-feature file generation -----------------------------
-# We ask the model to return a JSON map {path: full_file_contents}. Because JSON string
-# escaping of large source files is where truncation bites, we scale the token budget to the
-# combined size of the files it's likely to emit and REJECT any file that looks truncated.
-
-_MIN_FILE_BUDGET = 6000
-_TOKENS_PER_CHAR = 0.5   # generous; JSON-escaped source is dense
-
-
-def _strip_literals(src: str) -> str:
-    """Remove comments and string/template literals so bracket counting sees CODE only.
-
-    Counting raw characters cannot tell code from text: a COMPLETE file containing
-    `console.error("fatal on startup:", e)` or `// cache (TTL 300s)` easily ends up with
-    an unbalanced raw paren count. That false positive discarded a valid 5 KB server.js on
-    all three attempts and failed an entire build ("not even the smallest app worked").
-    """
-    out = []
-    i, n = 0, len(src)
-    quote = None          # ' " or `
-    comment = None        # "line" or "block"
-    while i < n:
-        ch = src[i]
-        nxt = src[i + 1] if i + 1 < n else ""
-        if comment == "line":
-            if ch == "\n":
-                comment = None
-                out.append(ch)
-            i += 1
-            continue
-        if comment == "block":
-            if ch == "*" and nxt == "/":
-                comment = None
-                i += 2
-                continue
-            i += 1
-            continue
-        if quote:
-            if ch == "\\":
-                i += 2            # skip the escaped char
-                continue
-            if ch == quote:
-                quote = None
-            i += 1
-            continue
-        if ch == "/" and nxt == "/":
-            comment = "line"; i += 2; continue
-        if ch == "/" and nxt == "*":
-            comment = "block"; i += 2; continue
-        if ch in "'\"`":
-            quote = ch; i += 1; continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _looks_truncated(path: str, content: str) -> bool:
-    """Heuristic truncation check — the Kimi-bug guard. A file whose braces/tags are wildly
-    unbalanced, or that ends mid-token, is treated as truncated and discarded."""
-    if not content or not content.strip():
-        return True
-    c = content
-    # balanced-ish braces/parens for code files — counted on CODE ONLY (see _strip_literals);
-    # parens/braces inside strings and comments are not structure.
-    if path.endswith((".js", ".ts", ".json", ".css")):
-        code = _strip_literals(c) if not path.endswith(".json") else c
-        # Now that literals are stripped, real code should balance almost exactly, so the
-        # tolerance can be tight enough to catch a file that stops mid-body. (Parens stay a
-        # little looser: regex literals aren't stripped and can leave a stray bracket.)
-        if code.count("{") - code.count("}") not in range(-1, 2):
-            return True
-        if code.count("(") - code.count(")") not in range(-2, 3):
-            return True
-    if path.endswith((".html", ".htm")):
-        low = c.lower()
-        if "<html" in low and "</html>" not in low:
-            return True
-        if "<body" in low and "</body>" not in low:
-            return True
-    # a source file that ends on an obviously-open construct
-    if c.rstrip().endswith(("{", "(", ",", "=>", "const", "return", "function")):
-        return True
-    if path.endswith(".json"):
-        try:
-            json.loads(c)
-        except Exception:
-            return True
-    return False
-
-
-async def generate_files(
-    *,
-    brief: str,
-    tech_plan: str,
-    feature: str,
-    current_files: Dict[str, str],
-    recent_changes: List[str],
-    target_hint: str = "",
-    minimal: bool = False,
-) -> Dict[str, str]:
-    """Generate/patch the file set for ONE feature. Returns {path: full_contents}.
-
-    `current_files` is a SHORT context block (path -> current contents) of the files the model
-    is allowed to see/edit — keep it small (the designer lesson). `recent_changes` is the last N
-    change summaries. Full-file output only; truncated files are retried with more tokens.
-    """
-    sys = (
-        "You are a meticulous full-stack engineer building one small feature at a time in an "
-        "existing Node(Express)+Postgres+Redis app. You output COMPLETE files only — never a "
-        "diff, never a fragment, never '...'. The app entry is server.js; frontend is "
-        "public/index.html (self-contained); migrations live in migrations/NNN_*.sql and run on "
-        "boot; the pg pool uses process.env.DATABASE_URL; redis uses process.env.REDIS_URL.\n\n"
-        + NO_SAAS_RULE
-    )
-    ctx_files = "\n\n".join(
-        f"----- FILE {p} -----\n{c[:8000]}" for p, c in current_files.items()
-    ) or "(no files provided; you are creating them)"
-    changes = "\n".join(f"- {c}" for c in recent_changes[-8:]) or "(none yet)"
-    scope = ("Make the SMALLEST change that satisfies the request; touch the fewest files."
-             if minimal else
-             "Implement exactly this one backlog feature — nothing more, nothing less.")
-    user = (
-        f"App brief: {brief}\n\n"
-        f"Technical plan (reference):\n{tech_plan[:5000]}\n\n"
-        f"Recent changes:\n{changes}\n\n"
-        f"Current relevant files:\n{ctx_files}\n\n"
-        + (f"Edit target: {target_hint}\n\n" if target_hint else "")
-        + f"FEATURE TO BUILD NOW: {feature}\n\n{scope}\n"
-        "Return ONLY a JSON object mapping file path to that file's FULL new contents, e.g. "
-        '{"server.js":"<entire file>","public/index.html":"<entire file>",'
-        '"migrations/002_x.sql":"<entire file>"}. Only include files you actually change/create. '
-        "Every included file must be complete and runnable. No commentary outside the JSON."
-    )
-
-    # scale the token budget to the size of what it's rewriting (truncation guard)
-    seed_chars = sum(len(c) for c in current_files.values()) or 4000
-    budget = max(_MIN_FILE_BUDGET, int(seed_chars * _TOKENS_PER_CHAR) + 4000)
-    budget = min(budget, 30000)
-
-    last_err: Optional[Exception] = None
+    messages = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
+    last_err = ""
     for attempt in range(3):
-        reply = await gpu.chat(
-            [{"role": "system", "content": sys}, {"role": "user", "content": user}],
-            schema={"type": "object"}, temperature=0.25,
-            num_predict=budget, timeout=420,
-        )
+        reply = await gpu.chat(messages, schema={"type": "object"}, temperature=0.2,
+                               num_predict=2000, timeout=300)
         try:
             data = _extract_json(reply)
         except Exception as e:  # noqa: BLE001
-            last_err = e
-            budget = min(int(budget * 1.6), 30000)
-            continue
-        if not isinstance(data, dict) or not data:
-            last_err = ValueError("file map empty")
-            budget = min(int(budget * 1.6), 30000)
-            continue
-        files: Dict[str, str] = {}
-        truncated: List[str] = []
-        for path, content in data.items():
-            if not isinstance(path, str) or not isinstance(content, str):
-                continue
-            path = path.lstrip("/").strip()
-            if not path or ".." in path:
-                continue
-            content = _strip_fences(content) if content.strip().startswith("```") else content
-            if _looks_truncated(path, content):
-                truncated.append(path)
-                continue
-            files[path] = content
-        if truncated:
-            # discard the whole batch and retry bigger (never write a half-file)
-            last_err = ValueError(f"truncated files discarded: {truncated}")
-            logger.warning("codegen truncation on %s; retry with bigger budget", truncated)
-            budget = min(int(budget * 1.8), 30000)
-            continue
-        if files:
-            return files
-        last_err = ValueError("no usable files after filtering")
-        budget = min(int(budget * 1.6), 30000)
-    raise RuntimeError(f"generate_files failed for '{feature}': {last_err}")
+            last_err = f"your reply was not parseable JSON ({e})"
+        else:
+            sql = (data.get("sql") or "").strip()
+            if not sql or "create table" not in sql.lower():
+                last_err = "the reply contained no CREATE TABLE statement"
+            else:
+                # Same gate the agent's own writes face: a truncated or non-idempotent
+                # migration here would crash-loop the app on its very first boot.
+                err = syntax.check_sql(sql)
+                if err is None:
+                    return {"sql": sql,
+                            "summary": (data.get("summary") or "app data schema").strip()}
+                last_err = f"the SQL was rejected by the syntax gate: {err}"
+        logger.warning("schema design attempt %d rejected: %s", attempt + 1, last_err)
+        messages += [{"role": "assistant", "content": reply[:4000]},
+                     {"role": "user", "content": f"That is not acceptable — {last_err}. "
+                                                 "Send the corrected JSON again."}]
+    raise ValueError(f"schema design failed: {last_err}")

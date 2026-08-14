@@ -21,7 +21,7 @@ from typing import Callable, Optional
 
 from server import deployer, gitea, store, workspace
 from server.harness import backlog as backlog_mod
-from server.harness import codegen, engine, runtime_qa
+from server.harness import agentic, codegen, engine, runtime_qa
 from server.harness.engine import Ctx, Step
 
 logger = logging.getLogger(__name__)
@@ -174,37 +174,23 @@ def _s_data_layer(brief: str):
     return step
 
 
-# The set of files the model is allowed to see/edit each feature (small context block).
-_BUILD_CONTEXT_FILES = ["server.js", "public/index.html"]
-
-
-def _build_context_files(shortid: str) -> dict:
-    files = {}
-    for rel in _BUILD_CONTEXT_FILES:
-        c = workspace.read_file_capped(shortid, rel)
-        if c is not None:
-            files[rel] = c
-    return files
-
-
 def _s_feature(idx: int, feature: str, brief: str):
+    """Build ONE backlog feature with the agentic loop (phase 26).
+
+    The model navigates the repo with tools (list/grep/read/edit) instead of being handed a
+    context block and asked to return whole files, so untouched code stays untouched and the
+    per-feature cost stops scaling with file size. If the deploy/health-gate then fails, the
+    SAME loop gets one repair pass — and it can `app_logs` the container's own crash output,
+    which the whole-file path could never see.
+    """
     async def step(ctx: Ctx):
         ctx.emit({"type": "progress", "stage": "build_feature",
                   "detail": f"[{idx+1}] {feature[:120]}"})
-        current = _build_context_files(ctx.project_id)
-        files = await codegen.generate_files(
-            brief=brief, tech_plan=ctx.state.get("tech_plan", ""),
-            feature=feature, current_files=current,
-            recent_changes=ctx.state.get("changes", []),
-        )
-        wrote = []
-        for path, content in files.items():
-            # migrations get a proper NNN name if the model didn't number them well
-            if path.startswith("migrations/") and not __import__("re").match(
-                    r"migrations/\d{3}_", path):
-                path = "migrations/" + _next_migration_name(ctx.project_id, feature)
-            workspace.write_file(ctx.project_id, path, content)
-            wrote.append(path)
+        res = await agentic.run_agent(
+            project_id=ctx.project_id, run_id=ctx.run_id, step=f"build_{idx+1:02d}",
+            brief=brief, tech_plan=ctx.state.get("tech_plan", ""), task=feature,
+            recent_changes=ctx.state.get("changes", []), mode="feature", emit=ctx.emit)
+        wrote = list(res["changed"])
         # rebuild + restart just the app, health-gate (deployer does the full compose)
         await _load_secrets_into_state(ctx)
         proj = await store.get_project(ctx.project_id)
@@ -214,15 +200,18 @@ def _s_feature(idx: int, feature: str, brief: str):
                 db_password=ctx.state["db_password"], app_secret=ctx.state["app_secret"],
                 title=(proj or {}).get("title", ""))
         except Exception as e:  # noqa: BLE001 — feed the error back once, then continue
-            logger.warning("feature %s build failed, one retry: %s", feature, e)
-            fix = await codegen.generate_files(
+            logger.warning("feature %s build failed, one repair pass: %s", feature, e)
+            fix = await agentic.run_agent(
+                project_id=ctx.project_id, run_id=ctx.run_id, step=f"build_{idx+1:02d}_fix",
                 brief=brief, tech_plan=ctx.state.get("tech_plan", ""),
-                feature=f"The previous change broke the build/health. Error:\n{str(e)[:1500]}\n"
-                        f"Fix it minimally for feature: {feature}",
-                current_files=_build_context_files(ctx.project_id),
-                recent_changes=ctx.state.get("changes", []), minimal=True)
-            for path, content in fix.items():
-                workspace.write_file(ctx.project_id, path, content)
+                task=f"The change just made for '{feature}' broke the build or the health "
+                     f"gate. Diagnose and fix it with the smallest possible change.",
+                extra=f"Deploy/health error:\n{str(e)[:2000]}\n"
+                      f"Files just changed: {', '.join(wrote) or '(none)'}\n"
+                      "Use app_logs to see what the container itself reported.",
+                recent_changes=ctx.state.get("changes", []), mode="fix",
+                require_change=False, emit=ctx.emit)
+            for path in fix["changed"]:
                 if path not in wrote:
                     wrote.append(path)
             await deployer.deploy(
@@ -231,7 +220,8 @@ def _s_feature(idx: int, feature: str, brief: str):
                 title=(proj or {}).get("title", ""))
         ctx.state.setdefault("changes", []).append(f"{feature} ({', '.join(wrote)})")
         await _commit(ctx, f"feat: {feature[:70]}")
-        return f"built {feature[:60]} -> {wrote}"
+        return (f"built {feature[:60]} -> {wrote or 'no file changes'} "
+                f"({res['tool_calls']} tool calls; {res['summary'][:160]})")
     return step
 
 
@@ -251,7 +241,7 @@ def _s_qa(brief: str):
             ctx.project_id, brief=brief, tech_plan=ctx.state.get("tech_plan", ""),
             url=url, db_password=ctx.state["db_password"],
             app_secret=ctx.state["app_secret"], title=(proj or {}).get("title", ""),
-            emit=ctx.emit, max_rounds=2, commit_fix=commit_fix,
+            emit=ctx.emit, max_rounds=2, commit_fix=commit_fix, run_id=ctx.run_id,
         )
         ctx.emit({"type": "qa", "final": True, "clean": report["clean"],
                   "rounds": report["rounds"], "critic": report["critic"],
@@ -445,23 +435,14 @@ def build_update_steps(user_id: str, email: Optional[str], request_text: str) ->
     async def s_plan_and_apply(ctx: Ctx):
         ctx.emit({"type": "progress", "stage": "update_plan",
                   "detail": f"planning minimal diff: {request_text[:100]}"})
-        current = _build_context_files(ctx.project_id)
-        files = await codegen.generate_files(
+        res = await agentic.run_agent(
+            project_id=ctx.project_id, run_id=ctx.run_id, step="plan_and_apply",
             brief=ctx.state["brief"], tech_plan=ctx.state["tech_plan"],
-            feature=f"CHANGE REQUEST: {request_text}",
-            current_files=current,
-            recent_changes=ctx.state.get("recent_commits", []),
-            minimal=True,
-        )
-        wrote = []
-        for path, content in files.items():
-            if path.startswith("migrations/") and not __import__("re").match(
-                    r"migrations/\d{3}_", path):
-                path = "migrations/" + _next_migration_name(ctx.project_id, request_text)
-            workspace.write_file(ctx.project_id, path, content)
-            wrote.append(path)
-        ctx.state["changed_files"] = wrote
-        return f"applied minimal diff -> {wrote}"
+            task=request_text, recent_changes=ctx.state.get("recent_commits", []),
+            mode="update", emit=ctx.emit)
+        ctx.state["changed_files"] = list(res["changed"])
+        return (f"applied minimal diff -> {res['changed'] or 'no file changes'} "
+                f"({res['tool_calls']} tool calls; {res['summary'][:160]})")
 
     async def s_deploy(ctx: Ctx):
         # keep last-good compose for rollback
@@ -501,7 +482,7 @@ def build_update_steps(user_id: str, email: Optional[str], request_text: str) ->
             ctx.project_id, brief=ctx.state["brief"], tech_plan=ctx.state["tech_plan"],
             url=url, db_password=ctx.state["db_password"], app_secret=ctx.state["app_secret"],
             title=(proj or {}).get("title", ""), emit=ctx.emit, max_rounds=2,
-            commit_fix=commit_fix)
+            commit_fix=commit_fix, run_id=ctx.run_id)
         ctx.emit({"type": "qa", "final": True, "clean": report["clean"],
                   "rounds": report["rounds"], "critic": report["critic"],
                   "errors": report["errors"][:10], "network": report["network"][:10]})
