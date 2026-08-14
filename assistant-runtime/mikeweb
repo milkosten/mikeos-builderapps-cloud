@@ -46,7 +46,17 @@ def die(msg: str, code: int = TOOL_ERROR):
     sys.exit(code)
 
 
-def call(method: str, path: str, body=None, timeout: float = 90.0):
+class Refused(Exception):
+    """The control plane said no (403/404/429). Carries the status so a caller can tell a
+    LOST SESSION (worth retrying once) from a REFUSAL (never worth retrying — retrying a
+    denied URL just prints the same refusal twice and looks like a bug)."""
+
+    def __init__(self, status: int, detail: str):
+        super().__init__(detail)
+        self.status, self.detail = status, detail
+
+
+def call(method: str, path: str, body=None, timeout: float = 90.0, raise_on_error=False):
     if not CONTROL_URL or not TOKEN:
         die("CONTROL_URL / ASSISTANT_TOKEN are not set — this only runs inside a beat")
     data = json.dumps(body).encode() if body is not None else None
@@ -63,6 +73,8 @@ def call(method: str, path: str, body=None, timeout: float = 90.0):
             detail = json.loads(detail).get("detail") or detail
         except Exception:
             pass
+        if raise_on_error:
+            raise Refused(e.code, str(detail)[:400])
         die(f"{str(detail)[:400]}")
     except Exception as e:  # noqa: BLE001
         die(f"could not reach the control plane: {str(e)[:200]}")
@@ -112,9 +124,14 @@ def do_goto(url: str, sid: str = "") -> dict:
     retry ONCE. A tool that answers "no such session" teaches an agent to stop using it."""
     sid = session(sid)
     try:
-        return call("POST", f"{BASE}/session/{sid}/navigate", {"url": url}, timeout=120)
-    except SystemExit:
-        # Most likely the session expired or was reaped. Open a fresh one and retry ONCE.
+        return call("POST", f"{BASE}/session/{sid}/navigate", {"url": url}, timeout=120,
+                    raise_on_error=True)
+    except Refused as e:
+        # 404 = the session expired or was reaped out from under us. Open a fresh one and
+        # retry ONCE. Anything else (403 refused url, 429 over the cap) is a real answer:
+        # retrying it just prints the same refusal twice and reads like a bug.
+        if e.status != 404:
+            die(e.detail)
         forget_session()
         sid = session("")
         return call("POST", f"{BASE}/session/{sid}/navigate", {"url": url}, timeout=120)
