@@ -43,6 +43,10 @@ HEARTBEAT_SEC = float(os.environ.get("BUILDERAPPS_HEARTBEAT_SEC", "30"))
 # HEARTBEAT_SEC so a GC pause / slow query can't cause a spurious takeover.
 STALE_SEC = int(os.environ.get("BUILDERAPPS_RUN_STALE_SEC", "180"))
 JANITOR_SEC = float(os.environ.get("BUILDERAPPS_JANITOR_SEC", "90"))
+# The control plane runs as ONE container with ONE uvicorn worker (see the Dockerfile), so at
+# boot every `running` run necessarily belonged to the process we just replaced. Set to 0 if
+# this is ever scaled out, and boot recovery falls back to the conservative staleness rule.
+SINGLE_INSTANCE = os.environ.get("BUILDERAPPS_SINGLE_INSTANCE", "1").strip() not in ("0", "false", "no")
 # Bounded retries: a run that keeps dying must eventually fail loudly instead of looping.
 # A step that FAILS already terminates the run, so this really bounds "how many process
 # restarts may one run survive" — generous enough for a long build to ride out a few deploys,
@@ -196,7 +200,7 @@ async def start(run_id: int, project_id: str,
 # ---------------------------------------------------------------------------
 # recovery: boot sweep + janitor
 # ---------------------------------------------------------------------------
-async def _resume(run: dict) -> None:
+async def _resume(run: dict, *, at_boot: bool = False) -> None:
     """Claim + resume one orphaned run. Marks it failed (with a reason) when it cannot be
     resumed, so the UI shows a real error instead of an eternal spinner."""
     from server.harness import pipeline   # local import: pipeline must not import runner
@@ -206,7 +210,8 @@ async def _resume(run: dict) -> None:
     if is_active(run_id):
         return
 
-    claimed = await store.claim_run(run_id, INSTANCE_ID, STALE_SEC)
+    claimed = await store.claim_run(run_id, INSTANCE_ID, STALE_SEC,
+                                    any_other_owner=at_boot and SINGLE_INSTANCE)
     if not claimed:
         return                      # another worker got there first — leave it alone
 
@@ -288,14 +293,24 @@ async def sweep() -> int:
 
 
 async def sweep_on_boot() -> int:
-    """Startup recovery. Any run marked `running` at boot predates this process by definition
-    (nothing else can be executing in it), so orphans are taken over immediately: we treat a
-    heartbeat older than the staleness window as dead, and an unowned run as dead outright."""
+    """Startup recovery — the one that matters, because a control-plane redeploy is how runs
+    got orphaned in the first place.
+
+    In the default single-instance deployment (one container, one uvicorn worker — see the
+    Dockerfile) ANY run still marked `running` at boot belongs to the process we just
+    replaced: nothing else can possibly be executing it. So we take them all over immediately
+    rather than waiting out the staleness window — a SIGKILLed container leaves a heartbeat
+    that is only seconds old, and making a customer's build sit idle for minutes because of
+    that would defeat the point.
+
+    With BUILDERAPPS_SINGLE_INSTANCE=0 the conservative rule applies instead: only unowned or
+    demonstrably stale runs are taken, so a live sibling's run is never stolen.
+    """
     try:
-        # Unowned (released by a clean shutdown) OR stale (SIGKILL / OOM / crash). A run whose
-        # owner is still heartbeating belongs to a live sibling worker — never steal it.
-        rows = [r for r in await store.running_runs()
-                if not (r.get("owner") or "") or _is_stale(r)]
+        rows = await store.running_runs()
+        if not SINGLE_INSTANCE:
+            rows = [r for r in rows if not (r.get("owner") or "") or _is_stale(r)]
+        rows = [r for r in rows if (r.get("owner") or "") != INSTANCE_ID]
     except Exception as e:  # noqa: BLE001
         logger.warning("boot sweep query failed: %s", e)
         return 0
@@ -305,7 +320,7 @@ async def sweep_on_boot() -> int:
     n = 0
     for run in rows:
         try:
-            await _resume(run)
+            await _resume(run, at_boot=True)
             n += 1
         except Exception:  # noqa: BLE001
             logger.exception("boot sweep could not recover run %s", run.get("id"))

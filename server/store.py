@@ -250,22 +250,36 @@ async def heartbeat_run(run_id: int, owner: str) -> bool:
     return res == "UPDATE 1"
 
 
-async def claim_run(run_id: int, owner: str, stale_sec: int) -> Optional[dict]:
-    """Atomically take ownership of a run, but ONLY if it is unowned or its heartbeat is
-    stale. This is the cross-process mutex: two api workers sweeping the same orphan at boot
-    race on this single UPDATE and exactly one wins (`UPDATE 1`).
+async def claim_run(run_id: int, owner: str, stale_sec: int,
+                    any_other_owner: bool = False) -> Optional[dict]:
+    """Atomically take ownership of a run. This single UPDATE is the cross-process mutex:
+    two processes sweeping the same orphan race on it and exactly one wins.
 
-    Returns the claimed row, or None if somebody else owns a live run.
+    Normally a run is only claimable when it is unowned or its heartbeat has gone stale.
+    `any_other_owner=True` (the BOOT sweep) also claims a run whose heartbeat is still fresh
+    but which belongs to a *different* instance: at startup that owner is by definition a
+    process that no longer exists — the previous container. Without this, recovery after a
+    redeploy had to wait out the whole staleness window before anything happened.
+
+    Returns the claimed row, or None if the claim did not apply.
     """
-    row = await pool().fetchrow(
-        "UPDATE builderapps.pipeline_runs SET owner=$2, attempts=attempts+1, "
-        "heartbeat_at=now() "
-        "WHERE id=$1 AND status='running' "
-        "  AND (owner = '' OR owner IS NULL OR heartbeat_at IS NULL "
-        "       OR heartbeat_at < now() - make_interval(secs => $3::double precision)) "
-        "RETURNING *",
-        run_id, owner, float(stale_sec),
-    )
+    if any_other_owner:
+        row = await pool().fetchrow(
+            "UPDATE builderapps.pipeline_runs SET owner=$2, attempts=attempts+1, "
+            "heartbeat_at=now() "
+            "WHERE id=$1 AND status='running' AND coalesce(owner,'') <> $2 RETURNING *",
+            run_id, owner,
+        )
+    else:
+        row = await pool().fetchrow(
+            "UPDATE builderapps.pipeline_runs SET owner=$2, attempts=attempts+1, "
+            "heartbeat_at=now() "
+            "WHERE id=$1 AND status='running' "
+            "  AND (owner = '' OR owner IS NULL OR heartbeat_at IS NULL "
+            "       OR heartbeat_at < now() - make_interval(secs => $3::double precision)) "
+            "RETURNING *",
+            run_id, owner, float(stale_sec),
+        )
     return dict(row) if row else None
 
 

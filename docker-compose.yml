@@ -55,6 +55,11 @@ services:
       WORKSPACES_ROOT: /opt/builderapps/workspaces
       BUILDERAPPS_VOL_ROOT: /data/builderapps/vol
       DEPLOY_NETWORK: deploy_default
+    # Docker's default 10s SIGTERM->SIGKILL window is shorter than uvicorn's graceful
+    # shutdown, so the app was being killed before its lifespan shutdown could run and
+    # RELEASE ownership of in-flight runs. With room to shut down cleanly, an interrupted run
+    # is handed back explicitly rather than only being inferred dead afterwards.
+    stop_grace_period: 30s
     volumes:
       # the deployer shells out `docker compose` against the HOST daemon
       - /var/run/docker.sock:/var/run/docker.sock
