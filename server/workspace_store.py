@@ -257,6 +257,33 @@ async def get_item(item_id: int, project_id: str) -> Optional[dict]:
     return _row(r) if r else None
 
 
+async def latest_item_by(project_id: str, created_by: str,
+                         within_minutes: int = 15) -> Optional[dict]:
+    """The newest item this actor filed, recently. Exists for ONE specific, guaranteed bug.
+
+    An assistant reasons ONCE per beat and emits up to two actions in that single reply. The
+    most valuable pair by far is "file the bug, then tell the Developer about it" — and it is
+    impossible to write correctly, because the id of the item does not exist yet when the
+    message naming it is composed. Observed on the very first real run: the Tester filed #21
+    and messaged "see item #4".
+
+    Telling the model to spend two beats instead is the wrong answer — a beat costs money and
+    the hand-off is the entire point of the feature. So a DM whose `refs_item_id` is not in
+    this project falls back to whatever this same assistant just filed, and SAYS SO in the
+    action result. Never silent: a silent substitution would attach the wrong report to the
+    wrong message and read as if it had worked.
+
+    Bounded by time so a stale or genuinely wrong id can never attach a week-old item.
+    """
+    r = await pool().fetchrow(
+        f"SELECT {_COLS} FROM builderapps.workspace_items "
+        "WHERE project_id=$1 AND created_by=$2 "
+        "  AND created_at > now() - make_interval(mins => $3::int) "
+        "ORDER BY id DESC LIMIT 1",
+        project_id, created_by, max(1, int(within_minutes)))
+    return _row(r) if r else None
+
+
 async def get_by_ext_key(project_id: str, ext_key: str) -> Optional[dict]:
     r = await pool().fetchrow(
         f"SELECT {_COLS} FROM builderapps.workspace_items "

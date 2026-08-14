@@ -736,7 +736,11 @@ def _action_menu(assistant: dict) -> str:
         "action — reference a board item and they receive the entire report, not your "
         "summary of it. Message someone when you need THEM to do something you cannot. Do "
         "not message to acknowledge, to thank, or to confirm you have read something: "
-        "silence is the correct answer to good news.")
+        "silence is the correct answer to good news.\n"
+        "  You CAN file an item and message someone about it in the same beat — emit "
+        '{"type":"workspace_add",…} first and then {"type":"message",…}. You will not know '
+        "the new item's id when you write the message; put your best guess in `item_id` and "
+        "the platform attaches the item you just filed.")
     lines.append('- {"type":"none"} — nothing is worth doing this beat. Preferred over noise.')
     return "\n".join(lines)
 
@@ -1098,14 +1102,29 @@ async def act_message(assistant: dict, action: dict,
         item_id = int(item_id) if item_id else None
     except (TypeError, ValueError):
         item_id = None
+
+    # THE FILE-THEN-TELL REPAIR. An assistant reasons once per beat and emits both actions in
+    # the same reply, so `{"type":"workspace_add"} , {"type":"message","item_id":…}` — the
+    # single most valuable pair there is — names an id that did not exist when it was written.
+    # The first real run did exactly this: filed #21, messaged "see item #4". Substitute what
+    # this assistant actually just filed, and say so in the result rather than pretending.
+    swapped_from = None
+    if item_id and not await W.get_item(item_id, project_id):
+        recent = await W.latest_item_by(project_id, _ws_actor(assistant).ident)
+        if recent:
+            swapped_from, item_id = item_id, int(recent["id"])
+
     res = await M.send(project_id, sender=assistant, to=to, body_md=body,
                        refs_item_id=item_id, beat_id=beat_id)
     if not res.get("ok"):
         return res
     msg = res.get("message") or {}
+    note = (f" (you referenced #{swapped_from}, which does not exist — sent it with #{item_id},"
+            " the item you filed this beat)" if swapped_from else "")
     return {"ok": True, "message_id": msg.get("id"), "to": msg.get("to_name"),
-            "blocked": res.get("blocked") or "", "woke": bool(res.get("woke")),
-            "detail": f"-> {msg.get('to_name')}: {res.get('detail')}"}
+            "refs_item_id": item_id, "blocked": res.get("blocked") or "",
+            "woke": bool(res.get("woke")),
+            "detail": f"-> {msg.get('to_name')}: {res.get('detail')}{note}"}
 
 
 async def apply_action(assistant: dict, action: dict,
