@@ -23,6 +23,7 @@ GITEA_URL = os.environ.get("GITEA_URL", "https://gitea.osmike.com").rstrip("/")
 GITEA_API = f"{GITEA_URL}/api/v1"
 GITEA_ADMIN_USER = os.environ.get("GITEA_ADMIN_USER", "").strip()
 GITEA_ADMIN_TOKEN = os.environ.get("GITEA_ADMIN_TOKEN", "").strip()
+GITEA_ADMIN_PW = os.environ.get("GITEA_ADMIN_PW", "").strip()
 
 TEMPLATE_OWNER = os.environ.get("GITEA_TEMPLATE_OWNER", "templates")
 TEMPLATE_REPO = os.environ.get("GITEA_TEMPLATE_REPO", "nodejs-fullstack")
@@ -99,13 +100,15 @@ async def ensure_user(user_id: str, email: Optional[str]) -> dict:
 
 
 async def _mint_user_token(username: str) -> str:
-    """Create a per-user token by having the admin act on the user's behalf (Sudo header).
-    Gitea allows the admin token + `Sudo: <user>` to hit the user's own /users/{u}/tokens."""
+    """Create a per-user token. Gitea's /users/{u}/tokens requires BASIC auth (not a token);
+    the admin acts on the user's behalf via the `Sudo` header + admin basic credentials."""
+    if not GITEA_ADMIN_PW:
+        raise RuntimeError("GITEA_ADMIN_PW is required to mint per-user Gitea tokens")
     name = f"builderapps-{secrets.token_hex(4)}"
-    headers = dict(_admin_headers())
-    headers["Sudo"] = username
+    headers = {"Sudo": username, "Content-Type": "application/json"}
     body = {"name": name, "scopes": ["write:repository", "write:user"]}
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as c:
+    async with httpx.AsyncClient(timeout=_TIMEOUT,
+                                 auth=(GITEA_ADMIN_USER, GITEA_ADMIN_PW)) as c:
         r = await c.post(f"{GITEA_API}/users/{username}/tokens", headers=headers, json=body)
         if r.status_code not in (201, 200):
             raise RuntimeError(f"gitea mint token failed HTTP {r.status_code}: {r.text[:300]}")
