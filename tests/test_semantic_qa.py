@@ -203,6 +203,25 @@ async def main() -> int:
     check("marker injected in nested strings only",
           injected == {"a": m1, "b": [f"x/{m1}"], "n": 3}, injected)
 
+    # --- 8b. a unique-constraint collision is OURS, not the app's ------------
+    # The campaign's standup build was reported "registration is broken (409 on a fresh
+    # email)" — QA had simply re-posted the planner's literal qa@example.com.
+    print("\n[duplicate seeds]")
+    uq = semantic_qa._uniquify({"email": "qa@example.com", "name": "__x__"}, "QASEEDAA")
+    check("emails are uniquified per seed", uq["email"] == "qa+QASEEDAA@example.com", uq)
+    check("other fields are left alone until we actually collide",
+          uq["name"] == "__x__", uq)
+    check("409 is recognised as a duplicate", semantic_qa._is_duplicate(409, "{}"))
+    check("a 400 that says 'already exists' counts too",
+          semantic_qa._is_duplicate(400, '{"error":"email already exists"}'))
+    check("a plain 422 is a real failure, not a duplicate",
+          not semantic_qa._is_duplicate(422, '{"error":"servings must be an integer"}'))
+    ag = semantic_qa._uniquify({"code": "mycustom1", "date": "2026-08-14", "n": 3,
+                                "amount": "12.50"}, "QASEEDBB", aggressive=True)
+    check("the retry makes short strings unique", ag["code"] == "mycustom1-QASEEDBB", ag)
+    check("dates and numbers are NOT corrupted by the retry",
+          ag["date"] == "2026-08-14" and ag["amount"] == "12.50" and ag["n"] == 3, ag)
+
     # --- 8. a detail page gets the created record's id substituted in --------
     # The campaign's first build was reported broken by QA purely because the flow's page was
     # the literal "/links/:id": the app answered "Link not found" for a route that works.

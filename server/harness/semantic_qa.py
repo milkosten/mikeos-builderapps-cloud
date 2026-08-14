@@ -152,6 +152,45 @@ async def plan_flows(project_id: str, brief: str, tech_plan: str) -> List[Dict[s
     return out
 
 
+_EMAIL_RE = re.compile(r"^([^@\s]+)@([^@\s]+\.[A-Za-z]{2,})$")
+# Values a suffix would CORRUPT rather than uniquify: dates, times, numbers, booleans, enums
+# the app validates against a whitelist. Suffixing one turns a 409 into a 422.
+_TYPED_VALUE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}([T ].*)?|[\d.,+-]+|true|false|null|#[0-9a-fA-F]{3,8})$", re.I)
+_DUP_RE = re.compile(r"already (exists|registered|taken)|duplicate|unique constraint"
+                     r"|is taken|in use", re.I)
+
+
+def _uniquify(value: Any, marker: str, *, aggressive: bool = False) -> Any:
+    """Make the planned body's unique-constrained values unique to THIS seed.
+
+    The planner writes literal values (`qa@example.com`, `"code": "mycustom1"`). The second
+    flow — or the second QA round on the same app — re-posts them and the app correctly answers
+    409. QA then reported "registration is broken (HTTP 409 on a fresh email)" on an app whose
+    registration was perfect, and every authenticated flow after it failed 401 (measured on the
+    campaign's standup build). Emails are always uniquified; `aggressive` (used only after a
+    duplicate response) also suffixes every other short string.
+    """
+    if isinstance(value, str):
+        m = _EMAIL_RE.match(value)
+        if m:
+            return f"{m.group(1)}+{marker}@{m.group(2)}" if marker not in value else value
+        if (aggressive and 0 < len(value) <= 64 and marker not in value
+                and not _TYPED_VALUE_RE.match(value)):
+            return f"{value}-{marker}"
+        return value
+    if isinstance(value, list):
+        return [_uniquify(v, marker, aggressive=aggressive) for v in value]
+    if isinstance(value, dict):
+        return {k: _uniquify(v, marker, aggressive=aggressive) for k, v in value.items()}
+    return value
+
+
+def _is_duplicate(status: int, text: str) -> bool:
+    """A create rejected because the value already exists (409, or a 4xx that says so)."""
+    return status == 409 or (400 <= status < 500 and bool(_DUP_RE.search(text or "")))
+
+
 _PLACEHOLDER_RE = re.compile(r":[A-Za-z_]\w*|\{[A-Za-z_]\w*\}|__ID__")
 
 
@@ -286,9 +325,15 @@ async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
     async with browser_factory(base_url) as br:
         for flow in flows:
             marker = _marker()
-            body = _inject(flow["body"], marker)
+            body = _uniquify(_inject(flow["body"], marker), marker)
             result["checked"] += 1
             status, text = await br.request(flow["method"], flow["path"], body)
+            if _is_duplicate(status, text):
+                # The planner's literal values (`qa@example.com`, a fixed short code) collide
+                # with a row a previous flow/round already inserted. That is OUR collision, not
+                # the app's bug — make every short string unique and try once more.
+                body = _uniquify(body, marker, aggressive=True)
+                status, text = await br.request(flow["method"], flow["path"], body)
             step = {"flow": flow["name"], "marker": marker, "create_status": status}
 
             # 1. the WRITE path — never trust 200 alone: the record must come back with an id
