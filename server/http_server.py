@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from server import (assistant_api, assistant_runtime, db, deployer, gitea, introspect,
-                    naming, runner, store, workspace, usage)
+                    llm_proxy, naming, runner, store, workspace, usage)
 from server.harness import pipeline
 from server.identity import authenticate, current_user
 
@@ -78,6 +78,11 @@ app = FastAPI(title="mikeos-builderapps-cloud", lifespan=lifespan)
 # Per-project AI assistants (phase 29). A router, not more routes here — its paths land in
 # /openapi.json exactly as if they were declared on the app.
 app.include_router(assistant_api.router)
+
+# The OpenAI-compatible endpoint the assistant's Pi coding agent talks to (phase 30). It is
+# what keeps the OpenRouter key OUT of an LLM-driven container while every token it spends
+# still lands in this project's usage accounting.
+app.include_router(llm_proxy.router)
 
 _CORS_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS", "https://builderapps.osmike.com").split(",") if o.strip()]

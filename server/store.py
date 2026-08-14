@@ -179,11 +179,21 @@ async def list_secrets(project_id: str) -> list[dict]:
 
 # ---- deployments ----------------------------------------------------------
 async def create_deployment(project_id: str, image_tag: str = "",
-                            compose_hash: str = "") -> int:
+                            compose_hash: str = "", git_sha: str = "",
+                            assistant_id: Optional[int] = None,
+                            beat_id: Optional[int] = None) -> int:
+    """Open a deployment row.
+
+    `git_sha` is what makes a ROLLBACK possible at all: the newest row that reached
+    `healthy` is by definition the last commit that passed the health gate — the thing a
+    failed assistant deploy has to go back to. `assistant_id`/`beat_id` make an unattended
+    deploy attributable to the exact beat that caused it.
+    """
     dep_id = await pool().fetchval(
-        "INSERT INTO builderapps.deployments(project_id,image_tag,compose_hash,status) "
-        "VALUES ($1,$2,$3,'deploying') RETURNING id",
-        project_id, image_tag, compose_hash,
+        "INSERT INTO builderapps.deployments"
+        "(project_id,image_tag,compose_hash,status,git_sha,assistant_id,beat_id) "
+        "VALUES ($1,$2,$3,'deploying',$4,$5,$6) RETURNING id",
+        project_id, image_tag, compose_hash, (git_sha or "")[:64], assistant_id, beat_id,
     )
     if dep_id is None:
         raise RuntimeError("create_deployment returned no id")
@@ -192,12 +202,28 @@ async def create_deployment(project_id: str, image_tag: str = "",
 
 async def list_deployments(project_id: str, limit: int = 50) -> list[dict]:
     rows = await pool().fetch(
-        "SELECT id,image_tag,status,health,started_at,finished_at "
+        "SELECT id,image_tag,status,health,git_sha,assistant_id,beat_id,"
+        "       started_at,finished_at "
         "FROM builderapps.deployments WHERE project_id=$1 "
         "ORDER BY started_at DESC LIMIT $2",
         project_id, max(1, min(int(limit), 200)),
     )
     return [dict(r) for r in rows]
+
+
+async def last_good_sha(project_id: str) -> Optional[str]:
+    """The most recent commit that actually passed the health gate — the rollback target.
+
+    Derived from the deployments table rather than kept in a `projects.last_good_sha`
+    column on purpose: one writer (`finish_deployment`), so there is no second source of
+    truth to drift out of step with reality. Returns None for a project that has never had
+    a green deploy recorded WITH a sha — and the caller must then refuse to "roll back",
+    because it does not know where to.
+    """
+    return await pool().fetchval(
+        "SELECT git_sha FROM builderapps.deployments "
+        "WHERE project_id=$1 AND status='healthy' AND git_sha <> '' "
+        "ORDER BY started_at DESC LIMIT 1", project_id)
 
 
 async def finish_deployment(dep_id: int, status: str, health: str = "") -> None:
@@ -211,11 +237,20 @@ async def finish_deployment(dep_id: int, status: str, health: str = "") -> None:
 
 
 # ---- pipeline runs / steps ------------------------------------------------
-async def create_run(project_id: str, kind: str, request: str, total_steps: int) -> int:
+async def create_run(project_id: str, kind: str, request: str, total_steps: int,
+                     assistant_id: Optional[int] = None,
+                     beat_id: Optional[int] = None) -> int:
+    """Open a pipeline run. `kind` ∈ {create, update, deploy}.
+
+    `assistant_id`/`beat_id` are set when an ASSISTANT caused this run, so every unattended
+    build is traceable back to the beat that triggered it — and the beat record links
+    forward to the run. An agent that can ship code must leave a trail in both directions.
+    """
     run_id = await pool().fetchval(
-        "INSERT INTO builderapps.pipeline_runs(project_id,kind,request,total_steps) "
-        "VALUES ($1,$2,$3,$4) RETURNING id",
-        project_id, kind, request, total_steps,
+        "INSERT INTO builderapps.pipeline_runs"
+        "(project_id,kind,request,total_steps,assistant_id,beat_id) "
+        "VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+        project_id, kind, request, total_steps, assistant_id, beat_id,
     )
     if run_id is None:
         raise RuntimeError("create_run returned no id")

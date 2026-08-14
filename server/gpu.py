@@ -106,6 +106,17 @@ def _report_usage(usage: Dict[str, Any], model: str) -> Dict[str, Any]:
         return usage
 
 
+def account_usage(usage: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Public entry to the SAME costing + sink path `chat()` uses.
+
+    The assistant LLM proxy (`server.llm_proxy`) forwards OpenAI-compatible traffic to
+    OpenRouter without going through `chat()`, and its tokens must still land in `llm_usage`
+    priced identically. Two costing implementations would drift, and the one that drifts is
+    always the one nobody is watching.
+    """
+    return _report_usage(usage, model)
+
+
 async def _openrouter_chat(messages: List[Dict[str, Any]], schema: Optional[Dict[str, Any]],
                            temperature: float, num_predict: int, timeout: float,
                            max_retries: int) -> str:

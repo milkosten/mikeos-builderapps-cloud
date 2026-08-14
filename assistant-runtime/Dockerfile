@@ -2,16 +2,30 @@
 #
 # Mike's constraint, and the right one: "an assistant that can only call an LLM is a chatbot;
 # an assistant with a checkout, a shell and tools is a colleague." So this image ships real
-# CLI tools and the beat program clones the project repo and actually uses them.
+# CLI tools, the beat program clones the project repo, and the actual code editing is done by
+# **Pi** — an open-source coding agent — running right here with the checkout in front of it.
+#
+# WE DO NOT WRITE OUR OWN CODING LOOP. `@earendil-works/pi-coding-agent` is pinned below and
+# driven non-interactively by beat.py. (Note the scope: Pi is the ASSISTANT's coding engine.
+# The build pipeline that produces v1 of an app is a different, strict, ordered thing and is
+# untouched by this — assistants are disconnected from it.)
 #
 # Ephemeral: the scheduler starts one of these per beat with `--rm`. It clones/refreshes,
-# perceives, reasons, acts, writes its beat record and exits. Nothing survives except
-# /workspace (the assistant's own cached checkout, bind-mounted from the host).
+# perceives, reasons, codes, commits, asks for a deploy, writes its beat record and exits.
+# Nothing survives except /workspace (the assistant's own cached checkout, bind-mounted).
 #
-# WHAT IS DELIBERATELY ABSENT: the docker CLI and the docker socket. An assistant never
-# deploys anything itself — it asks the control plane, which runs the normalizer + health
-# gate + rollback. Docker-socket access is host root.
-FROM debian:bookworm-slim
+# WHAT IS DELIBERATELY ABSENT:
+#   * the docker CLI and the docker socket — an assistant never deploys anything itself, it
+#     asks the control plane, which runs the normalizer + health gate + rollback. Docker
+#     socket access is host root.
+#   * any model provider credential. Pi is pointed at the control plane's OpenAI-compatible
+#     proxy and authenticates with the per-assistant token it already holds; the real
+#     OpenRouter key never enters this container. See server/llm_proxy.py.
+
+# Pi 0.84.x requires Node >= 22.19 (it crashes on Node 20 inside undici). node:24 is what
+# Pi's own image uses. The `legacy-node20` dist-tag (0.74.2) exists if this ever has to run
+# on an older runtime — but then pin THAT version, don't mix.
+FROM node:24-bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -19,19 +33,35 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # The starting kit (deliberately extensible — Mike's call what else belongs here):
 #   git            the checkout, the log, the diff, the commit, the push
-#   nodejs npm     the generated apps are node; the assistant must be able to lint/run them
+#   node/npm       from the base image; the generated apps are node and Pi is a node CLI
 #   python3        the beat program + general scripting
-#   ripgrep        searching a repo without slurping it into memory (house rule)
+#   ripgrep        searching a repo without slurping it into memory (house rule), and Pi's
+#                  own grep tool shells out to it
 #   jq curl        JSON + HTTP from the shell
-#   gawk sed       text surgery
+#   gawk sed less  text surgery
 #   postgresql-client / redis-tools   the project's own datastores
 #   ca-certificates  TLS to Gitea and the control plane
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates git curl jq ripgrep gawk sed less \
       python3 python3-minimal \
-      nodejs npm \
       postgresql-client redis-tools \
     && rm -rf /var/lib/apt/lists/*
+
+# THE CODING AGENT. Pinned exactly: an agent that silently changes version under an
+# unattended fleet is an outage waiting for a quiet weekend.
+# --ignore-scripts: nothing in this image should run a package's install hooks.
+ARG PI_VERSION=0.84.2
+RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+    && npm cache clean --force \
+    && pi --version
+
+# PI_OFFLINE kills every non-inference network call Pi would otherwise make at startup (its
+# version check, its install telemetry, and the remote model-catalog refresh). This container's
+# egress should reach the control plane and Gitea and nothing else, so those calls would just
+# hang; and the model we use is defined locally in models.json anyway.
+ENV PI_OFFLINE=1 \
+    PI_TELEMETRY=0 \
+    PI_CODING_AGENT_DIR=/tmp/pi/agent
 
 # Non-root by construction. The scheduler also passes --user, but an image that only works
 # as root is one --user flag away from a bad surprise.

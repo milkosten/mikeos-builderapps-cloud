@@ -447,10 +447,10 @@ _ACTION_SCHEMA = {
                 "properties": {
                     "type": {"type": "string"},
                     "text": {"type": "string"},
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
+                    "task": {"type": "string"},
                     "message": {"type": "string"},
                     "request": {"type": "string"},
+                    "capability": {"type": "string"},
                 },
                 "required": ["type"],
             },
@@ -467,24 +467,44 @@ def _action_menu(assistant: dict) -> str:
     lines = []
     if A.has(assistant, "comment"):
         lines.append('- {"type":"comment","text":"..."} — post a finding or proposal into the '
-                     "project thread the owner reads. This is your main way to be useful.")
+                     "project thread the owner reads.")
     if A.has(assistant, "run_qa"):
         lines.append('- {"type":"run_qa"} — drive the LIVE app through a real browser and '
                      "record what actually happens.")
     if A.has(assistant, "edit_code"):
-        lines.append('- {"type":"write_file","path":"relative/path","content":"full new file"} '
-                     "— replace a file in your own checkout.")
-    if A.has(assistant, "commit_push"):
-        lines.append('- {"type":"commit_push","message":"..."} — commit your edits and push.')
+        # ONE coding action, not a file-by-file protocol. The editing is done by Pi, an
+        # open-source coding agent running in this assistant's own container with the
+        # checkout in front of it; it reads, greps and edits on its own. What is wanted here
+        # is the BRIEF for that agent, so `task` should read like a ticket, not a diff.
+        lines.append(
+            '- {"type":"code","task":"<what to build, as a precise engineering brief>",'
+            '"message":"<git commit message>"} — hand ONE task to the coding agent that '
+            "runs in your container with the repo checked out. It will read the code, make "
+            "the change"
+            + (", commit and push it" if A.has(assistant, "commit_push") else "")
+            + (", and the control plane will then build it and health-gate it; if it fails "
+               "the gate it is rolled back automatically."
+               if A.has(assistant, "request_deploy") else ".")
+            + " Describe the OUTCOME and the constraints; do not write the code here.")
     if A.has(assistant, "request_deploy"):
-        lines.append('- {"type":"request_deploy","request":"one concrete change"} — ask the '
-                     "control plane to run the update pipeline. You never touch Docker.")
+        lines.append('- {"type":"request_deploy","request":"why"} — ship whatever is already '
+                     "committed on HEAD: build + health gate, rolled back if it goes red. "
+                     "You never touch Docker. Only useful if a commit is already pushed "
+                     "that has not been deployed.")
     lines.append('- {"type":"none"} — nothing is worth doing this beat. Preferred over noise.')
     return "\n".join(lines)
 
 
-async def reason(assistant: dict, context: dict, workspace_report: str = "") -> dict:
-    """ONE LLM call: SOUL + role + context -> {thought, actions[], done}.
+async def reason(assistant: dict, context: dict, workspace_report: str = "",
+                 docs: str = "") -> dict:
+    """ONE LLM call: docs + SOUL + role + context -> {thought, actions[], done}.
+
+    The ORDER of the prompt is deliberate and is Mike's: **the project's own documents come
+    first**, then the SOUL, then the current state, then the decision. An assistant with
+    judgment but no knowledge of what the product is *for* optimises the wrong thing, so the
+    vision/mission is the grounding and the persona sits on top of it. The docs are loaded
+    deterministically by the beat program — never left to the model to remember to go and
+    read them.
 
     Cost is attributed to the project (step `assistant:<id>`), so an assistant shows up in
     the project's Usage tab like everything else — an assistant that quietly burns money is
@@ -496,14 +516,24 @@ async def reason(assistant: dict, context: dict, workspace_report: str = "") -> 
     caps = assistant.get("capabilities") or []
 
     system = (
-        f"{soul}\n\n"
+        # 1. THE PRODUCT — what this thing is for, from the project's own docs.
+        ("# The product you look after\n\nThese are this project's own documents. They are "
+         "the ground truth about what it is for and who it is for; everything you decide is "
+         "judged against them.\n\n" + docs[:20000] + "\n\n---\n\n" if docs else "")
+        # 2. THE PERSONA — who you are, on top of that grounding.
+        + f"{soul}\n\n"
         "---\n"
         f"You are an autonomous assistant attached to ONE software project. Your role is "
         f"'{role}'. You run on a heartbeat; this is one beat. You are not chatting with a "
         "human — you either do something useful or you deliberately stay quiet.\n\n"
         f"Capabilities you have been GRANTED: {', '.join(caps) or '(none)'}. Anything not on "
         "that list is refused by the control plane, so do not attempt it.\n\n"
-        "Available actions:\n" + _action_menu(assistant) + "\n\n"
+        + ("You do NOT write code in this reply. You decide WHAT should be done and hand it "
+           "to a coding agent that is already running in your container with the repository "
+           "checked out — it reads and edits the files itself. Your job is to pick the ONE "
+           "most valuable change and brief it precisely.\n\n"
+           if A.has(assistant, "edit_code") else "")
+        + "Available actions:\n" + _action_menu(assistant) + "\n\n"
         "Rules:\n"
         "- Reply with JSON only: {\"thought\": str, \"actions\": [...], \"done\": bool}.\n"
         "- `thought` is one short paragraph a busy human would actually read: what you "
@@ -604,33 +634,67 @@ async def act_run_qa(assistant: dict) -> dict:
             "clean": bool((qa or {}).get("ok")) and not errors and not network}
 
 
-async def act_request_deploy(assistant: dict, request_text: str) -> dict:
-    """THE SAFETY BOUNDARY IN CODE.
+async def act_request_deploy(assistant: dict, request_text: str,
+                             beat_id: Optional[int] = None) -> dict:
+    """THE SAFETY BOUNDARY IN CODE — and it is a SHIP, not the build pipeline.
 
-    The assistant does not deploy. It asks, and the control plane runs the SAME update
-    pipeline a human's chat message runs — normalizer, health gate, rollback and all. The
-    assistant container has no Docker socket and never will.
+    The assistant does not deploy. It asks, and the control plane ships the repo's current
+    HEAD: compose normalizer -> docker build -> health gate -> roll back to the last good
+    commit if the gate goes red (`server.shipper`). The assistant container has no Docker
+    socket and never will.
+
+    Deliberately NOT `pipeline.run_update`. That pipeline re-plans a minimal diff with its
+    own LLM pass; running it here would have a second AI second-guess — and overwrite — the
+    change the assistant's own coding agent just made and pushed. `request_deploy` means one
+    thing only: *"I pushed a commit; ship the current HEAD."*
     """
     A.require(assistant, "request_deploy")
-    from server.harness import pipeline           # local import: avoid an import cycle
+    from server import shipper                    # local import: avoid an import cycle
     project_id = str(assistant["project_id"])
-    req = (request_text or "").strip()
-    if not req:
-        return {"ok": False, "detail": "empty request"}
     proj = await store.get_project(project_id)
     if not proj:
         return {"ok": False, "detail": "project is gone"}
     if proj.get("status") in ("creating", "building", "deploying"):
-        # Never start a pipeline on top of a running one.
-        return {"ok": False, "detail": "a pipeline is already running for this project"}
+        # NO DEPLOY STORM. A ship never starts on top of a run that is already in flight —
+        # the caller is told to come back, it does not queue up behind it.
+        return {"ok": False, "busy": True,
+                "detail": f"a run is already in flight for this project "
+                          f"(status={proj.get('status')}) — not starting a second deploy"}
     user_id = str(proj.get("user_id") or "")
-    await store.set_project_status(project_id, "building")
-    run_id = await store.create_run(project_id, "update", req, total_steps=5)
+    reason = (request_text or "").strip()[:2000] or "ship the pushed commit"
+    aid = int(assistant["id"])
+    run_id = await store.create_run(project_id, "deploy", reason,
+                                    total_steps=len(shipper.STEP_NAMES),
+                                    assistant_id=aid, beat_id=beat_id)
+    await store.set_project_status(project_id, "deploying")
     emit = runner.emitter(run_id)
     await runner.start(run_id, project_id,
-                       lambda: pipeline.run_update(project_id, run_id, user_id, None,
-                                                   req, emit))
-    return {"ok": True, "run_id": run_id, "detail": "update pipeline started"}
+                       lambda: shipper.run_ship(project_id, run_id, user_id, None, reason,
+                                                emit, assistant_id=aid, beat_id=beat_id))
+    return {"ok": True, "run_id": run_id, "detail": "shipping HEAD (build + health gate)"}
+
+
+async def deploy_status(assistant: dict, run_id: int) -> dict:
+    """Where has the ship this beat started got to? The beat container polls this so its
+    record carries the REAL outcome — a beat that says "done" while the health gate was
+    still running would be exactly the "never trust a 200" failure this codebase keeps
+    relearning."""
+    A.require(assistant, "request_deploy")
+    row = await store.get_run(run_id)
+    if not row or str(row.get("project_id")) != str(assistant["project_id"]):
+        return {"ok": False, "detail": "no such run for this project"}
+    steps = await store.get_run_with_steps(run_id) or {}
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "status": row.get("status"),                       # running | done | failed
+        "finished": row.get("status") in ("done", "failed"),
+        "error": _redact(str(row.get("error") or ""))[:1200],
+        "summary": str(row.get("summary") or "")[:600],
+        "steps": [{"name": s.get("name"), "status": s.get("status"),
+                   "detail": _redact(str(s.get("log") or ""))[:400]}
+                  for s in (steps.get("steps") or [])],
+    }
 
 
 async def act_costs(assistant: dict) -> dict:
@@ -638,7 +702,20 @@ async def act_costs(assistant: dict) -> dict:
     return await store.usage_for_project(str(assistant["project_id"]))
 
 
-async def apply_action(assistant: dict, action: dict) -> dict:
+async def act_check(assistant: dict, capability: str) -> dict:
+    """Ask the CONTROL PLANE whether a capability is granted, before doing the local work.
+
+    `edit_code` and `commit_push` necessarily execute inside the container — that is where
+    the checkout and git are. The container knows its own capability list, but that list is
+    a convenience, not a boundary: a tampered container could simply ignore it. So the
+    container asks here first, and this answer is the authority.
+    """
+    A.require(assistant, capability)
+    return {"ok": True, "granted": capability}
+
+
+async def apply_action(assistant: dict, action: dict,
+                       beat_id: Optional[int] = None) -> dict:
     """Dispatch one action. A denied capability is a recorded action RESULT, not a crash —
     the beat still gets written, and the refusal is visible in the timeline."""
     kind = str((action or {}).get("type") or "").strip().lower()
@@ -648,17 +725,15 @@ async def apply_action(assistant: dict, action: dict) -> dict:
         if kind in ("run_qa", "qa"):
             return await act_run_qa(assistant)
         if kind in ("request_deploy", "deploy"):
-            return await act_request_deploy(assistant, str(action.get("request")
-                                                           or action.get("text") or ""))
+            return await act_request_deploy(
+                assistant, str(action.get("request") or action.get("text") or ""),
+                beat_id=beat_id)
         if kind in ("read_costs", "costs"):
             return await act_costs(assistant)
         if kind == "none":
             return {"ok": True, "detail": "nothing to do this beat"}
-        # write_file / commit_push happen INSIDE the container (it has the checkout and git);
-        # the container capability-checks them too, and the control plane holds the grant.
-        if kind in ("write_file", "commit_push"):
-            A.require(assistant, "edit_code" if kind == "write_file" else "commit_push")
-            return {"ok": True, "detail": "executed in the assistant's own checkout"}
+        if kind == "check":
+            return await act_check(assistant, str(action.get("capability") or ""))
         return {"ok": False, "detail": f"unknown action type {kind!r}"}
     except A.Denied as e:
         return {"ok": False, "denied": True, "detail": str(e)}

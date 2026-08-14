@@ -33,9 +33,13 @@ logger = logging.getLogger(__name__)
 # capabilities — the enforced vocabulary
 # ---------------------------------------------------------------------------
 # Each entry: id -> (label, what it lets the assistant actually do, is it safe-by-default)
-# `safe_default` False means: the capability EXISTS and is enforced, but a template never
-# switches it on for you — unattended writes/deploys need the quota + guard work first
-# (v1 scope decision, stated honestly in the UI rather than quietly enabled).
+#
+# `safe_default: False` marks a WRITE capability — one that changes the project rather than
+# merely observing it. As of phase 30 exactly ONE starter template pre-fills these (the
+# Developer, whose entire job is to ship), and the UI flags them so granting one to anything
+# else is a deliberate act. Every other template stays read-only by construction: a Security
+# or Domain-Expert assistant cannot write, whatever its SOUL claims, because `require()` —
+# not the role name and not the prompt — is what the runtime consults.
 CAPABILITIES: dict[str, dict] = {
     "read_repo": {
         "label": "Read the repo",
@@ -59,7 +63,8 @@ CAPABILITIES: dict[str, dict] = {
     },
     "edit_code": {
         "label": "Edit code",
-        "detail": "Write files in its own workspace checkout (never the pipeline's tree).",
+        "detail": ("Run a coding agent over its own workspace checkout (never the pipeline's "
+                   "tree) to make a real change to the app."),
         "safe_default": False,
     },
     "commit_push": {
@@ -68,10 +73,11 @@ CAPABILITIES: dict[str, dict] = {
         "safe_default": False,
     },
     "request_deploy": {
-        "label": "Request a deploy",
-        "detail": ("Ask the control plane to run the update pipeline. The assistant NEVER "
-                   "touches Docker itself — the normalizer, health gate and rollback all "
-                   "still apply."),
+        "label": "Ship the pushed commit",
+        "detail": ("Ask the control plane to build and health-gate the repo's current HEAD, "
+                   "rolling back to the last good commit if it fails. The assistant NEVER "
+                   "touches Docker itself. This is not the build pipeline — no re-planning, "
+                   "no backlog; it ships the commit that is already in git."),
         "safe_default": False,
     },
 }
@@ -157,22 +163,40 @@ TEMPLATES: list[dict] = [
         "key": "developer",
         "role": "Developer",
         "name": "Developer",
-        "description": "Keeps it working and keeps it clean. Reads the code, spots rot, proposes (or makes) the fix.",
-        "optimises": "it works and stays clean",
-        "capabilities": ["read_repo", "comment"],
+        "description": ("Evolves the product. Reads the code, decides the next change, and "
+                        "actually ships it — commit, push, build, health gate."),
+        "optimises": "it works, it grows, and it stays clean",
+        # THE ONLY TEMPLATE THAT SHIPS WRITE CAPABILITIES, and deliberately so: a Developer
+        # that can only describe a fix is a code reviewer with extra steps. Every other
+        # template stays read-only — a Security or Domain-Expert assistant must not be able
+        # to touch the repo whatever its SOUL says, and `require()` is what makes that true.
+        "capabilities": ["read_repo", "comment", "edit_code", "commit_push", "request_deploy"],
         "interval_minutes": 60,
         "soul_md": _soul(
-            "I am the engineer on this app. The code is mine to keep honest.",
-            "Correctness first, then the code staying something a human can still change next month.",
-            ["Read the recent commits and the files they touched.",
+            "I am the engineer on this app. The code is mine to keep honest, and mine to "
+            "move forward — I do not file tickets for myself, I ship.",
+            "The product getting materially better every beat, without ever being broken at "
+            "the end of one. Correctness first, then code a human can still change next month.",
+            ["Read the project's vision and technical plan, then the recent commits, and ask "
+             "what the product is still missing to deliver what it promised.",
+             "Pick the SINGLE most valuable change I can finish and verify in one beat — a "
+             "whole working slice, not a half-wired one.",
+             "Hand it to my coding agent as a precise brief, then commit, push and let the "
+             "control plane build and health-gate it.",
              "Look for the bug that has not surfaced yet: unhandled errors, unbounded reads, "
-             "un-parameterised SQL, a route with no failure path.",
-             "Describe the fix precisely enough that someone could apply it in one sitting."],
-            ["Never load a whole file into memory to check one line.",
-             "Never interpolate a value into SQL.",
-             "Never claim something is fixed that I have not verified."],
-            "Act on a concrete defect or a concrete piece of rot. 'The code could be nicer' is not "
-            "a reason to act.",
+             "un-parameterised SQL, a route with no failure path."],
+            ["Never leave the app broken — a change that cannot pass the health gate is not "
+             "done, and I would rather ship nothing this beat than ship that.",
+             "Never rewrite half the app to make one feature fit; the smallest change that "
+             "genuinely works.",
+             "Never interpolate a value into SQL, and never load a whole file into memory to "
+             "check one line.",
+             "Never add a paid third-party service. Everything is self-hosted in this "
+             "app's own Node + Postgres + Redis stack.",
+             "Never claim something is fixed or built that I have not verified."],
+            "Act when there is a concrete, finishable improvement or a concrete defect. 'The "
+            "code could be nicer' is not a reason to act; a user unable to do something the "
+            "product promises is.",
         ),
     },
     {
@@ -511,18 +535,24 @@ async def sweep_orphaned_claims(owner_not: str) -> int:
 
 # ---- beats ----------------------------------------------------------------
 _BEAT_COLS = ("id, assistant_id, project_id, status, trigger_kind, thought, actions, log, "
-              "tokens, cost_usd, duration_ms, ts, finished_at")
+              "activity, tokens, cost_usd, duration_ms, ts, finished_at")
+
+# How many activity lines ONE beat may keep. An agent in a tool loop can emit hundreds; the
+# feed exists so a human can see what is happening, and the last N lines are what answers
+# that. Bounded here so no single row can grow without limit.
+MAX_ACTIVITY_LINES = 400
 
 
 def _beat_row(r) -> dict:
     d = dict(r)
-    acts = d.get("actions")
-    if isinstance(acts, str):
-        try:
-            acts = json.loads(acts)
-        except Exception:  # noqa: BLE001
-            acts = []
-    d["actions"] = acts or []
+    for key in ("actions", "activity"):
+        v = d.get(key)
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:  # noqa: BLE001
+                v = []
+        d[key] = v or []
     d["cost_usd"] = float(d.get("cost_usd") or 0)
     return d
 
@@ -553,6 +583,87 @@ async def finish_beat(beat_id: int, *, status: str, thought: str = "",
         (log or "")[:20000], int(tokens or 0), float(cost_usd or 0.0), int(duration_ms or 0))
     if res != "UPDATE 1":
         raise RuntimeError(f"finish_beat affected {res!r} for {beat_id}")
+
+
+_ACTIVITY_KINDS = ("phase", "tool", "text", "result")
+
+
+def sanitize_activity(items: Any) -> list[dict]:
+    """Keep only the shape the feed renders, clamped. The container is trusted to report
+    honestly but not to bound itself — an agent's own output is untrusted input like any
+    other."""
+    out: list[dict] = []
+    for it in (items or [])[:200]:
+        if not isinstance(it, dict):
+            continue
+        text = str(it.get("text") or "").strip()
+        if not text:
+            continue
+        entry = {
+            "kind": (str(it.get("kind") or "tool") if str(it.get("kind")) in _ACTIVITY_KINDS
+                     else "tool"),
+            "icon": str(it.get("icon") or "")[:4],
+            "text": text[:400],
+        }
+        if it.get("detail"):
+            entry["detail"] = str(it["detail"])[:600]
+        if it.get("ok") is not None:
+            entry["ok"] = bool(it["ok"])
+        if it.get("ts"):
+            entry["ts"] = str(it["ts"])[:32]
+        out.append(entry)
+    return out
+
+
+async def append_activity(beat_id: int, lines: list[dict]) -> int:
+    """Append activity lines to a beat and return how many it now holds.
+
+    One statement: append, then trim to the last MAX_ACTIVITY_LINES. Doing it in SQL keeps
+    it atomic against a container that is posting batches faster than we read them.
+    """
+    clean = sanitize_activity(lines)
+    if not clean:
+        return 0
+    n = await pool().fetchval(
+        "UPDATE builderapps.assistant_beats SET activity = ("
+        "  SELECT COALESCE(jsonb_agg(e), '[]'::jsonb) FROM ("
+        "    SELECT e FROM jsonb_array_elements(activity || $2::jsonb) WITH ORDINALITY t(e, i)"
+        "    ORDER BY i OFFSET GREATEST(0, jsonb_array_length(activity || $2::jsonb) - $3)"
+        "  ) s"
+        ") WHERE id=$1 RETURNING jsonb_array_length(activity)",
+        beat_id, json.dumps(clean), MAX_ACTIVITY_LINES)
+    if n is None:
+        raise RuntimeError(f"append_activity: no beat {beat_id}")
+    return int(n)
+
+
+async def recent_activity(project_id: str, limit: int = 6) -> list[dict]:
+    """The newest beats for this project that have something to show, oldest-first.
+
+    This is the /builder left pane's RESTORE path: on reload the pane is rebuilt from here
+    (Postgres), exactly like the pipeline's step history is — never from browser storage.
+    """
+    rows = await pool().fetch(
+        "SELECT b.id, b.assistant_id, b.project_id, b.status, b.trigger_kind, b.thought, "
+        "       b.activity, b.cost_usd, b.ts, b.finished_at, a.name, a.role "
+        "FROM builderapps.assistant_beats b "
+        "JOIN builderapps.assistants a ON a.id = b.assistant_id "
+        "WHERE b.project_id=$1 AND (jsonb_array_length(b.activity) > 0 "
+        "                           OR b.status='running' OR b.thought <> '') "
+        "ORDER BY b.ts DESC LIMIT $2", project_id, max(1, min(int(limit), 30)))
+    out = []
+    for r in reversed(rows):                       # oldest first: it reads as a timeline
+        d = _beat_row(r)
+        out.append({
+            "beat_id": int(d["id"]), "assistant_id": int(d["assistant_id"]),
+            "name": d.get("name") or "", "role": d.get("role") or "",
+            "status": d.get("status") or "", "trigger_kind": d.get("trigger_kind") or "",
+            "thought": (d.get("thought") or "")[:2000],
+            "activity": d.get("activity") or [],
+            "cost_usd": float(d.get("cost_usd") or 0),
+            "ts": d.get("ts"), "finished_at": d.get("finished_at"),
+        })
+    return out
 
 
 async def list_beats(assistant_id: int, limit: int = 40) -> list[dict]:

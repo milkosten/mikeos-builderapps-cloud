@@ -43,6 +43,12 @@ _STEP_TIMEOUTS: dict[str, float] = {
     "deploy": 1800,
     "runtime_qa": 2400,
     "plan_and_apply": 1800,
+    # ship-HEAD (phase 30, server/shipper.py). `ship_deploy` can legitimately run the whole
+    # build + health gate TWICE — once for the assistant's commit and once for the rollback —
+    # so its budget is deliberately about double a normal deploy's.
+    "ship_checkout": 600,
+    "ship_deploy": 3600,
+    "ship_record": 120,
 }
 
 
@@ -68,6 +74,9 @@ CRITICAL_STEPS = frozenset({
     "final_deploy", "finalize",
     # update pipeline
     "update_context", "plan_and_apply", "deploy", "commit_push",
+    # ship-HEAD: every step is load-bearing — you cannot skip the checkout, the health gate
+    # or the record and still have shipped anything.
+    "ship_checkout", "ship_deploy", "ship_record",
 })
 _FEATURE_RE = re.compile(r"^build_\d+")
 

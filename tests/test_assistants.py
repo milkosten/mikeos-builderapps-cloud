@@ -88,15 +88,33 @@ def main() -> int:
     check("capabilities as a json string still deny",
           not A.has({"capabilities": '["comment"]'}, "edit_code"))
 
-    # ---- 4. the write capabilities default OFF ---------------------------
+    # ---- 4. exactly ONE template may write (phase 30) ---------------------
+    # This inverted deliberately. In v1 no template pre-granted a write capability at all,
+    # because an agent editing code unattended needed the bounds first. Those bounds now
+    # exist — a protected-path list, a files/diff cap, a syntax gate, a health gate and an
+    # automatic rollback — so the Developer ships for real. The invariant that MUST hold is
+    # narrower but sharper: it is the ONLY one. A Security or Domain-Expert assistant that
+    # quietly gained `edit_code` because someone copied a capability list would be a genuine
+    # security regression, and this is what catches it.
+    WRITE_CAPS = ("edit_code", "commit_push", "request_deploy")
     for tpl in A.TEMPLATES:
-        for risky in ("edit_code", "commit_push", "request_deploy"):
-            check(f"template {tpl['key']} does not pre-grant {risky}",
-                  risky not in tpl["capabilities"],
-                  "v1 keeps unattended writes off until the quota+guard work lands")
-    check("the capability table marks the risky ones",
-          all(A.CAPABILITIES[c]["safe_default"] is False
-              for c in ("edit_code", "commit_push", "request_deploy")))
+        writers = [c for c in WRITE_CAPS if c in tpl["capabilities"]]
+        if tpl["key"] == "developer":
+            check("the Developer template grants all three write capabilities",
+                  sorted(writers) == sorted(WRITE_CAPS),
+                  "a Developer that can only describe a fix is a code reviewer with "
+                  "extra steps")
+        else:
+            check(f"template {tpl['key']} grants no write capability", not writers,
+                  "only the Developer ships code; everything else observes")
+    check("exactly one template can write",
+          sum(1 for t in A.TEMPLATES if any(c in t["capabilities"] for c in WRITE_CAPS)) == 1)
+    check("the capability table still marks the write ones",
+          all(A.CAPABILITIES[c]["safe_default"] is False for c in WRITE_CAPS))
+    # A template is a pre-fill, never a grant in itself: the row's capabilities are what
+    # `require()` reads, so a Developer created with an explicit empty set cannot write.
+    check("a Developer row with no capabilities still cannot edit",
+          denied({"id": 9, "role": "Developer", "capabilities": []}, "edit_code"))
 
     # ---- 5. interval clamping (a runaway heartbeat is a cost bug) --------
     check("interval floor", A.clamp_interval(0) == A.MIN_INTERVAL_MIN)

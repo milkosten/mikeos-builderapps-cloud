@@ -262,6 +262,18 @@ async def _resume(run: dict, *, at_boot: bool = False) -> None:
         # reads as ALIVE and no other process will try to take it over.
         async with _RESUME_SLOTS:
             logger.info("run %s (%s): resuming kind=%s %s", run_id, project_id, kind, age_note)
+            if kind == "deploy":
+                # An assistant's ship-HEAD run (server/shipper.py). It MUST be resumed as a
+                # ship: falling through to run_create would re-run the whole build pipeline
+                # over a live app because of one interrupted deploy.
+                from server import shipper
+                return await shipper.run_ship(
+                    project_id, run_id, user_id, None, request_text or "resume", emit,
+                    assistant_id=(int(run["assistant_id"])
+                                  if run.get("assistant_id") is not None else None),
+                    beat_id=(int(run["beat_id"])
+                             if run.get("beat_id") is not None else None),
+                    resume=True)
             if kind == "update":
                 if not request_text:
                     raise RuntimeError("update run has no stored request text — cannot resume")

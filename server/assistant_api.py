@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 from server import assistants as A
 from server import assistant_runtime as R
-from server import introspect, store
+from server import introspect, llm_proxy, store
 from server.identity import authenticate
 
 logger = logging.getLogger(__name__)
@@ -61,10 +61,25 @@ class PatchAssistantBody(BaseModel):
 
 class ReasonBody(BaseModel):
     workspace: str = Field("", max_length=40000)
+    docs: str = Field("", max_length=60000,
+                      description="The project's own strategy docs, loaded deterministically "
+                                  "by the beat program. They are the grounding the SOUL "
+                                  "sits on top of.")
 
 
 class ActBody(BaseModel):
     action: dict = Field(default_factory=dict)
+
+
+class ActivityBody(BaseModel):
+    """What the assistant is doing, streamed out of the beat container as it happens.
+
+    Every line corresponds to something that ACTUALLY occurred — a tool the coding agent
+    invoked, a file it wrote, a commit, a health gate verdict. Nothing here is a plausible-
+    looking progress message invented to fill the gap; a feed that narrates work it did not
+    observe is worse than a quiet one.
+    """
+    lines: list[dict] = Field(default_factory=list, max_length=200)
 
 
 class BeatBody(BaseModel):
@@ -271,6 +286,22 @@ async def assistant_beats(project_id: str, assistant_id: int, request: Request,
     return {"beats": await A.list_beats(assistant_id, limit)}
 
 
+@router.get("/api/projects/{project_id}/assistant-activity",
+            summary="Live + restorable feed of what this project's assistants are doing")
+async def project_assistant_activity(project_id: str, request: Request,
+                                     limit: int = 6) -> dict:
+    """The /builder left pane's assistant feed — BOTH the live view and the reload restore.
+
+    One mechanism, deliberately: the pane polls this while a beat is running and reads it
+    once on load, so what you see mid-beat and what you see after a hard refresh are the
+    same rows from the same table. A separate live channel would be a second source of
+    truth, and the one that drifts is always the one nobody reloads to check.
+    """
+    await _owned(project_id, request)
+    feed = await A.recent_activity(project_id, limit)
+    return {"beats": feed, "beating": any(b.get("status") == "running" for b in feed)}
+
+
 @router.get("/api/projects/{project_id}/assistants/{assistant_id}/soul",
             summary="The raw SOUL.md")
 async def assistant_soul(project_id: str, assistant_id: int, request: Request) -> dict:
@@ -304,16 +335,55 @@ async def assistant_reason(body: ReasonBody, x_assistant_token: str = Header("")
     accounting."""
     a = await _from_token(x_assistant_token)
     ctx = await R.perceive(a)
-    return await R.reason(a, ctx, body.workspace or "")
+    return await R.reason(a, ctx, body.workspace or "", body.docs or "")
 
 
 @router.post("/api/assistant/act", summary="[beat container] perform one capability-gated act")
-async def assistant_act(body: ActBody, x_assistant_token: str = Header("")) -> dict:
+async def assistant_act(body: ActBody, request: Request,
+                        x_assistant_token: str = Header("")) -> dict:
     """THE enforcement point. `apply_action` calls `assistants.require()` for every act, so a
     capability the assistant was not granted is refused here regardless of what the container
     (or its SOUL) believes."""
     a = await _from_token(x_assistant_token)
-    return await R.apply_action(a, body.action or {})
+    raw = (request.headers.get("x-beat-id") or "").strip()
+    beat_id = int(raw) if raw.isdigit() and await A.beat_belongs_to(int(raw), int(a["id"])) \
+        else None
+    return await R.apply_action(a, body.action or {}, beat_id=beat_id)
+
+
+@router.post("/api/assistant/activity",
+             summary="[beat container] stream what the assistant is doing, live")
+async def assistant_activity(body: ActivityBody, request: Request,
+                             x_assistant_token: str = Header("")) -> dict:
+    """Append activity lines to the beat that is running right now.
+
+    Called every couple of seconds by the beat container while its coding agent works, so
+    the /builder left pane fills in as the work happens instead of staying blank for two
+    minutes and then dumping a result. A beat that is already closed is not written to — a
+    late batch is dropped, not resurrected.
+    """
+    a = await _from_token(x_assistant_token)
+    raw = (request.headers.get("x-beat-id") or "").strip()
+    if not raw.isdigit() or not await A.beat_belongs_to(int(raw), int(a["id"])):
+        raise HTTPException(status_code=403, detail="that beat is not yours")
+    try:
+        total = await A.append_activity(int(raw), body.lines or [])
+    except RuntimeError:
+        raise HTTPException(status_code=404, detail="no such beat")
+    return {"ok": True, "lines": total}
+
+
+@router.get("/api/assistant/deploy/{run_id}",
+            summary="[beat container] how did the ship-HEAD run it started end?")
+async def assistant_deploy_status(run_id: int, x_assistant_token: str = Header("")) -> dict:
+    """The beat polls this so its record carries the REAL outcome of the deploy it caused.
+
+    Without it a beat would report "done" the instant it asked for a deploy, and a health
+    gate that went red ten minutes later would be invisible in the timeline — the "never
+    trust a 200" mistake, wearing a different hat.
+    """
+    a = await _from_token(x_assistant_token)
+    return await R.deploy_status(a, run_id)
 
 
 @router.post("/api/assistant/beat", summary="[beat container] record the finished beat")
@@ -335,7 +405,13 @@ async def assistant_record_beat(body: BeatBody, request: Request,
             raise HTTPException(status_code=409, detail="no running beat to record")
         beat_id = int(running[0]["id"])
     status = body.status if body.status in ("done", "skipped", "failed") else "done"
+    # The container can only report what IT knows it spent. Everything Pi spent went through
+    # the control plane's LLM proxy, which is the only place that saw the real numbers — add
+    # it here so the beat's cost is the beat's whole cost, not just the part the container
+    # happened to be told about.
+    pi_cost = llm_proxy.forget_beat(beat_id)
     await A.finish_beat(beat_id, status=status, thought=body.thought,
                         actions=body.actions, log=body.log, tokens=body.tokens,
-                        cost_usd=body.cost_usd, duration_ms=body.duration_ms)
-    return {"ok": True, "beat_id": beat_id}
+                        cost_usd=float(body.cost_usd or 0.0) + pi_cost,
+                        duration_ms=body.duration_ms)
+    return {"ok": True, "beat_id": beat_id, "coding_agent_cost_usd": pi_cost}

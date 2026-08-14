@@ -232,10 +232,25 @@ async def _subnet_for(shortid: str) -> Optional[str]:
         return None
 
 
+async def _head_sha(workspace: Path) -> str:
+    """The commit this deploy is building. Best-effort — a workspace with no .git still
+    deploys, it just cannot be rolled back TO later (and `last_good_sha` will skip it)."""
+    if not (workspace / ".git").is_dir():
+        return ""
+    rc, out = await _run(["git", "-C", str(workspace), "rev-parse", "HEAD"], timeout=30)
+    return out.strip() if rc == 0 else ""
+
+
 async def deploy(shortid: str, workspace: Path, *, db_password: str, app_secret: str,
-                 title: str) -> dict:
+                 title: str, assistant_id: Optional[int] = None,
+                 beat_id: Optional[int] = None) -> dict:
     """Normalize + build + up + health-gate + public-route verify. Records a deployments row.
-    Returns {ok, deployment_id, public_health}."""
+    Returns {ok, deployment_id, git_sha, public_health}.
+
+    The recorded `git_sha` is read from the workspace itself, never passed in by a caller:
+    "what is actually checked out" is the only honest answer to "what did we just build",
+    and it is what a later rollback will treat as the last good commit.
+    """
     raw = (workspace / "docker-compose.yml").read_text("utf-8")
     subnet = await _subnet_for(shortid)
     normalized = normalize_compose(raw, shortid, subnet)
@@ -249,8 +264,10 @@ async def deploy(shortid: str, workspace: Path, *, db_password: str, app_secret:
         "\n".join(f"{k}={v}" for k, v in env.items()) + "\n", "utf-8")
 
     await _ensure_vol_dirs(shortid)
+    git_sha = await _head_sha(workspace)
     dep_id = await store.create_deployment(shortid, image_tag=f"{shortid}-app",
-                                           compose_hash=compose_hash)
+                                           compose_hash=compose_hash, git_sha=git_sha,
+                                           assistant_id=assistant_id, beat_id=beat_id)
 
     compose_base = ["docker", "compose", "-p", shortid, "-f", str(norm_path)]
     try:
@@ -286,7 +303,8 @@ async def deploy(shortid: str, workspace: Path, *, db_password: str, app_secret:
             raise RuntimeError("public https health did not return a healthy body")
 
         await store.finish_deployment(dep_id, "healthy", json.dumps(public_health))
-        return {"ok": True, "deployment_id": dep_id, "public_health": public_health}
+        return {"ok": True, "deployment_id": dep_id, "git_sha": git_sha,
+                "public_health": public_health}
     except Exception:
         raise
 

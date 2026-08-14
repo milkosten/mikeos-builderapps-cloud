@@ -96,6 +96,85 @@ async def commit_push(project_id: str, message: str,
     return True
 
 
+async def head_sha(project_id: str) -> str:
+    """The commit currently checked out, or "" if there is no checkout."""
+    dst = path_for(project_id)
+    if not (dst / ".git").is_dir():
+        return ""
+    rc, out = await _run(["git", "rev-parse", "HEAD"], cwd=dst, timeout=30)
+    return out.strip() if rc == 0 else ""
+
+
+async def commits_between(project_id: str, base_sha: str) -> list[str]:
+    """`<base>..HEAD` as "<short> <subject>" lines — i.e. exactly what a rollback would undo."""
+    dst = path_for(project_id)
+    if not (dst / ".git").is_dir() or not base_sha:
+        return []
+    rc, out = await _run(["git", "log", "--pretty=format:%h %s", f"{base_sha}..HEAD"],
+                         cwd=dst, timeout=30)
+    if rc != 0:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()][:20]
+
+
+async def roll_back_to(project_id: str, good_sha: str, message: str,
+                       gitea_user: str, repo: str, token: str) -> Optional[str]:
+    """Put the repo's CONTENT back to `good_sha` with a new FORWARD commit, and push it.
+
+    Three deliberate properties, because this runs unattended after an agent broke the app:
+
+    * **Never a force-push, never a history rewrite.** The bad commit stays in the log where
+      a human can read it; the fix is an ordinary commit on top that restores the last good
+      tree. Rewriting an agent's mistake out of history would also destroy the evidence of
+      what it did — the opposite of what an audit trail is for.
+    * **It cannot conflict.** `git read-tree -u --reset <sha>` makes the index and working
+      tree *equal* to that commit's tree outright; there is no merge and therefore no
+      conflict to resolve, which matters when nobody is watching. (`git revert
+      <good>..HEAD` can and does conflict, and a half-reverted tree would be worse than the
+      broken one.)
+    * **Ignored files survive.** `.env` and `docker-compose.normalized.yml` are not in the
+      index, so the deployer's own generated state is untouched.
+
+    Returns the new commit's sha, or None when there was nothing to roll back (HEAD already
+    IS the good commit) or the rollback could not be completed.
+    """
+    dst = path_for(project_id)
+    if not (dst / ".git").is_dir() or not good_sha:
+        return None
+    rc, cur = await _run(["git", "rev-parse", "HEAD"], cwd=dst, timeout=30)
+    if rc == 0 and cur.strip().startswith(good_sha[:7]):
+        return None                                   # already there — nothing to undo
+    rc, out = await _run(["git", "cat-file", "-e", f"{good_sha}^{{commit}}"], cwd=dst,
+                         timeout=30)
+    if rc != 0:
+        # A shallow clone may simply not have the good commit. Deepen once, then give up
+        # loudly rather than "rolling back" to something we cannot see.
+        await _run(["git", "fetch", "--unshallow"], cwd=dst, timeout=180)
+        rc, _ = await _run(["git", "cat-file", "-e", f"{good_sha}^{{commit}}"], cwd=dst,
+                           timeout=30)
+        if rc != 0:
+            logger.error("rollback target %s is not in %s's checkout", good_sha, project_id)
+            return None
+    rc, out = await _run(["git", "read-tree", "-u", "--reset", good_sha], cwd=dst, timeout=60)
+    if rc != 0:
+        logger.error("rollback read-tree failed for %s: %s", project_id, out[-300:])
+        return None
+    rc, out = await _run(["git", "commit", "-m", message[:400]], cwd=dst, timeout=60)
+    if rc != 0:
+        if "nothing to commit" in out.lower():
+            return None
+        logger.error("rollback commit failed for %s: %s", project_id, out[-300:])
+        return None
+    url = gitea.clone_url_for(gitea_user, repo, token)
+    await _run(["git", "remote", "set-url", "origin", url], cwd=dst)
+    rc, out = await _run(["git", "push", "origin", "HEAD:main"], cwd=dst, timeout=120)
+    if rc != 0:
+        # The app is restored locally and will be redeployed either way; a push failure is
+        # recorded, not raised, so we never leave the box running code we could not restore.
+        logger.error("rollback push failed for %s: %s", project_id, out[-300:])
+    return (await _run(["git", "rev-parse", "HEAD"], cwd=dst, timeout=30))[1].strip()
+
+
 async def revert_uncommitted(project_id: str) -> bool:
     """Throw away everything since the last commit (phase 28).
 
