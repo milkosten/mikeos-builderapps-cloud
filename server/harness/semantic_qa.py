@@ -217,6 +217,37 @@ def _resolve_page(page: str, create_response: str) -> str:
     return _PLACEHOLDER_RE.sub(m.group(2), page)
 
 
+def _parent_collection(path: str) -> str:
+    """`/api/jobs/:id/apply` -> `/api/jobs` — where to look up a real parent id."""
+    out: List[str] = []
+    for seg in path.strip("/").split("/"):
+        if _PLACEHOLDER_RE.fullmatch(seg):
+            break
+        out.append(seg)
+    return "/" + "/".join(out)
+
+
+async def _resolve_parent_path(br: Any, path: str, list_path: Optional[str]) -> Optional[str]:
+    """Fill a nested create path's `:id` with the id of a record that really exists.
+
+    `POST /api/jobs/:id/apply` needs an EXISTING job. Posting the literal path made the
+    campaign's job board answer 400 "invalid job id", and QA declared the candidate apply flow
+    broken — applying by hand works fine. We ask the app for the parent collection and take the
+    first id it returns. `None` means we could not find one: the probe is inconclusive, and an
+    inconclusive probe is never reported as a pass OR as a bug.
+    """
+    for candidate in (list_path, _parent_collection(path)):
+        if not candidate:
+            continue
+        status, text = await br.request("GET", candidate)
+        if not (200 <= status < 300):
+            continue
+        m = _ID_RE.search(text or "")
+        if m:
+            return _PLACEHOLDER_RE.sub(m.group(2), path, count=1)
+    return None
+
+
 def _same_route(template: str, concrete: str) -> bool:
     """`/api/notes/:id` matches `/api/notes/123` (segment count + literal segments)."""
     a, b = template.strip("/").split("/"), concrete.strip("/").split("/")
@@ -330,20 +361,30 @@ async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
             marker = _marker()
             body = _uniquify(_inject(flow["body"], marker), marker)
             result["checked"] += 1
-            status, text = await br.request(flow["method"], flow["path"], body)
+            create_path = flow["path"]
+            if _PLACEHOLDER_RE.search(create_path):
+                # A nested write like `POST /api/jobs/:id/apply` needs the id of an EXISTING
+                # parent. Posting the literal path made the job board answer 400 "invalid job
+                # id" and QA declared the candidate apply flow broken — applying by hand works.
+                create_path = await _resolve_parent_path(br, create_path, flow.get("list"))
+                if create_path is None:
+                    result["detail"].append({"flow": flow["name"], "marker": marker,
+                                             "verdict": "inconclusive_no_parent"})
+                    continue      # inconclusive is never reported as either a pass or a bug
+            status, text = await br.request(flow["method"], create_path, body)
             if _is_duplicate(status, text):
                 # The planner's literal values (`qa@example.com`, a fixed short code) collide
                 # with a row a previous flow/round already inserted. That is OUR collision, not
                 # the app's bug — make every short string unique and try once more.
                 body = _uniquify(body, marker, aggressive=True)
-                status, text = await br.request(flow["method"], flow["path"], body)
+                status, text = await br.request(flow["method"], create_path, body)
             step = {"flow": flow["name"], "marker": marker, "create_status": status}
 
             # 1. the WRITE path — never trust 200 alone: the record must come back with an id
             if not (200 <= status < 300):
                 result["findings"].append(
                     f"FLOW '{flow['name']}': creating a record failed — "
-                    f"{flow['method']} {flow['path']} returned HTTP {status}. "
+                    f"{flow['method']} {create_path} returned HTTP {status}. "
                     f"Request body was {json.dumps(body)[:300]}. Response: {text[:300]}")
                 result["detail"].append({**step, "verdict": "write_failed"})
                 continue
@@ -357,7 +398,7 @@ async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
                     api_has = marker in ltext
                     if not api_has:
                         result["findings"].append(
-                            f"FLOW '{flow['name']}': {flow['method']} {flow['path']} accepted "
+                            f"FLOW '{flow['name']}': {flow['method']} {create_path} accepted "
                             f"the record (HTTP {status}) but GET {list_path} does NOT return "
                             f"it (marker {marker} absent from the response). The write is "
                             f"being dropped, filtered out, or read back from the wrong table "
@@ -400,7 +441,7 @@ async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
                         else "(no list endpoint to cross-check)")
             result["findings"].append(
                 f"FLOW '{flow['name']}': a record was created via {flow['method']} "
-                f"{flow['path']} (HTTP {status}) {api_note}, but it does NOT appear anywhere "
+                f"{create_path} (HTTP {status}) {api_note}, but it does NOT appear anywhere "
                 f"in the rendered page {page} — the marker {marker} is "
                 f"absent from the page text. The FRONTEND is not rendering data the API "
                 f"returns: read what that endpoint actually returns and unwrap that exact key "

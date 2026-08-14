@@ -58,6 +58,54 @@ def _endpoint() -> tuple[str, Dict[str, str]]:
     return f"{scheme}://{rest.rstrip('/')}", headers
 
 
+# ---- token / cost accounting -------------------------------------------------------
+# Every LLM call reports what it consumed. The harness installs a sink (see
+# server.usage) that stamps the current project/run/step onto each record, so the
+# builder's Usage tab can show input / output / cached tokens and cost per project.
+#
+# OpenRouter returns REAL cost when we send {"usage":{"include":true}} — we use that
+# whenever it is present and only fall back to the rate table below when it is not.
+# Rates are USD per 1M tokens and are overridable without a redeploy.
+KIMI_IN_PER_M = float(os.environ.get("LLM_PRICE_IN_PER_M", "0.60"))
+KIMI_OUT_PER_M = float(os.environ.get("LLM_PRICE_OUT_PER_M", "2.50"))
+KIMI_CACHED_IN_PER_M = float(os.environ.get("LLM_PRICE_CACHED_IN_PER_M", "0.15"))
+
+_usage_sink: Optional[Any] = None
+
+
+def set_usage_sink(fn) -> None:
+    """Install a callable(record: dict) invoked after every LLM call. Best-effort."""
+    global _usage_sink
+    _usage_sink = fn
+
+
+def _report_usage(usage: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Normalise a provider usage block, cost it, and hand it to the sink."""
+    try:
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        details = usage.get("prompt_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or usage.get("cached_tokens") or 0)
+        fresh_in = max(0, prompt - cached)
+        cost = usage.get("cost")
+        estimated = cost is None
+        if estimated:  # provider didn't tell us — price it from the rate table
+            cost = (fresh_in * KIMI_IN_PER_M + cached * KIMI_CACHED_IN_PER_M
+                    + completion * KIMI_OUT_PER_M) / 1_000_000.0
+        rec = {"model": model, "prompt_tokens": prompt, "completion_tokens": completion,
+               "cached_tokens": cached, "cost_usd": round(float(cost), 6),
+               "cost_estimated": estimated}
+        if _usage_sink:
+            try:
+                _usage_sink(rec)
+            except Exception:  # accounting must NEVER break a build
+                logger.debug("usage sink failed", exc_info=True)
+        return {**usage, "_accounted": rec}
+    except Exception:
+        logger.debug("usage parse failed", exc_info=True)
+        return usage
+
+
 async def _openrouter_chat(messages: List[Dict[str, Any]], schema: Optional[Dict[str, Any]],
                            temperature: float, num_predict: int, timeout: float,
                            max_retries: int) -> str:
@@ -75,6 +123,9 @@ async def _openrouter_chat(messages: List[Dict[str, Any]], schema: Optional[Dict
         # fastest provider.
         "reasoning": {"enabled": False},
         "provider": {"sort": "throughput"},
+        # Ask OpenRouter to return real accounting (cost + cached/prompt/completion tokens)
+        # so the Usage tab reports what we ACTUALLY paid rather than an estimate.
+        "usage": {"include": True},
     }
     if schema is not None:
         body["response_format"] = {"type": "json_object"}  # ask for valid JSON
@@ -98,6 +149,7 @@ async def _openrouter_chat(messages: List[Dict[str, Any]], schema: Optional[Dict
             data = resp.json()
             if data.get("error"):
                 raise RuntimeError(str(data["error"]))
+            _report_usage(data.get("usage") or {}, data.get("model") or LLM_MODEL)
             msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
             content = msg.get("content") or ""
             if not content.strip():
@@ -295,7 +347,8 @@ async def _openrouter_tools(messages: List[Dict[str, Any]], tools: List[Dict[str
                 continue
             return {"content": content, "tool_calls": calls,
                     "finish_reason": choice.get("finish_reason") or "", "raw": msg,
-                    "usage": data.get("usage") or {}}
+                    "usage": _report_usage(data.get("usage") or {},
+                                           data.get("model") or LLM_MODEL)}
         except httpx.HTTPStatusError as e:
             last_err = e
             logger.warning("OpenRouter(tools) HTTP %s (attempt %d)",

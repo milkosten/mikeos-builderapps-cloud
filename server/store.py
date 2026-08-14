@@ -545,3 +545,52 @@ async def steps_for_latest_run(project_id: str) -> dict:
             "total_steps": run["total_steps"],
             "heartbeat_at": run["heartbeat_at"], "finished_at": run["finished_at"],
             "steps": [dict(r) for r in rows]}
+
+
+# ---- token / cost accounting (the Usage tab) -------------------------------
+async def record_usage(*, project_id: str, run_id, step, model: str,
+                       prompt_tokens: int, completion_tokens: int, cached_tokens: int,
+                       cost_usd: float, cost_estimated: bool) -> None:
+    """One row per LLM call. Best-effort: accounting must never break a build."""
+    await pool().execute(
+        "INSERT INTO builderapps.llm_usage "
+        "(project_id,run_id,step,model,prompt_tokens,completion_tokens,cached_tokens,"
+        " cost_usd,cost_estimated) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        project_id, run_id, step, model, prompt_tokens, completion_tokens,
+        cached_tokens, cost_usd, cost_estimated,
+    )
+
+
+async def usage_for_project(project_id: str) -> dict:
+    """Totals + a per-step breakdown for one project."""
+    tot = await pool().fetchrow(
+        "SELECT coalesce(sum(prompt_tokens),0)::bigint      AS prompt_tokens,"
+        "       coalesce(sum(completion_tokens),0)::bigint  AS completion_tokens,"
+        "       coalesce(sum(cached_tokens),0)::bigint      AS cached_tokens,"
+        "       coalesce(sum(cost_usd),0)::float8           AS cost_usd,"
+        "       count(*)::bigint                            AS calls,"
+        "       bool_or(cost_estimated)                     AS any_estimated,"
+        "       max(model)                                  AS model "
+        "FROM builderapps.llm_usage WHERE project_id=$1", project_id)
+    rows = await pool().fetch(
+        "SELECT coalesce(step,'(other)') AS step, count(*)::bigint AS calls,"
+        "       sum(prompt_tokens)::bigint AS prompt_tokens,"
+        "       sum(completion_tokens)::bigint AS completion_tokens,"
+        "       sum(cached_tokens)::bigint AS cached_tokens,"
+        "       sum(cost_usd)::float8 AS cost_usd "
+        "FROM builderapps.llm_usage WHERE project_id=$1 "
+        "GROUP BY 1 ORDER BY sum(cost_usd) DESC LIMIT 100", project_id)
+    t = dict(tot) if tot else {}
+    return {
+        "totals": {
+            "prompt_tokens": int(t.get("prompt_tokens") or 0),
+            "completion_tokens": int(t.get("completion_tokens") or 0),
+            "cached_tokens": int(t.get("cached_tokens") or 0),
+            "total_tokens": int((t.get("prompt_tokens") or 0) + (t.get("completion_tokens") or 0)),
+            "cost_usd": round(float(t.get("cost_usd") or 0.0), 6),
+            "calls": int(t.get("calls") or 0),
+            "cost_estimated": bool(t.get("any_estimated")),
+            "model": t.get("model") or "",
+        },
+        "by_step": [dict(r) for r in rows],
+    }

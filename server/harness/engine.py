@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-from server import store
+from server import store, usage
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +221,10 @@ async def run_partial(project_id: str, run_id: int, steps: list[Step],
             emit({"type": "step_skipped", "idx": idx, "name": name,
                   "reason": (prev.get("log") or "")[:400]})
             continue
+
+        # stamp the accounting context so every LLM call this step makes is attributed
+
+        usage.set_context(project_id, run_id, name)
 
         await store.upsert_step(run_id, idx, name, "running")
         _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "running",

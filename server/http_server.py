@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from server import db, deployer, gitea, introspect, runner, store, workspace
+from server import db, deployer, gitea, introspect, runner, store, workspace, usage
 from server.harness import pipeline
 from server.identity import authenticate, current_user
 
@@ -45,6 +45,7 @@ def _spawn(coro) -> asyncio.Task:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_pool()
+    usage.install()          # token/cost accounting sink (best-effort, never blocks a build)
     logger.info("builderapps-cloud up (%s); public=%s sites=%s",
                 runner.INSTANCE_ID, PUBLIC_BASE, SITES_BASE)
     # RECOVERY: a control-plane redeploy kills every in-flight pipeline. Take over anything
@@ -352,6 +353,13 @@ def _bad_path(e: Exception) -> HTTPException:
 
 
 # ---- 1/2 docs -------------------------------------------------------------
+@app.get("/api/projects/{project_id}/usage")
+async def project_usage(project_id: str, request: Request):
+    """Token + cost accounting for the builder's Usage tab."""
+    await _owned(project_id, request)
+    return await store.usage_for_project(project_id)
+
+
 @app.get("/api/projects/{project_id}/docs")
 async def project_docs(project_id: str, request: Request):
     await _owned(project_id, request)

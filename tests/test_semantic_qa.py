@@ -235,6 +235,31 @@ async def main() -> int:
     check("dates and numbers are NOT corrupted by the retry",
           ag["date"] == "2026-08-14" and ag["amount"] == "12.50" and ag["n"] == 3, ag)
 
+    # --- 8c. a nested create path needs a REAL parent id ---------------------
+    # `POST /api/jobs/:id/apply` posted literally made the job board answer 400 "invalid job
+    # id"; QA called the candidate apply flow broken while applying by hand worked.
+    print("\n[nested create path]")
+    check("the parent collection is derived from the path",
+          semantic_qa._parent_collection("/api/jobs/:id/apply") == "/api/jobs")
+    check("a flat path has no placeholder to cut",
+          semantic_qa._parent_collection("/api/jobs") == "/api/jobs")
+
+    class ParentBrowser:
+        def __init__(self, body):
+            self.body = body
+            self.seen = []
+
+        async def request(self, method, path, body=None):
+            self.seen.append((method, path))
+            return (200, self.body) if self.body else (404, "nope")
+
+    br = ParentBrowser('{"jobs":[{"id":"42","title":"x"}]}')
+    got = await semantic_qa._resolve_parent_path(br, "/api/jobs/:id/apply", "/api/jobs")
+    check("the parent's id is substituted into the create path", got == "/api/jobs/42/apply", got)
+    br2 = ParentBrowser("")
+    got2 = await semantic_qa._resolve_parent_path(br2, "/api/jobs/:id/apply", "/api/jobs")
+    check("no parent found -> None (inconclusive, never a false accusation)", got2 is None, got2)
+
     # --- 8. a detail page gets the created record's id substituted in --------
     # The campaign's first build was reported broken by QA purely because the flow's page was
     # the literal "/links/:id": the app answered "Link not found" for a route that works.
