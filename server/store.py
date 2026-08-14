@@ -165,6 +165,13 @@ async def create_run(project_id: str, kind: str, request: str, total_steps: int)
     return int(run_id)
 
 
+async def set_run_total(run_id: int, total_steps: int) -> None:
+    await pool().execute(
+        "UPDATE builderapps.pipeline_runs SET total_steps=$2 WHERE id=$1",
+        run_id, total_steps,
+    )
+
+
 async def finish_run(run_id: int, status: str) -> None:
     await pool().execute(
         "UPDATE builderapps.pipeline_runs SET status=$2, finished_at=now() WHERE id=$1",
@@ -202,6 +209,27 @@ async def get_run_with_steps(run_id: int) -> Optional[dict]:
     d = dict(run)
     d["steps"] = [dict(s) for s in steps]
     return d
+
+
+# ---- messages (conversation / QA thread) ----------------------------------
+async def append_message(project_id: str, role: str, text: str,
+                         meta: Optional[dict] = None) -> None:
+    """Append one entry to the project's messages thread (jsonb array). Idempotent-safe:
+    upserts the row and appends. Timestamps are ISO-8601."""
+    import time as _t
+    entry = {"role": role, "text": (text or "")[:4000],
+             "ts": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime())}
+    if meta:
+        entry["meta"] = meta
+    res = await pool().execute(
+        "INSERT INTO builderapps.messages(project_id, thread, updated_at) "
+        "VALUES ($1, jsonb_build_array($2::jsonb), now()) "
+        "ON CONFLICT (project_id) DO UPDATE SET "
+        "thread = builderapps.messages.thread || $2::jsonb, updated_at = now()",
+        project_id, json.dumps(entry),
+    )
+    if not res.endswith(("INSERT 0 1", "UPDATE 1")):
+        raise RuntimeError(f"append_message did not affect a row: {res!r}")
 
 
 async def latest_run_for(project_id: str) -> Optional[dict]:

@@ -13,7 +13,7 @@ import base64
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import httpx
 
@@ -164,6 +164,147 @@ def inject_collector(html: str) -> str:
         cut = m.end()
         return html[:cut] + ERR_COLLECTOR + html[cut:]
     return ERR_COLLECTOR + html
+
+
+# A collector installed via /eval RIGHT AFTER navigate (window state does NOT survive a
+# navigate on chrome-pool, so we can't pre-inject). It wraps fetch + XMLHttpRequest to record
+# 4xx/5xx + network failures, and adds error/unhandledrejection listeners. It therefore catches
+# everything that happens from interactions AFTER load (form submits, button clicks, XHR) — the
+# faults that matter most. Pure load-time throws are additionally covered by tailing app logs.
+_INSTALL_COLLECTORS_JS = (
+    "(function(){"
+    "if(window.__qa)return 'already';window.__qa=1;window.__errs=[];window.__net=[];"
+    "addEventListener('error',function(e){try{window.__errs.push((e.message||'error')+' @'+"
+    "String(e.filename||'').split('/').pop()+':'+(e.lineno||0));}catch(_){}});"
+    "addEventListener('unhandledrejection',function(e){try{window.__errs.push("
+    "'unhandledrejection: '+((e.reason&&e.reason.message)||e.reason));}catch(_){}});"
+    "var _ce=console.error;console.error=function(){try{window.__errs.push("
+    "'console.error: '+Array.prototype.join.call(arguments,' '));}catch(_){}"
+    "_ce.apply(console,arguments);};"
+    "var _f=window.fetch;if(_f){window.fetch=function(){var args=arguments;var u=args[0]&&args[0].url||args[0];"
+    "return _f.apply(this,args).then(function(r){if(!r.ok){window.__net.push(r.status+' '+String(u));}return r;},"
+    "function(err){window.__net.push('FETCH_FAIL '+String(u)+' '+(err&&err.message||err));throw err;});};}"
+    "var _open=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){this.__u=u;"
+    "return _open.apply(this,arguments);};"
+    "var _send=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(){var x=this;"
+    "x.addEventListener('load',function(){if(x.status>=400){window.__net.push(x.status+' '+String(x.__u));}});"
+    "x.addEventListener('error',function(){window.__net.push('XHR_FAIL '+String(x.__u));});"
+    "return _send.apply(this,arguments);};"
+    "return 'installed';})()"
+)
+
+
+async def qa_run(url: str, exercise: bool = True,
+                 timeout: Optional[float] = None) -> dict:
+    """Full runtime-QA pass against a LIVE url in one chrome-pool session.
+
+    Navigates, installs error+network collectors, exercises the UI, then reads back JS console
+    errors + failed network requests + a screenshot data: URI. Best-effort: returns a dict with
+    empty lists on any chrome-pool failure so QA can never break generation.
+
+    Returns {errors:[...], network:[...], screenshot: data-uri|None, ok: bool}.
+    """
+    to = float(timeout if timeout is not None else max(_TIMEOUT, 60.0))
+    sid = None
+    result = {"errors": [], "network": [], "screenshot": None, "ok": False}
+    try:
+        async with httpx.AsyncClient(timeout=to, verify=False, auth=_auth()) as client:
+            r = await client.post(f"{CHROME_POOL_URL}/session")
+            r.raise_for_status()
+            j = r.json() or {}
+            sid = j.get("sessionId") or j.get("id")
+            if not sid:
+                return result
+            await client.post(f"{CHROME_POOL_URL}/session/{sid}/navigate",
+                              json={"url": url, "acceptCookies": True})
+            await asyncio.sleep(1.0)
+            await client.post(f"{CHROME_POOL_URL}/session/{sid}/eval",
+                              json={"expression": _INSTALL_COLLECTORS_JS})
+            if exercise:
+                try:
+                    await client.post(f"{CHROME_POOL_URL}/session/{sid}/eval",
+                                      json={"expression": _EXERCISE_JS})
+                    await asyncio.sleep(1.5)  # let click/submit handlers + their XHRs run
+                except Exception as e:  # noqa: BLE001
+                    logger.info("qa exercise failed for %s: %s", url, e)
+            # read collectors
+            re_ = await client.post(f"{CHROME_POOL_URL}/session/{sid}/eval",
+                                    json={"expression": "JSON.stringify(window.__errs||[])"})
+            rn_ = await client.post(f"{CHROME_POOL_URL}/session/{sid}/eval",
+                                    json={"expression": "JSON.stringify(window.__net||[])"})
+            result["errors"] = _parse_json_list((re_.json() or {}).get("value"))
+            result["network"] = _parse_json_list((rn_.json() or {}).get("value"))
+            try:
+                shot = await client.get(f"{CHROME_POOL_URL}/session/{sid}/screenshot")
+                b64 = (shot.json() or {}).get("imageB64")
+                if b64:
+                    raw = base64.b64decode(b64)
+                    result["screenshot"] = _downscale_jpeg(raw, 640)
+            except Exception:
+                pass
+            result["ok"] = True
+            return result
+    except Exception as e:  # noqa: BLE001
+        logger.info("qa_run failed for %s: %s", url, e)
+        return result
+    finally:
+        if sid:
+            try:
+                async with httpx.AsyncClient(timeout=15, verify=False, auth=_auth()) as c:
+                    await c.post(f"{CHROME_POOL_URL}/session/{sid}/close")
+            except Exception:
+                pass
+
+
+def _parse_json_list(val) -> List[str]:
+    if isinstance(val, str) and val.strip():
+        try:
+            p = json.loads(val)
+            if isinstance(p, list):
+                # unique, order-preserving
+                seen, out = set(), []
+                for x in p:
+                    s = str(x)
+                    if s and s not in seen:
+                        seen.add(s)
+                        out.append(s)
+                return out
+        except Exception:
+            pass
+    return []
+
+
+async def eval_js(url: str, expression: str, navigate: bool = True,
+                  timeout: Optional[float] = None) -> Optional[Any]:
+    """Navigate (optional) and evaluate a JS expression, returning its `value` (or None).
+    Used by QA to assert real UX behavior (e.g. count rendered rows) — never-trust-200 for UX."""
+    to = float(timeout if timeout is not None else _TIMEOUT)
+    sid = None
+    try:
+        async with httpx.AsyncClient(timeout=to, verify=False, auth=_auth()) as client:
+            r = await client.post(f"{CHROME_POOL_URL}/session")
+            r.raise_for_status()
+            j = r.json() or {}
+            sid = j.get("sessionId") or j.get("id")
+            if not sid:
+                return None
+            if navigate:
+                await client.post(f"{CHROME_POOL_URL}/session/{sid}/navigate",
+                                  json={"url": url, "acceptCookies": True})
+                await asyncio.sleep(1.2)
+            rr = await client.post(f"{CHROME_POOL_URL}/session/{sid}/eval",
+                                   json={"expression": expression})
+            return (rr.json() or {}).get("value")
+    except Exception as e:  # noqa: BLE001
+        logger.info("eval_js failed for %s: %s", url, e)
+        return None
+    finally:
+        if sid:
+            try:
+                async with httpx.AsyncClient(timeout=15, verify=False, auth=_auth()) as c:
+                    await c.post(f"{CHROME_POOL_URL}/session/{sid}/close")
+            except Exception:
+                pass
 
 
 async def console_errors(url: str, exercise: bool = True,

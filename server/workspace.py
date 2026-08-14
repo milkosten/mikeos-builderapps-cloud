@@ -95,6 +95,17 @@ async def commit_push(project_id: str, message: str,
     return True
 
 
+async def recent_commits(project_id: str, n: int = 8) -> list[str]:
+    """Return the last N commit subjects (for the update context block). Best-effort."""
+    dst = path_for(project_id)
+    if not (dst / ".git").is_dir():
+        return []
+    rc, out = await _run(["git", "log", f"-{n}", "--pretty=format:%s"], cwd=dst, timeout=30)
+    if rc != 0:
+        return []
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
 def read_file_capped(project_id: str, relpath: str) -> Optional[str]:
     """Read a workspace file, refusing anything over the size cap (RAM house rule)."""
     p = (path_for(project_id) / relpath).resolve()

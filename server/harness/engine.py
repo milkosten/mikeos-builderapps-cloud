@@ -66,22 +66,34 @@ async def _already_done(run_id: int, idx: int) -> bool:
     return False
 
 
-async def run(project_id: str, run_id: int, steps: list[Step],
-              emit: Callable[[dict], None]) -> dict:
-    """Execute the steps in order. Returns the shared ctx.state on success; raises on a
-    failed step (the run is left resumable — done steps are persisted)."""
-    ctx = Ctx(project_id=project_id, run_id=run_id, emit=emit)
-    emit({"type": "run_start", "project_id": project_id, "run_id": run_id,
-          "total_steps": len(steps)})
+async def run_partial(project_id: str, run_id: int, steps: list[Step],
+                      emit: Callable[[dict], None], *, base_idx: int = 0,
+                      state: Optional[dict] = None, finish: bool = False,
+                      total: Optional[int] = None) -> dict:
+    """Execute `steps` whose engine indices start at `base_idx` (so a run can be assembled in
+    two passes — e.g. the create pipeline computes its backlog after the strategy step and then
+    appends the remaining steps under the same run_id). Persists/streams exactly like `run`.
 
-    for idx, (name, fn) in enumerate(steps):
+    `state` carries ctx.state across passes. When `finish=True`, marks the run done + emits the
+    terminal `done` event. Raises (resumable) on a failed step.
+    """
+    ctx = Ctx(project_id=project_id, run_id=run_id, emit=emit)
+    if state:
+        ctx.state = state
+    if base_idx == 0:
+        emit({"type": "run_start", "project_id": project_id, "run_id": run_id,
+              "total_steps": total if total is not None else len(steps)})
+
+    for local, (name, fn) in enumerate(steps):
+        idx = base_idx + local
         if await _already_done(run_id, idx):
             ctx.log(f"skip done step {idx} {name}")
             emit({"type": "step_done", "idx": idx, "name": name, "skipped": True})
             continue
 
         await store.upsert_step(run_id, idx, name, "running")
-        _write_current_work(project_id, run_id, steps, idx, "running")
+        _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "running",
+                            {"step_name": name, "total_steps": total or (base_idx + len(steps))})
         emit({"type": "step_start", "idx": idx, "name": name})
         t0 = time.time()
         try:
@@ -92,19 +104,29 @@ async def run(project_id: str, run_id: int, steps: list[Step],
             elif isinstance(result, dict):
                 log = json.dumps(result)[:2000]
             await store.upsert_step(run_id, idx, name, "done", log)
-            _write_current_work(project_id, run_id, steps, idx, "done")
+            _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "done",
+                                {"step_name": name})
             emit({"type": "step_done", "idx": idx, "name": name,
                   "ms": int((time.time() - t0) * 1000), "detail": log[:400]})
         except Exception as e:  # noqa: BLE001
             logger.exception("step %s failed", name)
             await store.upsert_step(run_id, idx, name, "failed", str(e)[:8000])
-            _write_current_work(project_id, run_id, steps, idx, "failed",
-                                {"error": str(e)[:500]})
+            _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "failed",
+                                {"step_name": name, "error": str(e)[:500]})
             emit({"type": "error", "idx": idx, "name": name, "message": str(e)})
             await store.finish_run(run_id, "failed")
             raise
 
-    await store.finish_run(run_id, "done")
-    emit({"type": "done", "project_id": project_id, "run_id": run_id,
-          "state": {k: v for k, v in ctx.state.items() if isinstance(v, (str, int, bool))}})
+    if finish:
+        await store.finish_run(run_id, "done")
+        emit({"type": "done", "project_id": project_id, "run_id": run_id,
+              "state": {k: v for k, v in ctx.state.items() if isinstance(v, (str, int, bool))}})
     return ctx.state
+
+
+async def run(project_id: str, run_id: int, steps: list[Step],
+              emit: Callable[[dict], None]) -> dict:
+    """Execute the steps in order (single-pass). Returns ctx.state; raises on a failed step
+    (the run is left resumable — done steps are persisted)."""
+    return await run_partial(project_id, run_id, steps, emit, base_idx=0,
+                             finish=True, total=len(steps))

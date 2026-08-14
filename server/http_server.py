@@ -98,6 +98,10 @@ class CreateBody(BaseModel):
     title: Optional[str] = None
 
 
+class UpdateBody(BaseModel):
+    request: str = Field(..., min_length=1, max_length=8000)
+
+
 # ---- SSE plumbing ---------------------------------------------------------
 def _sse(item: dict) -> str:
     return f"data: {json.dumps(item)}\n\n"
@@ -164,6 +168,52 @@ async def create_project(body: CreateBody, request: Request):
                 await pipeline.run_create(shortid, run_id, user_id, email, q.put_nowait)
             except Exception as e:  # noqa: BLE001
                 logger.exception("create pipeline failed for %s", shortid)
+                q.put_nowait({"type": "error", "message": str(e)})
+            finally:
+                q.put_nowait(None)
+
+        task = _spawn(body_task())
+        try:
+            while True:
+                item = await q.get()
+                if item is None:
+                    break
+                yield _sse(item)
+        finally:
+            await task
+
+    return StreamingResponse(
+        event_gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Connection": "keep-alive"})
+
+
+# ---- update project (phase 18) --------------------------------------------
+@app.post("/api/projects/{project_id}/update")
+async def update_project(project_id: str, body: UpdateBody, request: Request):
+    """Apply a natural-language change to an existing app (ownership-checked). Streams the
+    update run as SSE, same vocabulary as create."""
+    user_id = await _auth_and_provision(request)
+    email = getattr(request.state, "user_email", None)
+
+    proj = await store.get_project(project_id, user_id)   # ownership-checked
+    if not proj:
+        raise HTTPException(status_code=404, detail="not found")
+
+    await store.set_project_status(project_id, "building")
+    run_id = await store.create_run(project_id, "update", body.request, total_steps=5)
+
+    async def event_gen():
+        q: asyncio.Queue = asyncio.Queue()
+        await q.put({"type": "created", "id": project_id,
+                     "url": f"https://{project_id}.{SITES_BASE}/", "run_id": run_id})
+
+        async def body_task():
+            try:
+                await pipeline.run_update(project_id, run_id, user_id, email,
+                                          body.request, q.put_nowait)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("update pipeline failed for %s", project_id)
                 q.put_nowait({"type": "error", "message": str(e)})
             finally:
                 q.put_nowait(None)
