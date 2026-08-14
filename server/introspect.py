@@ -395,6 +395,11 @@ def qa_rounds(qa_entries: list[dict], qa_steps: list[dict]) -> list[dict]:
             "round": int(meta.get("rounds") or (i + 1)),
             "console_errors": [str(e) for e in (meta.get("errors") or [])][:20],
             "server_errors": server_errors,
+            # phase 28: "a record was seeded through the API — did it render?" A round with
+            # zero console errors and a failed flow is NOT a clean round.
+            "flow_failures": [str(s) for s in (meta.get("semantic") or [])][:20],
+            "flows_checked": int(meta.get("flows_checked") or 0),
+            "flows_passed": int(meta.get("flows_passed") or 0),
             "summary": summary[:1000],
         })
     if not rounds:

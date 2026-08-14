@@ -307,18 +307,28 @@ def _s_qa(brief: str):
         ctx.emit({"type": "qa", "final": True, "clean": report["clean"],
                   "rounds": report["rounds"], "critic": report["critic"],
                   "errors": report["errors"][:10], "network": report["network"][:10],
+                  "semantic": report.get("semantic", [])[:10],
+                  "flows_checked": report.get("flows_checked", 0),
+                  "flows_passed": report.get("flows_passed", 0),
                   "fixes": report["fixes"]})
         await store.append_message(ctx.project_id, "qa", report.get("critic", ""),
                                    {"clean": report["clean"], "rounds": report["rounds"],
                                     "errors": report["errors"][:20],
                                     "network": report["network"][:20],
+                                    # end-to-end flow results: "seeded a record, did it render"
+                                    "semantic": report.get("semantic", [])[:20],
+                                    "flows_checked": report.get("flows_checked", 0),
+                                    "flows_passed": report.get("flows_passed", 0),
                                     # the QA tab reads server_errors — persist them properly
                                     # instead of leaving it to infer from `network`.
                                     "server_errors": (report.get("server_errs") or "")
                                     .splitlines()[:20]})
         await _commit(ctx, "qa: runtime QA results")
         status = "clean" if report["clean"] else "live-with-warnings"
-        return f"QA {status} after {report['rounds']} round(s); critic: {report['critic'][:200]}"
+        flows = (f"; flows {report.get('flows_passed', 0)}/{report.get('flows_checked', 0)} "
+                 f"rendered" if report.get("flows_checked") else "")
+        return (f"QA {status} after {report['rounds']} round(s){flows}; "
+                f"critic: {report['critic'][:200]}")
     return step
 
 
@@ -591,8 +601,13 @@ def build_update_steps(user_id: str, email: Optional[str], request_text: str) ->
             commit_fix=commit_fix, run_id=ctx.run_id)
         ctx.emit({"type": "qa", "final": True, "clean": report["clean"],
                   "rounds": report["rounds"], "critic": report["critic"],
-                  "errors": report["errors"][:10], "network": report["network"][:10]})
-        return f"QA {'clean' if report['clean'] else 'live-with-warnings'}: {report['critic'][:150]}"
+                  "errors": report["errors"][:10], "network": report["network"][:10],
+                  "semantic": report.get("semantic", [])[:10],
+                  "flows_checked": report.get("flows_checked", 0),
+                  "flows_passed": report.get("flows_passed", 0)})
+        return (f"QA {'clean' if report['clean'] else 'live-with-warnings'} "
+                f"(flows {report.get('flows_passed', 0)}/{report.get('flows_checked', 0)} "
+                f"rendered): {report['critic'][:150]}")
 
     async def s_commit(ctx: Ctx):
         changed = await _commit(ctx, f"update: {request_text[:70]}")
