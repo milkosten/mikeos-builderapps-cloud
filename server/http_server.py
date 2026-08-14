@@ -22,7 +22,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from server import (assistant_api, assistant_runtime, browser_proxy, db, deployer, gitea,
-                    introspect, llm_proxy, naming, runner, store, workspace, usage)
+                    introspect, llm_proxy, naming, runner, store, workspace, workspace_api,
+                    usage)
 from server.harness import pipeline
 from server.identity import authenticate, current_user
 
@@ -100,6 +101,12 @@ app.include_router(llm_proxy.router)
 # `asst_…` token, so an agent gets to look at its app without ever holding the estate's key.
 # `curl` proves a process is up; only this proves a UI works.
 app.include_router(browser_proxy.router)
+
+# The per-project WORKSPACE (phase 32) — the work-tracker the pipeline, the assistants and
+# the human all share. A third credential model again: the owner's session OR the project's
+# `workspace-api-key`, which is scoped to exactly one project. API-first by decision, so its
+# routes are published in /openapi.json and the Workspace tab is just one of its clients.
+app.include_router(workspace_api.router)
 
 _CORS_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS", "https://builderapps.osmike.com").split(",") if o.strip()]

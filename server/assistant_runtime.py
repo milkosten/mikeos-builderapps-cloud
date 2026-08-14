@@ -47,6 +47,7 @@ from typing import Any, Optional
 
 from server import assistants as A
 from server import chrome, gitea, gpu, runner, store, usage
+from server import workspace_store as W
 from server.harness import codegen
 
 logger = logging.getLogger(__name__)
@@ -191,6 +192,22 @@ async def launch_beat(assistant: dict, beat_id: int, *, trigger_kind: str) -> tu
     if A.has(assistant, "read_repo"):
         remote = await _git_remote_for(proj, str(proj.get("user_id") or ""))
 
+    # THE SHARED BRAIN (phase 32). Every assistant on a project gets the SAME
+    # `workspace-api-key`, which is what makes the tracker shared: the Developer files a bug,
+    # the Tester sees it, the Product Owner comments on it. `ensure_key` mints one on first
+    # ask, so projects that existed before phase 32 are never stranded without one.
+    #
+    # It arrives HERE, per beat, in the container environment — it is deliberately NOT baked
+    # into the runtime image. An image is pulled, inspected, copied and shared; a credential
+    # inside one is a credential in everyone's hands. `docker run --rm --entrypoint sh
+    # mikeos-assistant-runtime -c env` must show nothing.
+    ws_key = ""
+    try:
+        ws_key = await W.ensure_key(project_id)
+    except Exception as e:  # noqa: BLE001 — a tracker outage must not stop the assistant
+        logger.warning("no workspace key for %s (%s) — this beat runs without `ws`",
+                       project_id, e)
+
     name = f"asst-{aid}-{beat_id}"
     cmd = [
         "docker", "run", "--rm", "--name", name,
@@ -220,6 +237,8 @@ async def launch_beat(assistant: dict, beat_id: int, *, trigger_kind: str) -> tu
     ]
     if remote:
         cmd += ["-e", f"GIT_REMOTE={remote}"]
+    if ws_key:
+        cmd += ["-e", f"WORKSPACE_API_KEY={ws_key}"]
     cmd.append(IMAGE)
 
     try:
@@ -236,6 +255,8 @@ async def launch_beat(assistant: dict, beat_id: int, *, trigger_kind: str) -> tu
 def _redact(text: str) -> str:
     """Never let a token reach a log or a beat record."""
     text = re.sub(r"asst_[A-Za-z0-9_\-]{8,}", "asst_***", text or "")
+    # …and the project's shared workspace key, which the beat's `ws` tool carries (phase 32).
+    text = re.sub(r"wsk_[A-Za-z0-9_\-]{8,}", "wsk_***", text)
     return re.sub(r"://[^/@\s]+:[^/@\s]+@", "://***:***@", text)
 
 
@@ -453,6 +474,23 @@ async def perceive(assistant: dict, *, include_soul: bool = False) -> dict:
     # pipeline's codegen prompts carry, so an assistant cannot unknowingly "harden" away
     # something the pipeline is contractually required to keep.
     ctx["platform_rules"] = codegen.PLATFORM_CONTRACTS
+    # THE SHARED BOARD (phase 32). Every assistant sees the project's workspace on every
+    # beat, deterministically — it is not a tool the model has to remember to reach for.
+    # This is what stops two assistants rebuilding the same thing and what lets one pick up
+    # a bug another filed. Only the LIVE items (open/in_progress/blocked) are sent: a
+    # finished feature is history, and history is what makes a context window expensive.
+    try:
+        board = await W.list_items(project_id, limit=60)
+        live_items = [i for i in board if i.get("status") not in W.CLOSED_STATUSES]
+        ctx["workspace"] = {
+            "counts": await W.counts(project_id),
+            "open_items": [{"id": i["id"], "kind": i["kind"], "status": i["status"],
+                            "title": i["title"][:160],
+                            "by": i.get("created_by_name") or i.get("created_by")}
+                           for i in live_items[:30]],
+        }
+    except Exception as e:  # noqa: BLE001 — perception must never fail a beat
+        logger.info("workspace board unavailable for %s: %s", project_id, e)
     if include_soul:
         # Only for the container's GET /context, so it can mirror the SOUL into the repo at
         # `docs/assistants/<role>.SOUL.md` — the SOUL should live in git next to the app it
@@ -484,6 +522,11 @@ _ACTION_SCHEMA = {
                     "message": {"type": "string"},
                     "request": {"type": "string"},
                     "capability": {"type": "string"},
+                    # the shared workspace (phase 32)
+                    "kind": {"type": "string"},
+                    "title": {"type": "string"},
+                    "status": {"type": "string"},
+                    "item_id": {"type": "integer"},
                 },
                 "required": ["type"],
             },
@@ -527,6 +570,23 @@ def _action_menu(assistant: dict) -> str:
                      "committed on HEAD: build + health gate, rolled back if it goes red. "
                      "You never touch Docker. Only useful if a commit is already pushed "
                      "that has not been deployed.")
+    # THE SHARED WORKSPACE — offered to EVERY assistant, with no capability gate.
+    #
+    # Deliberate: writing to your own project's work-tracker is not a privilege, it is how
+    # you exist to your colleagues and to the owner. It touches no code, ships nothing, and
+    # cannot leave the project. Gating it behind a capability would mean the read-only
+    # assistants — exactly the ones whose entire output IS findings and knowledge — could
+    # observe carefully and then have nowhere to put it.
+    lines.append(
+        '- {"type":"workspace_add","kind":"bug|feature|task|testcase|doc|kb","title":"...",'
+        '"text":"the details someone else could act on"} — put something on the project\'s '
+        "shared board, where the pipeline, the other assistants and the owner all read it. "
+        "This is the only thing you produce that outlives this beat. `kind` is free text.")
+    lines.append(
+        '- {"type":"workspace_update","item_id":42,"status":"in_progress|done|blocked",'
+        '"text":"a comment explaining the change"} — move an item on the board (its id is in '
+        "the `workspace` block of your context) and/or comment on it. Only mark something "
+        "`done` if you actually verified it.")
     lines.append('- {"type":"none"} — nothing is worth doing this beat. Preferred over noise.')
     return "\n".join(lines)
 
@@ -786,6 +846,60 @@ async def act_check(assistant: dict, capability: str) -> dict:
     return {"ok": True, "granted": capability}
 
 
+def _ws_actor(assistant: dict) -> W.Actor:
+    """Who this assistant is on the board. Resolved from the ROW, never from anything the
+    container sent — an assistant cannot file work under a colleague's name."""
+    return W.Actor.assistant(assistant["id"],
+                             assistant.get("name") or assistant.get("role") or "assistant")
+
+
+async def act_workspace_add(assistant: dict, action: dict) -> dict:
+    """File a new item on the project's shared board (phase 32). No capability gate — see
+    `_action_menu`."""
+    project_id = str(assistant["project_id"])
+    title = str(action.get("title") or action.get("text") or "").strip()
+    if not title:
+        return {"ok": False, "detail": "workspace_add needs a `title`"}
+    item = await W.create_item(
+        project_id, _ws_actor(assistant),
+        kind=str(action.get("kind") or "task"),
+        title=title[:W.MAX_TITLE],
+        body_md=str(action.get("text") or "")[:W.MAX_BODY],
+        status=str(action.get("status") or "open"))
+    return {"ok": True, "item_id": item["id"], "kind": item["kind"], "title": item["title"],
+            "detail": f"filed #{item['id']} [{item['kind']}] {item['title'][:80]}"}
+
+
+async def act_workspace_update(assistant: dict, action: dict) -> dict:
+    """Move and/or comment on an existing board item. A status change and a comment in one
+    act, because "done, because X" is one thought and splitting it costs a whole beat."""
+    project_id = str(assistant["project_id"])
+    try:
+        item_id = int(action.get("item_id") or 0)
+    except (TypeError, ValueError):
+        item_id = 0
+    if not item_id:
+        return {"ok": False, "detail": "workspace_update needs an `item_id`"}
+    actor = _ws_actor(assistant)
+    status = str(action.get("status") or "").strip()
+    text = str(action.get("text") or "").strip()
+    if not status and not text:
+        return {"ok": False, "detail": "workspace_update needs a `status` and/or `text`"}
+    item = None
+    if status:
+        item = await W.update_item(item_id, project_id, actor, status=status)
+        if not item:
+            return {"ok": False, "detail": f"no item #{item_id} in this project"}
+    if text:
+        c = await W.add_comment(item_id, project_id, actor, text[:W.MAX_COMMENT])
+        if not c:
+            return {"ok": False, "detail": f"no item #{item_id} in this project"}
+    item = item or await W.get_item(item_id, project_id)
+    return {"ok": True, "item_id": item_id, "status": (item or {}).get("status"),
+            "detail": f"#{item_id} -> {(item or {}).get('status')}"
+                      + (" + comment" if text else "")}
+
+
 async def apply_action(assistant: dict, action: dict,
                        beat_id: Optional[int] = None) -> dict:
     """Dispatch one action. A denied capability is a recorded action RESULT, not a crash —
@@ -806,6 +920,11 @@ async def apply_action(assistant: dict, action: dict,
             return {"ok": True, "detail": "nothing to do this beat"}
         if kind == "check":
             return await act_check(assistant, str(action.get("capability") or ""))
+        # The shared work-tracker (phase 32). Ungated on purpose — see `_action_menu`.
+        if kind in ("workspace_add", "workspace_new", "ws_add"):
+            return await act_workspace_add(assistant, action)
+        if kind in ("workspace_update", "workspace_comment", "ws_update"):
+            return await act_workspace_update(assistant, action)
         return {"ok": False, "detail": f"unknown action type {kind!r}"}
     except A.Denied as e:
         return {"ok": False, "denied": True, "detail": str(e)}

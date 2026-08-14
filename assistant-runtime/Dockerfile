@@ -82,11 +82,25 @@ RUN chmod 0555 /app/beat.py
 COPY mikeweb /usr/local/bin/mikeweb
 RUN chmod 0555 /usr/local/bin/mikeweb
 
-# The skill that tells the coding agent this tool exists and when to reach for it. Pi's own
-# mechanism (the Agent Skills spec: a directory with SKILL.md + frontmatter), loaded by
-# beat.py with an explicit `--skill`. It lives in the IMAGE, not in the repo: `--no-skills`
-# still disables discovery from the checkout, so an LLM-written repository cannot introduce a
-# skill that configures the agent editing it next.
+# THE SHARED WORKSPACE (phase 32). `ws` is the work-tracker every assistant on this project,
+# the build pipeline and the human all write to: features, bugs, tasks, test cases, docs and
+# knowledge-base notes, each with a status, comments and a who-did-what trail. A beat
+# container is deleted when the beat ends, so this is the ONLY memory an assistant has that
+# outlives it — and the only way two assistants can hand work to each other.
+#
+# SAME CREDENTIAL RULE AS mikeweb, and it matters more here: NO KEY IS BAKED IN. The
+# project's `workspace-api-key` is injected per beat by the scheduler as WORKSPACE_API_KEY
+# (server/assistant_runtime.py) and is scoped to exactly one project. An image is pulled,
+# copied and shared; a key inside one is a key in everyone's hands. Verify with:
+#   docker run --rm --entrypoint sh mikeos-assistant-runtime -c 'env'
+COPY ws /usr/local/bin/ws
+RUN chmod 0555 /usr/local/bin/ws
+
+# The skills that tell the coding agent these tools exist and when to reach for them. Pi's
+# own mechanism (the Agent Skills spec: a directory with SKILL.md + frontmatter), loaded by
+# beat.py with an explicit `--skill` per directory. They live in the IMAGE, not in the repo:
+# `--no-skills` still disables discovery from the checkout, so an LLM-written repository
+# cannot introduce a skill that configures the agent editing it next.
 COPY skills /app/skills
 RUN chmod -R a=rX /app/skills
 

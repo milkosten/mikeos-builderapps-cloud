@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""ws — the project's shared WORKSPACE, on the command line.
+
+    Your notes die with this container. `ws` is where the work actually lives.
+
+Every assistant on this project — and the build pipeline, and the human — reads and writes
+the SAME tracker through this tool: features, bugs, tasks, test cases, documentation and
+knowledge-base notes, each with a status, comments and a full audit trail of who changed
+what. It is how a Developer tells a Tester what is ready, how a Tester files what is broken,
+and how anyone finds out what was decided three beats ago.
+
+Design notes, because this is a tool an LLM must use correctly on the first try:
+
+* **The key is in the environment, per beat** (`WORKSPACE_API_KEY`) and is scoped to THIS
+  project only. It is not baked into the image and it cannot see another project's work.
+* **`kind` and `status` are free text.** The conventions are listed in `--help`; inventing
+  `kind=risk` works and costs nothing. Nothing here validates a vocabulary.
+* **Text out by default, `--json` when asked.** The default output is what a model reads;
+  scripts get `--json`.
+* **Exit 0 = it worked. 1 = the API said no (404/422). 2 = the tool could not run.** So `ws`
+  is usable in a shell gate, exactly like `mikeweb`.
+* **`ws get <id>` returns the WHOLE item** — body, comments, event trail and links — in one
+  call, so acting on an item never needs four commands.
+
+Stdlib only: this must work in a container with no pip install.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONTROL_URL = os.environ.get("CONTROL_URL", "").rstrip("/")
+WS_KEY = os.environ.get("WORKSPACE_API_KEY", "")
+PROJECT_ID = os.environ.get("PROJECT_ID", "")
+# Sent alongside the shared key so the control plane can attribute a change to THIS
+# assistant rather than to "an agent". The server verifies it; we cannot fake an identity.
+ASSISTANT_TOKEN = os.environ.get("ASSISTANT_TOKEN", "")
+ACTOR_NAME = os.environ.get("ASSISTANT_NAME", "")
+
+OK, REFUSED, TOOL_ERROR = 0, 1, 2
+
+KINDS = ["feature", "bug", "task", "testcase", "doc", "kb"]
+STATUSES = ["open", "in_progress", "blocked", "done", "rejected"]
+
+
+def die(msg: str, code: int = TOOL_ERROR):
+    print("ws: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def call(method: str, path: str, body=None, timeout: float = 45.0):
+    if not CONTROL_URL or not WS_KEY or not PROJECT_ID:
+        die("CONTROL_URL / WORKSPACE_API_KEY / PROJECT_ID are not set — this only runs "
+            "inside a beat")
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"X-Workspace-Key": WS_KEY, "Content-Type": "application/json",
+               "Accept": "application/json"}
+    if ASSISTANT_TOKEN:
+        headers["X-Assistant-Token"] = ASSISTANT_TOKEN
+    if ACTOR_NAME:
+        headers["X-Actor-Name"] = ACTOR_NAME[:120]
+    req = urllib.request.Request(CONTROL_URL + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(detail).get("detail") or detail
+        except Exception:
+            pass
+        # A refusal is an ANSWER (no such item, title required), not a broken tool.
+        die(f"HTTP {e.code}: {str(detail)[:400]}", REFUSED)
+    except Exception as e:  # noqa: BLE001
+        die(f"could not reach the control plane: {str(e)[:200]}")
+    return json.loads(raw) if raw.strip() else {}
+
+
+def base() -> str:
+    return f"/api/projects/{urllib.parse.quote(PROJECT_ID)}"
+
+
+def qs(**kw) -> str:
+    pairs = {k: v for k, v in kw.items() if v not in ("", None)}
+    return ("?" + urllib.parse.urlencode(pairs)) if pairs else ""
+
+
+# --- rendering -------------------------------------------------------------
+def who(kind: str, name: str) -> str:
+    """Who did it, in a form a model can quote back to a human. The distinction that
+    matters is human vs agent, so it is spelled out rather than implied by a name."""
+    mark = {"human": "human", "assistant": "assistant", "pipeline": "pipeline",
+            "agent": "agent"}.get(kind or "", kind or "?")
+    return f"{name or '?'} ({mark})"
+
+
+def one_line(it: dict) -> str:
+    return (f"#{it.get('id')}  {str(it.get('kind') or ''):9s} "
+            f"{str(it.get('status') or ''):12s} {str(it.get('title') or '')[:88]}")
+
+
+def print_item(it: dict) -> None:
+    print(f"#{it.get('id')}  [{it.get('kind')}]  {it.get('title')}")
+    print(f"status    {it.get('status')}"
+          + (f"   priority {it.get('priority')}" if it.get("priority") else "")
+          + (f"   assignee {it.get('assignee')}" if it.get("assignee") else ""))
+    print(f"created   {who(it.get('created_by_kind'), it.get('created_by_name'))} "
+          f"at {it.get('created_at')}")
+    body = (it.get("body_md") or "").strip()
+    if body:
+        print("\n--- body ---")
+        print(body[:8000])
+    links = it.get("links") or []
+    if links:
+        print("\n--- links ---")
+        for l in links:
+            arrow = "->" if l.get("direction") == "out" else "<-"
+            print(f"  {arrow} {l.get('link_rel')} #{l.get('other_id')} "
+                  f"[{l.get('other_kind')}/{l.get('other_status')}] {l.get('other_title')}")
+    comments = it.get("comments") or []
+    if comments:
+        print(f"\n--- comments ({len(comments)}) ---")
+        for c in comments:
+            print(f"  {c.get('created_at')}  {who(c.get('author_kind'), c.get('author_name'))}")
+            for line in (c.get("body_md") or "").splitlines()[:40]:
+                print(f"      {line}")
+    events = it.get("events") or []
+    if events:
+        print(f"\n--- history ({len(events)}) ---")
+        for e in events:
+            bit = ""
+            if e.get("from_val") or e.get("to_val"):
+                bit = f" {e.get('from_val') or '∅'} -> {e.get('to_val') or '∅'}"
+            note = f"  {str(e.get('note'))[:120]}" if e.get("note") else ""
+            print(f"  {e.get('ts')}  {who(e.get('actor_kind'), e.get('actor_name'))}  "
+                  f"{e.get('verb')}{bit}{note}")
+
+
+# --- commands --------------------------------------------------------------
+def cmd_list(args) -> int:
+    res = call("GET", base() + "/items" + qs(kind=args.kind, status=args.status,
+                                             assignee=args.assignee, q=args.q,
+                                             limit=args.limit))
+    items = res.get("items") or []
+    if args.json:
+        print(json.dumps(res, indent=2)[:400000])
+        return OK
+    if not items:
+        print("no items match. `ws new --kind feature --title '...'` creates one.")
+        return OK
+    counts = (res.get("counts") or {}).get("by_status") or {}
+    print(f"{len(items)} item(s)   " +
+          "  ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    print("")
+    for it in items:
+        print(one_line(it))
+    return OK
+
+
+def cmd_get(args) -> int:
+    res = call("GET", f"{base()}/items/{int(args.id)}")
+    it = res.get("item") or {}
+    if args.json:
+        print(json.dumps(it, indent=2)[:400000])
+        return OK
+    print_item(it)
+    return OK
+
+
+def cmd_new(args) -> int:
+    body = {"kind": args.kind, "title": args.title, "body_md": args.body,
+            "status": args.status, "priority": args.priority, "assignee": args.assignee}
+    res = call("POST", base() + "/items", body)
+    it = res.get("item") or {}
+    if args.json:
+        print(json.dumps(it, indent=2))
+    else:
+        print(f"created #{it.get('id')}  [{it.get('kind')}] {it.get('title')}")
+    return OK
+
+
+def cmd_update(args) -> int:
+    patch = {k: v for k, v in {"kind": args.kind, "title": args.title, "body_md": args.body,
+                               "status": args.status, "priority": args.priority,
+                               "assignee": args.assignee}.items() if v not in ("", None)}
+    if not patch:
+        die("nothing to update — pass at least one of --status/--kind/--title/--body/"
+            "--assignee/--priority")
+    res = call("PATCH", f"{base()}/items/{int(args.id)}", patch)
+    it = res.get("item") or {}
+    if args.json:
+        print(json.dumps(it, indent=2))
+    else:
+        print(f"updated #{it.get('id')} -> status {it.get('status')} [{it.get('kind')}]")
+    return OK
+
+
+def cmd_comment(args) -> int:
+    res = call("POST", f"{base()}/items/{int(args.id)}/comments", {"body_md": args.text})
+    if args.json:
+        print(json.dumps(res.get("comment") or {}, indent=2))
+    else:
+        print(f"commented on #{args.id}")
+    return OK
+
+
+def cmd_link(args) -> int:
+    res = call("POST", f"{base()}/items/{int(args.id)}/links",
+               {"to_item": int(args.to), "rel": args.rel})
+    if args.json:
+        print(json.dumps(res.get("link") or {}, indent=2))
+    else:
+        print(f"#{args.id} {args.rel} #{args.to}")
+    return OK
+
+
+def cmd_search(args) -> int:
+    res = call("GET", base() + "/search" + qs(q=args.q, kind=args.kind, limit=args.limit))
+    items = res.get("items") or []
+    if args.json:
+        print(json.dumps(res, indent=2)[:400000])
+        return OK
+    if not items:
+        print(f"nothing found for {args.q!r}.")
+        return OK
+    print(f"{len(items)} match(es) for {args.q!r}:\n")
+    for it in items:
+        print(one_line(it))
+    return OK
+
+
+def cmd_events(args) -> int:
+    res = call("GET", f"{base()}/items/{int(args.id)}/events")
+    evs = res.get("events") or []
+    if args.json:
+        print(json.dumps(evs, indent=2))
+        return OK
+    for e in evs:
+        bit = ""
+        if e.get("from_val") or e.get("to_val"):
+            bit = f" {e.get('from_val') or '∅'} -> {e.get('to_val') or '∅'}"
+        print(f"{e.get('ts')}  {who(e.get('actor_kind'), e.get('actor_name'))}  "
+              f"{e.get('verb')}{bit}  {str(e.get('note') or '')[:160]}")
+    return OK
+
+
+EPILOG = f"""\
+The shared work-tracker for THIS project. The pipeline files what it built; you file what
+you find; everyone can see and comment on all of it.
+
+  ws list                              everything, newest last
+  ws list --kind bug --status open     just the open bugs
+  ws get 42                            the WHOLE item: body, comments, history, links
+  ws new --kind bug --title "Save button does nothing on /notes" \\
+         --body "Clicking Save posts /api/notes and the row never appears. Console: 500."
+  ws update 42 --status in_progress    take it
+  ws update 42 --status done           finish it
+  ws comment 42 "Fixed in a1b2c3d — the handler swallowed the DB error."
+  ws link 42 --to 7 --rel blocks       relate two items
+  ws search "rate limit"               across features, bugs, docs and the knowledge base
+
+Conventional kinds:    {' · '.join(KINDS)}
+Conventional statuses: {' · '.join(STATUSES)}
+Both are FREE TEXT — a kind or status that does not exist yet simply starts existing. Use
+the conventions unless you have a reason not to, so the board stays readable.
+
+Exit codes:  0 = done   1 = the API refused (no such item, missing title)   2 = tool error
+
+This project's workspace only. The key in this container cannot read another project.
+"""
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="ws",
+        description="The shared workspace: features, bugs, tasks, test cases, docs and the "
+                    "knowledge base for this project — with statuses, comments and a full "
+                    "record of who changed what.",
+        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    l = sub.add_parser("list", help="list items (filter by kind/status/assignee/text)")
+    l.add_argument("--kind", default=""); l.add_argument("--status", default="")
+    l.add_argument("--assignee", default=""); l.add_argument("--q", default="")
+    l.add_argument("--limit", type=int, default=200)
+    l.set_defaults(fn=cmd_list)
+
+    g = sub.add_parser("get", help="one item in full: body, comments, history, links")
+    g.add_argument("id"); g.set_defaults(fn=cmd_get)
+
+    n = sub.add_parser("new", help="create an item")
+    n.add_argument("--kind", default="task", help=f"free text; usually one of {'|'.join(KINDS)}")
+    n.add_argument("--title", required=True)
+    n.add_argument("--body", default="", help="markdown; the details someone else needs")
+    n.add_argument("--status", default="open",
+                   help=f"free text; usually one of {'|'.join(STATUSES)}")
+    n.add_argument("--priority", default="normal")
+    n.add_argument("--assignee", default="")
+    n.set_defaults(fn=cmd_new)
+
+    u = sub.add_parser("update", help="change an item's status or fields")
+    u.add_argument("id")
+    u.add_argument("--kind", default=""); u.add_argument("--title", default="")
+    u.add_argument("--body", default=""); u.add_argument("--status", default="")
+    u.add_argument("--priority", default=""); u.add_argument("--assignee", default="")
+    u.set_defaults(fn=cmd_update)
+
+    c = sub.add_parser("comment", help="add a comment to an item")
+    c.add_argument("id"); c.add_argument("text")
+    c.set_defaults(fn=cmd_comment)
+
+    k = sub.add_parser("link", help="link two items (covers|blocks|duplicates|relates)")
+    k.add_argument("id"); k.add_argument("--to", required=True)
+    k.add_argument("--rel", default="relates")
+    k.set_defaults(fn=cmd_link)
+
+    s = sub.add_parser("search", help="search across every kind — the knowledge-base lookup")
+    s.add_argument("q"); s.add_argument("--kind", default="")
+    s.add_argument("--limit", type=int, default=50)
+    s.set_defaults(fn=cmd_search)
+
+    e = sub.add_parser("events", help="an item's audit trail (who changed what, when)")
+    e.add_argument("id"); e.set_defaults(fn=cmd_events)
+
+    args = p.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(TOOL_ERROR)

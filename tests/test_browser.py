@@ -155,8 +155,13 @@ check("a page that is broken in a browser fails the beat",
       "BROKEN IN A BROWSER" in beat_src)
 check("the beat closes its browser sessions in a finally",
       "close_browser()" in beat_src)
-check("Pi is handed the skill explicitly (it survives --no-skills)",
-      '"--skill", PI_SKILLS' in beat_src)
+# Phase 32 added a SECOND skill (`workspace`), so PI_SKILLS became a list and the flag is
+# emitted once per directory. The property under test is unchanged: each skill is passed
+# EXPLICITLY, which is what makes it survive `--no-skills`.
+check("Pi is handed each skill explicitly (they survive --no-skills)",
+      '"--skill", skill_dir' in beat_src and "for skill_dir in PI_SKILLS" in beat_src)
+check("browser-verify is still one of the skills handed over",
+      "/app/skills/browser-verify" in beat_src)
 check("Pi is told which URL is its own app", "MIKEWEB_APP_URL" in beat_src)
 check("the runtime image installs mikeweb", "COPY mikeweb /usr/local/bin/mikeweb" in dockerfile)
 check("the runtime image ships the skill", "COPY skills /app/skills" in dockerfile)

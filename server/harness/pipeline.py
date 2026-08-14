@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from server import deployer, gitea, naming, store, workspace
+from server import workspace_store as W
 from server.harness import backlog as backlog_mod
 from server.harness import agentic, codegen, engine, runtime_qa
 from server.harness.engine import Ctx, Step
@@ -36,6 +37,57 @@ logger = logging.getLogger(__name__)
 # ONE constant, shared with the TECHNICAL-PLAN prompt: while the prompt asked for "6-14 tasks"
 # and this said 12, items 13-14 were parsed and then dropped without a word.
 _MAX_FEATURES = backlog_mod.MAX_FEATURES
+
+
+# --------------------------------------------------------------------------
+# phase 32 — the pipeline writes into the project's WORKSPACE as it goes
+# --------------------------------------------------------------------------
+# The tracker's whole payoff: the pipeline already knows the backlog and already knows which
+# `build_NN` succeeded, was retried, or was given up on. Writing that in as `feature` items
+# with real statuses means the user's "what got built / what got skipped" view exists with
+# nobody maintaining it — and a SKIPPED feature becomes a visible `blocked` item carrying its
+# reason, instead of one grey line in a step list nobody scrolls to.
+#
+# Every call here is BEST-EFFORT. A tracker that can take a build down would be a worse
+# feature than no tracker: these helpers swallow their own errors and log. The build is the
+# product; the tracker is the record of it.
+_WS_ACTOR = W.Actor.pipeline()
+
+
+async def _ws_seed_backlog(project_id: str, items: list[str]) -> int:
+    """One `feature` item per backlog entry, keyed `build_01`… so a RESUMED run updates the
+    same rows instead of duplicating the whole backlog."""
+    n = 0
+    for i, feature in enumerate(items):
+        try:
+            await W.upsert_by_ext_key(
+                project_id, f"build_{i + 1:02d}", _WS_ACTOR,
+                kind="feature", title=feature[:W.MAX_TITLE],
+                body_md=f"Planned by the build pipeline as feature {i + 1} of {len(items)}.\n\n"
+                        f"{feature}",
+                status="open")
+            n += 1
+        except Exception as e:  # noqa: BLE001
+            logger.info("workspace seed for %s build_%02d skipped: %s", project_id, i + 1, e)
+    return n
+
+
+async def _ws_status(project_id: str, idx: int, status: str, note: str = "") -> None:
+    """Move one seeded feature. `idx` is 1-based, matching the `build_NN` step name."""
+    try:
+        await W.set_status(project_id, f"build_{idx:02d}", _WS_ACTOR, status, note=note)
+    except Exception as e:  # noqa: BLE001
+        logger.info("workspace status for %s build_%02d skipped: %s", project_id, idx, e)
+
+
+async def _ws_bug(project_id: str, title: str, body: str) -> None:
+    """File a runtime-QA finding as a `bug` item — QA output that lives only in a run record
+    is QA output nobody reads twice."""
+    try:
+        await W.create_item(project_id, _WS_ACTOR, kind="bug", title=title[:W.MAX_TITLE],
+                            body_md=body[:8000], status="open")
+    except Exception as e:  # noqa: BLE001
+        logger.info("workspace bug for %s skipped: %s", project_id, e)
 
 
 # --------------------------------------------------------------------------
@@ -89,7 +141,17 @@ def _s_secrets():
         await store.put_secret(ctx.project_id, "app_secret", app_secret)
         ctx.state["db_password"] = db_password
         ctx.state["app_secret"] = app_secret
-        return "secrets allocated"
+        # phase 32 — mint the project's `workspace-api-key` at birth, alongside its other
+        # credentials. Every assistant this project ever gets is handed THIS key, which is
+        # what makes the tracker shared between them. (`ensure_key` is also called lazily
+        # when a beat launches, so an older project is never stranded — but a project created
+        # from here has one before anything else in the pipeline could want it.)
+        ws_key = ""
+        try:
+            ws_key = await W.ensure_key(ctx.project_id)
+        except Exception as e:  # noqa: BLE001 — never fail a build on the tracker
+            logger.warning("workspace key for %s not minted here: %s", ctx.project_id, e)
+        return "secrets allocated" + (" + workspace key" if ws_key else "")
     return step
 
 
@@ -191,9 +253,12 @@ def _s_parse_backlog():
         ctx.state["backlog"] = items
         ctx.state["feature_total"] = len(items)   # denominator of the honest "N of M" summary
         ctx.state["changes"] = []
+        # phase 32 — the same backlog, written into the project's workspace as `feature`
+        # items so the user has a live view of what is planned before anything is built.
+        seeded = await _ws_seed_backlog(ctx.project_id, items)
         note = (f" ({len(planned)} planned; the last {folded + 1} folded into one step so "
                 f"nothing is dropped)" if folded else "")
-        return f"backlog: {len(items)} features{note} -> {items}"
+        return f"backlog: {len(items)} features{note} ({seeded} tracked) -> {items}"
     return step
 
 
@@ -329,12 +394,17 @@ def _s_feature(idx: int, feature: str, brief: str):
     async def step(ctx: Ctx):
         ctx.emit({"type": "progress", "stage": "build_feature",
                   "detail": f"[{idx+1}] {feature[:120]}"})
+        # The tracker follows the build in real time: open -> in_progress -> done|blocked.
+        await _ws_status(ctx.project_id, idx + 1, "in_progress")
         try:
             out = await _feature_attempt(ctx, idx, feature, brief, attempt=1)
         except Exception as first:  # noqa: BLE001
             logger.warning("feature '%s' attempt 1 failed: %s", feature, first)
             ctx.emit({"type": "progress", "stage": "build_feature",
                       "detail": f"[{idx+1}] failed — retrying once with the error fed back"})
+            await _ws_status(ctx.project_id, idx + 1, "in_progress",
+                             note=f"attempt 1 failed: {str(first)[:400]} — retrying once "
+                                  f"with the error fed back")
             try:
                 out = await _feature_attempt(ctx, idx, feature, brief, attempt=2,
                                              prior_error=str(first))
@@ -349,10 +419,16 @@ def _s_feature(idx: int, feature: str, brief: str):
                     logger.error("could not restore %s after skipping a feature: %s",
                                  ctx.project_id, e3)
                 reason = (f"failed twice ({str(second)[:220]}); {restored}")
+                # A skipped feature is BLOCKED, not gone. It stays on the board with the
+                # reason attached, so "the pipeline quietly dropped this" is no longer a
+                # thing that can happen to a user without them seeing it.
+                await _ws_status(ctx.project_id, idx + 1, "blocked", note=reason)
                 raise engine.StepSkipped(reason, label=feature[:80])
         wrote, res = out["wrote"], out["res"]
         ctx.state.setdefault("changes", []).append(f"{feature} ({', '.join(wrote)})")
         await _commit(ctx, f"feat: {feature[:70]}")
+        await _ws_status(ctx.project_id, idx + 1, "done",
+                         note=f"built and deployed — {', '.join(wrote) or 'no file changes'}")
         return (f"built {feature[:60]} -> {wrote or 'no file changes'} "
                 f"({res['tool_calls']} tool calls; {res['summary'][:160]})")
     return step
@@ -396,6 +472,24 @@ def _s_qa(brief: str):
                                     "server_errors": (report.get("server_errs") or "")
                                     .splitlines()[:20]})
         await _commit(ctx, "qa: runtime QA results")
+        # phase 32 — every finding QA could NOT fix becomes a `bug` item. The QA report
+        # itself is a snapshot in a run record; a bug on the board is something an assistant
+        # can pick up on its next beat, comment on, and close.
+        if not report["clean"]:
+            for msg in (report.get("errors") or [])[:10]:
+                await _ws_bug(ctx.project_id, f"JS console error: {str(msg)[:200]}",
+                              f"Found by runtime QA on {url} after {report['rounds']} "
+                              f"round(s).\n\n```\n{str(msg)[:3000]}\n```")
+            for msg in (report.get("network") or [])[:10]:
+                await _ws_bug(ctx.project_id, f"Failed request: {str(msg)[:200]}",
+                              f"Found by runtime QA on {url}.\n\n```\n{str(msg)[:3000]}\n```")
+            for f in (report.get("semantic") or [])[:10]:
+                label = f.get("flow") or f.get("name") or "flow" if isinstance(f, dict) else str(f)
+                if isinstance(f, dict) and f.get("passed"):
+                    continue
+                await _ws_bug(ctx.project_id, f"Flow does not work end-to-end: {str(label)[:180]}",
+                              f"Found by runtime QA on {url}: a record was seeded and the "
+                              f"page did not render it.\n\n```\n{str(f)[:3000]}\n```")
         status = "clean" if report["clean"] else "live-with-warnings"
         flows = (f"; flows {report.get('flows_passed', 0)}/{report.get('flows_checked', 0)} "
                  f"rendered" if report.get("flows_checked") else "")

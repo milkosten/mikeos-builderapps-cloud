@@ -64,8 +64,16 @@ PI_TIMEOUT_SEC = int(os.environ.get("PI_TIMEOUT_SEC", "780"))
 DEPLOY_WAIT_SEC = int(os.environ.get("DEPLOY_WAIT_SEC", "900"))
 # The browser tool baked into this image, and the skill that teaches Pi to reach for it.
 MIKEWEB = os.environ.get("MIKEWEB_BIN", "/usr/local/bin/mikeweb")
-PI_SKILLS = os.environ.get("PI_SKILLS_DIR", "/app/skills/browser-verify")
 BROWSER_TIMEOUT_SEC = int(os.environ.get("BROWSER_TIMEOUT_SEC", "180"))
+# The shared work-tracker (phase 32). Its key arrives per beat in the environment; it is
+# never baked into the image. Empty = this project has no workspace, and `ws` stays hidden
+# rather than being offered and then failing.
+WORKSPACE_API_KEY = os.environ.get("WORKSPACE_API_KEY", "")
+# Every skill directory we hand Pi explicitly. A LIST, not one path: phase 31 shipped one
+# skill and hardcoded it, and phase 32's second skill would have silently replaced it.
+PI_SKILLS = [s for s in os.environ.get(
+    "PI_SKILLS_DIRS",
+    "/app/skills/browser-verify,/app/skills/workspace").split(",") if s.strip()]
 
 # House rule: never slurp a file into RAM without a cap.
 FILE_CAP = 200 * 1024
@@ -485,6 +493,17 @@ def build_grounding(docs: str, context: dict, survey: str, app_url: str = "") ->
         "loaded in a browser, and a beat that ships a page which is broken for a user is "
         "recorded as a failure too. So the bar is not 'it looks right' — it is 'this boots, "
         "and a person can use it'.\n"
+        # The shared work-tracker (phase 32). Mentioned HERE as well as in its skill, because
+        # the single most valuable moment to use it is the one the agent is in right now:
+        # mid-task, having just discovered something the next assistant will need.
+        + ("\n**`ws` — the project's shared workspace.** This container is deleted when the "
+           "beat ends; `ws` is the only memory that survives it, and it is shared with every "
+           "other assistant on this project and with the owner. `ws list` before you start "
+           "(someone may already have filed, or be working on, what you are about to do), "
+           "and record what you did, found or decided before you finish: `ws new --kind bug "
+           "--title '...' --body '...'`, `ws update <id> --status done`, `ws comment <id> "
+           "'...'`. `ws --help` and the `workspace` skill have the rest.\n"
+           if WORKSPACE_API_KEY else "")
         + ("\n" + rules + "\n" if rules else ""))
     return "\n\n---\n\n".join(out)
 
@@ -560,7 +579,7 @@ def _on_pi_event(ev: dict, seen: dict) -> None:
         activity("phase", "✓", "coding agent finished", flush=True)
 
 
-def run_pi(task: str, grounding: str, app_url: str = "") -> dict:
+def run_pi(task: str, grounding: str, app_url: str = "", assistant_name: str = "") -> dict:
     """Run ONE non-interactive Pi session over the checkout, STREAMING its events out.
 
     `--mode json` (not `-p`) is what makes the /builder pane live: Pi writes one JSON event
@@ -580,13 +599,13 @@ def run_pi(task: str, grounding: str, app_url: str = "") -> dict:
                           same reasoning, for discovery of anything outside this image
       --no-context-files  AGENTS.md / CLAUDE.md discovery off: WE decide the grounding
                           (the project's real docs), it is not scavenged from the tree
-      --skill <dir>       the ONE skill we ship: `browser-verify`, which tells the agent it
-                          has a real browser (`mikeweb`) and when to use it. This is Pi's own
-                          idiomatic mechanism (the Agent Skills spec), and it survives
-                          `--no-skills` by design — verified in Pi 0.84.2's resource-loader:
-                          `--no-skills` drops DISCOVERED skills but still merges explicit
-                          `--skill` paths. So the agent gets our tool and nothing the
-                          LLM-written repository might try to hand it.
+      --skill <dir>       the skills we ship, one flag each: `browser-verify` (the agent has
+                          a real browser, `mikeweb`) and `workspace` (the shared work-tracker,
+                          `ws`). This is Pi's own idiomatic mechanism (the Agent Skills spec),
+                          and it survives `--no-skills` by design — verified in Pi 0.84.2's
+                          resource-loader: `--no-skills` drops DISCOVERED skills but still
+                          merges explicit `--skill` paths. So the agent gets our tools and
+                          nothing the LLM-written repository might try to hand it.
       --append-system-prompt  the grounding block, appended to Pi's own coding prompt so its
                           tool instructions stay intact
     A hard wall-clock timeout wraps the lot, because Pi has no step or turn cap of its own
@@ -602,13 +621,23 @@ def run_pi(task: str, grounding: str, app_url: str = "") -> dict:
         "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
         "--model", PI_MODEL,
     ]
-    if os.path.isdir(PI_SKILLS):
-        cmd += ["--skill", PI_SKILLS]
+    for skill_dir in PI_SKILLS:
+        # The workspace skill is only offered when the key to use it actually arrived. A
+        # skill that tells an agent to run a tool that will fail is worse than no skill.
+        if skill_dir.endswith("/workspace") and not WORKSPACE_API_KEY:
+            continue
+        if os.path.isdir(skill_dir):
+            cmd += ["--skill", skill_dir]
     cmd += ["--append-system-prompt", prompt_path, task]
     env = {**os.environ, "HOME": "/tmp", "PI_CODING_AGENT_DIR": PI_DIR,
            "ASSISTANT_TOKEN": TOKEN, "BEAT_ID": BEAT_ID,
            # so `mikeweb check` with no argument means "my own app"
            "MIKEWEB_APP_URL": app_url or "",
+           # `ws` reads these: the shared key, and the assistant's own name so the tracker
+           # attributes a change to "Ada", not to "an agent".
+           "WORKSPACE_API_KEY": WORKSPACE_API_KEY,
+           "PROJECT_ID": PROJECT_ID,
+           "ASSISTANT_NAME": assistant_name or "",
            "PI_OFFLINE": "1", "PI_TELEMETRY": "0", "NO_COLOR": "1"}
     t0 = time.monotonic()
     seen: dict = {}
@@ -1001,7 +1030,8 @@ def act_code(action: dict, context: dict, docs: str, survey: str) -> dict:
     # Where the repo stood BEFORE Pi ran. This — not the dirtiness of the tree — is what
     # tells us whether the beat produced anything, because Pi commits and pushes directly.
     head_before = current_sha()
-    pi = run_pi(task, grounding, app_url)
+    pi = run_pi(task, grounding, app_url,
+                assistant_name=str(((context or {}).get("assistant") or {}).get("name") or ""))
     log(f"code: Pi exited rc={pi['rc']} after {pi['seconds']}s, {pi['tools']} tool call(s)")
     tail = pi["output"][-1200:]
 
