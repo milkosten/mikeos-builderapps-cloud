@@ -41,10 +41,10 @@ exactly the 5 chips a real user would click:
 | 1 | URL shortener + analytics | `iukghl` (run 34) | yes | **done** — 12/12 features, 0 skipped, ~28 min | **PASS** — created `/mikecamp1` in the UI, followed the redirect (landed on wikipedia), reloaded the dashboard: row persisted with `clicks=1`; `/links/4` stats page renders totals + 30-day chart + the recent-click row; `/health` `{"status":"ok","db":"ok","redis":"ok"}`; zero console/network errors | **none** (unattended) |
 | 2 | Team standup + digest | `3lq510` (run 35) | yes | **done** — 12/12 features, 0 skipped, ~22 min | **PASS (with a caveat)** — registered a member, posted yesterday/today/blockers, reloaded: the board renders my entry server-side; `POST /api/digests/generate` produces a correct digest of both members. Caveat: the digest has **no page** — it exists only as an API. `/health` green, zero console/network errors | **none** (unattended) |
 | 3 | Expense tracker + chart + CSV | `cj1qbm` (run 36) | yes | **done** — 12/12 features, 0 skipped, ~18 min | **PASS** — registered, added a $123.45 Dining expense (`MIKECAMP3-COFFEE`), reloaded: the row, the *Spending by category* SVG bar chart and the month total all render from the server; `←/→` month nav works; `GET /api/export.csv?month=2026-08` returns real CSV (`2026-08-14,Dining,123.45,MIKECAMP3-COFFEE`); `/health` green, zero console errors | **none** (unattended) |
-| 4 | Changelog + admin + RSS | — | — | — | — | — |
+| 4 | Changelog + admin + RSS | `xvynod` (run 37) — **FAILED**<br>`sgj9go` (run 38) — **FAILED** | yes | both reported `done` | **FAIL x2.** `xvynod`: `/admin` and `/rss.xml` both 404 — the admin editor and the RSS feed, 2 of the 3 things the prompt asked for, were never built while the run said "12 of 12 features built". `sgj9go`: `/admin` and `/feed.xml` work, but the PUBLIC changelog at `/` served the builder's own *"Your app is being built"* placeholder to every visitor | **fix 4** (backlog truncation) and **fix 5** (build placeholder shadowing `/`) |
 | 5 | Job board + applications | — | — | — | — | — |
 
-**Status: 3 / 5**
+**Status: 3 / 5**  (app 4 has failed twice; two pipeline fixes shipped, third attempt pending)
 
 ## Pipeline fixes made during the campaign
 (append: symptom → root cause → fix → commit)
@@ -88,6 +88,38 @@ exactly the 5 chips a real user would click:
   show).
 - **Commit:** `566fd11`.
 
+### 4. The backlog was TRUNCATED, so the last features were never built — **a lost build**
+- **Symptom (app 4 attempt 1, `xvynod`):** run `done`, `finalize` = *"project live — 12 of 12
+  features built"*, `/health` green — and `GET /admin` -> **404**, `GET /rss.xml` -> **404**. Logging
+  in at `/admin/login` succeeds and redirects to an `/admin` that does not exist. The prompt was
+  "a public changelog / release-notes site **with an admin editor and RSS feed**".
+- **Root cause:** `TECH_PLAN_ASK` asked the model for *"6-14 tasks"*; `pipeline._MAX_FEATURES` was
+  **12**. The model wrote 14, `parse_backlog` sliced to the cap, and items 13-14 vanished with no
+  log line, no event, no warning. Item 14 was literally *"Frontend `/admin` editor page … then
+  `GET /rss.xml` feed generation"*. The "12 of 12" summary counted the ALREADY-truncated backlog,
+  so the run looked complete.
+- **Fix:** `backlog.MAX_FEATURES` is now the single source of truth — the prompt quotes it and the
+  pipeline imports it, so they cannot drift again. The cap now **folds** the overflow into the last
+  step instead of dropping it, and the step log reports "(N planned; the last K folded)". The prompt
+  also gained the rule this taught: the backlog IS the build, so every page under `## Pages` needs
+  its own item and scope is cut in the Data Model/Routes, never in the Pages.
+- **Commit:** `9925b6c` (+ `tests/test_backlog.py`).
+
+### 5. The finished app still served the *"your app is being built"* placeholder
+- **Symptom (app 4 attempt 2, `sgj9go`):** 14/14 features built, `/health` green, `/admin` and
+  `/feed.xml` both working — and the **public changelog at `/`**, the entire product, rendered the
+  builder's holding page to every visitor.
+- **Root cause:** the template ships `public/index.html` as a friendly "being built" page, and
+  `server.js` mounts `express.static("public")` **before** the routes. This app renders its home
+  page server-side (`app.get("/")`), so the untouched holding page shadowed it permanently. Nothing
+  in the pipeline ever looks at `/` — the health gate reads `/health`, `finalize` counts backlog
+  items.
+- **Fix:** at `final_deploy` the holding page is inspected. *shadowing* (the app has its own `/`)
+  -> delete it, it has done its job. *only* (nothing serves `/` at all) -> **fail the run loudly**,
+  because shipping a placeholder as "live" is precisely the silent-success failure the house rules
+  exist to prevent. An app whose frontend the agent actually wrote is untouched.
+- **Commit:** `4439efb` (+ `tests/test_placeholder.py`).
+
 ### Observations that did NOT need a fix
 - **App 1, `runtime_qa` reported `live-with-warnings`** — the critic claimed the
   "create link and verify on detail page" flow was broken (`/links/:id` renders "Link not found").
@@ -99,4 +131,9 @@ exactly the 5 chips a real user would click:
   in `public/` links to them, so a user cannot reach the feature. The primary flow (post standup →
   board renders it → survives reload) is fully working, so this is scored a pass, but it is a real
   gap: a requirement stated in the prompt landed backend-only. Worth a planner fix if it recurs
-  (not fixed mid-campaign — it is a codegen-quality issue, not a build failure).
+  (not fixed mid-campaign — it is a codegen-quality issue, not a build failure). **App 4's two
+  failures were the same disease in a fatal form**, and fixes 4 and 5 attack it directly.
+- **QA cannot authenticate as an admin.** On `xvynod` all three seeded flows returned 401 because
+  the app has no public registration — only an admin login. Semantic QA can seed an app that lets
+  it register, but not one with a bootstrapped admin account. That is a real blind spot; it produced
+  warnings rather than a wrong verdict, so it was left alone during the campaign.
