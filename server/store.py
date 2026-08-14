@@ -236,6 +236,69 @@ async def finish_deployment(dep_id: int, status: str, health: str = "") -> None:
         raise RuntimeError(f"finish_deployment affected {res!r} for {dep_id}")
 
 
+# ---- repair episodes (phase 31) -------------------------------------------
+async def open_repair(project_id: str) -> Optional[dict]:
+    """The repair episode currently running for this project, if any."""
+    row = await pool().fetchrow(
+        "SELECT * FROM builderapps.deploy_repairs "
+        "WHERE project_id=$1 AND status='open'", project_id)
+    return dict(row) if row else None
+
+
+async def record_repair_failure(project_id: str, *, assistant_id: Optional[int],
+                                failed_sha: str, stage: str, signature: str) -> dict:
+    """Fold one red deploy into this project's repair episode and return the decision inputs.
+
+    Returns {episode_id, attempts, previous_signature, repeat, first, origin_sha}. It decides
+    nothing about what to do next — the caller applies the bounds — but it is the single place
+    the counting happens, so the budget cannot be double-read.
+    """
+    prev = await open_repair(project_id)
+    if not prev:
+        row = await pool().fetchrow(
+            "INSERT INTO builderapps.deploy_repairs"
+            "(project_id,assistant_id,origin_sha,last_sha,stage,signature,attempts,status) "
+            "VALUES ($1,$2,$3,$3,$4,$5,0,'open') RETURNING *",
+            project_id, assistant_id, (failed_sha or "")[:64], stage[:32], signature[:400])
+        return {"episode_id": int(row["id"]), "attempts": 0, "previous_signature": "",
+                "repeat": False, "first": True, "origin_sha": str(row["origin_sha"] or "")}
+    row = await pool().fetchrow(
+        "UPDATE builderapps.deploy_repairs SET last_sha=$2, stage=$3, signature=$4, "
+        "updated_at=now() WHERE id=$1 RETURNING *",
+        int(prev["id"]), (failed_sha or "")[:64], stage[:32], signature[:400])
+    return {"episode_id": int(row["id"]), "attempts": int(prev["attempts"]),
+            "previous_signature": str(prev["signature"] or ""),
+            "repeat": str(prev["signature"] or "") == signature,
+            "first": False, "origin_sha": str(prev["origin_sha"] or "")}
+
+
+async def count_repair_attempt(episode_id: int) -> int:
+    """A repair beat is about to be dispatched — charge it to the episode's budget."""
+    n = await pool().fetchval(
+        "UPDATE builderapps.deploy_repairs SET attempts=attempts+1, updated_at=now() "
+        "WHERE id=$1 RETURNING attempts", episode_id)
+    if n is None:
+        raise RuntimeError(f"count_repair_attempt: no episode {episode_id}")
+    return int(n)
+
+
+async def close_repair(project_id: str, status: str = "resolved", detail: str = "") -> bool:
+    """Close the open episode. Called on a GREEN deploy (resolved) and on escalation."""
+    res = await pool().execute(
+        "UPDATE builderapps.deploy_repairs SET status=$2, detail=$3, updated_at=now() "
+        "WHERE project_id=$1 AND status='open'",
+        project_id, status[:16], (detail or "")[:2000])
+    return res.endswith("UPDATE 1")
+
+
+async def recent_repairs(project_id: str, limit: int = 5) -> list[dict]:
+    rows = await pool().fetch(
+        "SELECT id,origin_sha,last_sha,stage,attempts,status,detail,created_at,updated_at "
+        "FROM builderapps.deploy_repairs WHERE project_id=$1 "
+        "ORDER BY created_at DESC LIMIT $2", project_id, max(1, min(int(limit), 50)))
+    return [dict(r) for r in rows]
+
+
 # ---- pipeline runs / steps ------------------------------------------------
 async def create_run(project_id: str, kind: str, request: str, total_steps: int,
                      assistant_id: Optional[int] = None,

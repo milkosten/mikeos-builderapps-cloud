@@ -289,7 +289,15 @@ async def execute_beat(assistant: dict, beat_id: int, trigger_kind: str) -> int:
 async def _finish_if_running(beat_id: int, status: str, *, log: str = "",
                              duration_ms: int = 0) -> None:
     """Close a beat only if the container did not already report a richer record."""
+    from server import browser_proxy               # local import: avoid an import cycle
     from server.db import pool
+    # Whatever happens to the beat row, a dead container's browser sessions are released.
+    # This is the path a CRASHED beat takes — it never reaches `/api/assistant/beat`, so
+    # without this the OOM-kill case is exactly the one that leaks into the shared pool.
+    try:
+        await browser_proxy.close_beat_sessions(beat_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("browser cleanup failed for beat %s", beat_id, exc_info=True)
     cur = await pool().fetchval(
         "SELECT status FROM builderapps.assistant_beats WHERE id=$1", beat_id)
     if cur != "running":
@@ -494,8 +502,11 @@ def _action_menu(assistant: dict) -> str:
         lines.append('- {"type":"comment","text":"..."} — post a finding or proposal into the '
                      "project thread the owner reads.")
     if A.has(assistant, "run_qa"):
-        lines.append('- {"type":"run_qa"} — drive the LIVE app through a real browser and '
-                     "record what actually happens.")
+        lines.append('- {"type":"run_qa"} — load the LIVE app in a REAL BROWSER, click '
+                     "through it, and report the rendered page, the JS console errors and "
+                     "the failed requests. This sees what curl and /health cannot: an empty "
+                     "list, a dead button, a blank screen. Use it before concluding anything "
+                     "about whether a page works.")
     if A.has(assistant, "edit_code"):
         # ONE coding action, not a file-by-file protocol. The editing is done by Pi, an
         # open-source coding agent running in this assistant's own container with the
@@ -558,6 +569,16 @@ async def reason(assistant: dict, context: dict, workspace_report: str = "",
            "checked out — it reads and edits the files itself. Your job is to pick the ONE "
            "most valuable change and brief it precisely.\n\n"
            if A.has(assistant, "edit_code") else "")
+        # The single most important line for an assistant that has one: you can SEE the page.
+        # Without this, a model reasons from deploy records and invents a cause that fits.
+        + ("**You have a real browser.** Use it to SEE the page before you claim anything "
+           "about whether it works — an HTTP 200 and a green health check prove a process "
+           "answered, not that a user can use it. A previous assistant here diagnosed a "
+           "broken site as a certificate problem at the platform ingress when the real cause "
+           "was a header it had added itself; it had no browser, so it guessed. Your coding "
+           "agent has the `mikeweb` command for this mid-task, and the page is loaded in a "
+           "browser automatically after anything you ship.\n\n"
+           if A.has(assistant, "run_qa") else "")
         # The contracts belong here too, not only in the coding agent's grounding: the
         # decision to "add clickjacking protection" is taken HERE, and a brief that asks for
         # the wrong header produces a correct-looking change that breaks the owner's preview.

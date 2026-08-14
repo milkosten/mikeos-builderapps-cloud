@@ -71,6 +71,25 @@ RUN useradd -r -u 10001 -m -d /home/assistant -s /bin/bash assistant \
 COPY beat.py /app/beat.py
 RUN chmod 0555 /app/beat.py
 
+# THE BROWSER. `curl` in this image proves a process answered; `mikeweb` proves the page
+# actually works — it drives a real headless Chrome and reports rendered text, JS console
+# errors and failed requests. Deliberately in addition to curl, never instead of it.
+#
+# NO CREDENTIAL COMES WITH IT. chrome-pool's shared Basic auth stays on the control plane
+# (`server/browser_proxy.py`); this CLI authenticates with the same per-assistant `asst_…`
+# token the container already holds, exactly like Pi does for the model. So an agent gets a
+# browser without ever holding the key to the estate's browser fleet.
+COPY mikeweb /usr/local/bin/mikeweb
+RUN chmod 0555 /usr/local/bin/mikeweb
+
+# The skill that tells the coding agent this tool exists and when to reach for it. Pi's own
+# mechanism (the Agent Skills spec: a directory with SKILL.md + frontmatter), loaded by
+# beat.py with an explicit `--skill`. It lives in the IMAGE, not in the repo: `--no-skills`
+# still disables discovery from the checkout, so an LLM-written repository cannot introduce a
+# skill that configures the agent editing it next.
+COPY skills /app/skills
+RUN chmod -R a=rX /app/skills
+
 # git refuses to operate in a directory it does not consider owned by the caller; the
 # bind-mounted /workspace is chowned to 10001 by the control plane, but make it explicit so a
 # host with a different mount uid degrades to a clear message rather than a cryptic git error.

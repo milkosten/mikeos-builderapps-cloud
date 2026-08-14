@@ -30,6 +30,30 @@ def _auth() -> tuple[str, str]:
     return (CHROME_POOL_USER, CHROME_POOL_PASS)
 
 
+async def _close(sid: str) -> bool:
+    """Close a chrome-pool session. **`DELETE /session/{id}` — there is no `.../close`.**
+
+    Every caller in this file used to `POST /session/{sid}/close`, which chrome-pool answers
+    with a 404 ("Cannot POST"), inside a bare `except: pass`. So no session this platform ever
+    opened was actually closed: they all sat there until chrome-pool's own 30-minute TTL
+    collected them, and the shared pool was found holding 11 live sessions with nobody using
+    it. A cleanup that silently does nothing is worse than no cleanup, because it stops
+    anyone from looking.
+    """
+    if not sid:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15, verify=False, auth=_auth()) as c:
+            r = await c.delete(f"{CHROME_POOL_URL}/session/{sid}")
+        if r.status_code >= 400 and r.status_code != 404:   # 404 = already gone; fine
+            logger.info("chrome-pool: close of %s returned %s", sid, r.status_code)
+            return False
+        return True
+    except Exception as e:  # noqa: BLE001 — a failed close must never raise into a caller
+        logger.info("chrome-pool: could not close session %s: %s", sid, e)
+        return False
+
+
 def _downscale_jpeg(png_or_jpeg: bytes, width: int = 320) -> Optional[str]:
     """Downscale image bytes to a small JPEG data: URI. Falls back to the raw bytes as a
     data: URI (best-guess mime) if Pillow is unavailable."""
@@ -82,11 +106,7 @@ async def screenshot_data_uri(url: str, width: int = 320) -> Optional[str]:
         return None
     finally:
         if sid:
-            try:
-                async with httpx.AsyncClient(timeout=15, verify=False, auth=_auth()) as c:
-                    await c.post(f"{CHROME_POOL_URL}/session/{sid}/close")
-            except Exception:
-                pass
+            await _close(sid)
 
 
 async def fetch_image_data_uri(keywords: str, w: int = 1200, h: int = 630,
@@ -249,11 +269,7 @@ async def qa_run(url: str, exercise: bool = True,
         return result
     finally:
         if sid:
-            try:
-                async with httpx.AsyncClient(timeout=15, verify=False, auth=_auth()) as c:
-                    await c.post(f"{CHROME_POOL_URL}/session/{sid}/close")
-            except Exception:
-                pass
+            await _close(sid)
 
 
 def _parse_json_list(val) -> List[str]:
@@ -300,11 +316,7 @@ async def eval_js(url: str, expression: str, navigate: bool = True,
         return None
     finally:
         if sid:
-            try:
-                async with httpx.AsyncClient(timeout=15, verify=False, auth=_auth()) as c:
-                    await c.post(f"{CHROME_POOL_URL}/session/{sid}/close")
-            except Exception:
-                pass
+            await _close(sid)
 
 
 async def console_errors(url: str, exercise: bool = True,
@@ -353,11 +365,7 @@ async def console_errors(url: str, exercise: bool = True,
         return []
     finally:
         if sid:
-            try:
-                async with httpx.AsyncClient(timeout=15, verify=False, auth=_auth()) as c:
-                    await c.post(f"{CHROME_POOL_URL}/session/{sid}/close")
-            except Exception:
-                pass
+            await _close(sid)
     # unique, order-preserving
     seen = set()
     uniq: List[str] = []

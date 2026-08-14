@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""mikeweb — a real browser, on the command line, for the agent working in this container.
+
+    curl tells you a process answered. mikeweb tells you what a user SEES.
+
+This is the CLI half of the browser tool; the other half is `server/browser_proxy.py` on the
+control plane, which holds chrome-pool's credential so this container never does. Everything
+here authenticates with the per-assistant `asst_…` token already in the environment.
+
+Design notes, because this is a tool an LLM has to use correctly on the first try:
+
+* **A sticky session.** `mikeweb goto <url>` opens a session if there is not one already and
+  remembers it in /tmp, so the agent never has to thread a session id through five commands.
+  `mikeweb close` ends it. `mikeweb check <url>` does the whole open->look->close in one.
+* **Text out by default, `--json` when asked.** The default output is what a human (or a
+  model) reads; scripts get `--json`.
+* **A non-zero exit means the page is broken**, not that the tool failed. Tool failures exit
+  2. That distinction is the whole point: `mikeweb check` is usable as a gate.
+* **Console errors are collected for you.** The control plane installs the collectors after
+  every navigation, so `mikeweb console` works without any setup — an agent that had to
+  instrument the page itself would forget and then report a clean run.
+
+Stdlib only: this must work in a container with no pip install.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+CONTROL_URL = os.environ.get("CONTROL_URL", "").rstrip("/")
+TOKEN = os.environ.get("ASSISTANT_TOKEN", "")
+BEAT_ID = os.environ.get("BEAT_ID", "")
+# The assistant's own app. Set by the beat program so `mikeweb check` needs no argument.
+APP_URL = os.environ.get("MIKEWEB_APP_URL", "")
+SESSION_FILE = os.environ.get("MIKEWEB_SESSION_FILE", "/tmp/mikeweb.session")
+
+BASE = "/api/assistant/browser"
+
+OK, BROKEN, TOOL_ERROR = 0, 1, 2
+
+
+def die(msg: str, code: int = TOOL_ERROR):
+    print("mikeweb: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def call(method: str, path: str, body=None, timeout: float = 90.0):
+    if not CONTROL_URL or not TOKEN:
+        die("CONTROL_URL / ASSISTANT_TOKEN are not set — this only runs inside a beat")
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        CONTROL_URL + path, data=data, method=method,
+        headers={"X-Assistant-Token": TOKEN, "X-Beat-Id": BEAT_ID,
+                 "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(detail).get("detail") or detail
+        except Exception:
+            pass
+        die(f"{str(detail)[:400]}")
+    except Exception as e:  # noqa: BLE001
+        die(f"could not reach the control plane: {str(e)[:200]}")
+    return json.loads(raw) if raw.strip() else {}
+
+
+# --- the sticky session ----------------------------------------------------
+def saved_session() -> str:
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def save_session(sid: str) -> None:
+    try:
+        with open(SESSION_FILE, "w", encoding="utf-8") as f:
+            f.write(sid or "")
+    except OSError:
+        pass
+
+
+def forget_session() -> None:
+    try:
+        os.unlink(SESSION_FILE)
+    except OSError:
+        pass
+
+
+def session(explicit: str = "", create: bool = True) -> str:
+    sid = (explicit or saved_session()).strip()
+    if sid:
+        return sid
+    if not create:
+        die("no browser session is open — run `mikeweb goto <url>` first")
+    res = call("POST", f"{BASE}/session", {})
+    sid = str(res.get("session") or "")
+    if not sid:
+        die("the control plane opened no session")
+    save_session(sid)
+    return sid
+
+
+def do_goto(url: str, sid: str = "") -> dict:
+    """Navigate, and if the session had expired under a long coding turn, open a new one and
+    retry ONCE. A tool that answers "no such session" teaches an agent to stop using it."""
+    sid = session(sid)
+    try:
+        return call("POST", f"{BASE}/session/{sid}/navigate", {"url": url}, timeout=120)
+    except SystemExit:
+        # Most likely the session expired or was reaped. Open a fresh one and retry ONCE.
+        forget_session()
+        sid = session("")
+        return call("POST", f"{BASE}/session/{sid}/navigate", {"url": url}, timeout=120)
+
+
+def render_console(c: dict) -> tuple[str, bool]:
+    errs = c.get("console_errors") or []
+    net = c.get("failed_requests") or []
+    lines = []
+    if errs:
+        lines.append(f"JS console errors ({len(errs)}):")
+        lines += [f"  ! {e}" for e in errs]
+    if net:
+        lines.append(f"Failed requests ({len(net)}):")
+        lines += [f"  ! {n}" for n in net]
+    if not errs and not net:
+        if c.get("instrumented"):
+            lines.append("No JS errors and no failed requests.")
+        else:
+            # Never report a pass you did not observe.
+            lines.append("No errors recorded — BUT the collectors were not installed on this "
+                         "page, so this is 'nothing was seen', not 'nothing happened'.")
+    return "\n".join(lines), bool(errs or net)
+
+
+def cmd_check(args) -> int:
+    """open -> navigate -> exercise -> read the page + the console -> close. The one command
+    an agent should use if it only ever uses one."""
+    url = args.url or APP_URL
+    if not url:
+        die("no url, and MIKEWEB_APP_URL is not set — `mikeweb check <url>`")
+    sid = session("")
+    broken = False
+    out: dict = {"url": url}
+    try:
+        nav = call("POST", f"{BASE}/session/{sid}/navigate", {"url": url}, timeout=120)
+        out["loaded"] = nav.get("url") or url
+        if not args.no_exercise:
+            try:
+                out["exercised"] = call("POST", f"{BASE}/session/{sid}/exercise", {},
+                                        timeout=90).get("clicked")
+            except SystemExit:
+                out["exercised"] = None
+        text = call("GET", f"{BASE}/session/{sid}/text", timeout=90).get("text") or ""
+        out["text"] = text[:args.max_chars]
+        con = call("GET", f"{BASE}/session/{sid}/console", timeout=90)
+        out["console_errors"] = con.get("console_errors") or []
+        out["failed_requests"] = con.get("failed_requests") or []
+        out["instrumented"] = con.get("instrumented")
+        console_txt, broken = render_console(con)
+        # A page that rendered NOTHING is broken even with a clean console — that is the
+        # "HTTP 200, blank screen" case, and it is the one people ship by accident.
+        if len(text.strip()) < 40:
+            broken = True
+            out["empty"] = True
+    finally:
+        call("DELETE", f"{BASE}/session/{sid}", timeout=30)
+        forget_session()
+    out["ok"] = not broken
+    if args.json:
+        print(json.dumps(out, indent=2)[:200000])
+        return BROKEN if broken else OK
+    print(f"URL       {out.get('loaded')}")
+    print(f"VERDICT   {'BROKEN IN A BROWSER' if broken else 'renders and runs clean'}")
+    if out.get("empty"):
+        print("          the page rendered almost no text — a blank screen for a user")
+    print("")
+    print(console_txt)
+    print("")
+    print("--- what the page actually renders ---")
+    print(out["text"] or "(nothing)")
+    return BROKEN if broken else OK
+
+
+def cmd_open(args) -> int:
+    forget_session()
+    sid = session("")
+    print(sid)
+    if args.url:
+        do_goto(args.url, sid)
+        print(f"loaded {args.url}")
+    return OK
+
+
+def cmd_goto(args) -> int:
+    res = do_goto(args.url)
+    print(f"loaded {res.get('url') or args.url}")
+    return OK
+
+
+def cmd_text(args) -> int:
+    sid = session("", create=False)
+    t = call("GET", f"{BASE}/session/{sid}/text", timeout=90).get("text") or ""
+    print(t[:args.max_chars] or "(the page rendered no text)")
+    return OK
+
+
+def cmd_eval(args) -> int:
+    sid = session("", create=False)
+    v = call("POST", f"{BASE}/session/{sid}/eval", {"expression": args.expression}).get("value")
+    print(json.dumps(v) if args.json else (v if isinstance(v, str) else json.dumps(v)))
+    return OK
+
+
+def cmd_click(args) -> int:
+    sid = session("", create=False)
+    call("POST", f"{BASE}/session/{sid}/click", {"selector": args.selector})
+    print(f"clicked {args.selector}")
+    return OK
+
+
+def cmd_type(args) -> int:
+    sid = session("", create=False)
+    call("POST", f"{BASE}/session/{sid}/type", {"selector": args.selector, "text": args.text})
+    print(f"typed into {args.selector}")
+    return OK
+
+
+def cmd_console(args) -> int:
+    sid = session("", create=False)
+    con = call("GET", f"{BASE}/session/{sid}/console", timeout=90)
+    if args.json:
+        print(json.dumps(con, indent=2))
+    else:
+        txt, _ = render_console(con)
+        print(txt)
+    return BROKEN if (con.get("console_errors") or con.get("failed_requests")) else OK
+
+
+def cmd_screenshot(args) -> int:
+    sid = session("", create=False)
+    uri = call("GET", f"{BASE}/session/{sid}/screenshot", timeout=120).get("data_uri") or ""
+    if not uri:
+        die("no screenshot came back")
+    if args.out:
+        import base64
+        raw = base64.b64decode(uri.split(",", 1)[1])
+        with open(args.out, "wb") as f:
+            f.write(raw)
+        print(f"wrote {args.out} ({len(raw)} bytes)")
+    else:
+        print(uri[:200] + f"... ({len(uri)} chars of data: URI)")
+    return OK
+
+
+def cmd_close(args) -> int:
+    if args.all:
+        n = call("POST", f"{BASE}/close-all", {}).get("closed")
+        forget_session()
+        print(f"closed {n} session(s)")
+        return OK
+    sid = saved_session()
+    if not sid:
+        print("nothing open")
+        return OK
+    call("DELETE", f"{BASE}/session/{sid}", timeout=30)
+    forget_session()
+    print("closed")
+    return OK
+
+
+EPILOG = """\
+Typical use — verify a change you just made, before you claim it works:
+
+  mikeweb check                      # loads YOUR app, clicks around, reports what broke
+  mikeweb check https://<id>.builderapps.osmike.com/notes
+
+Step by step, when you need to drive a flow:
+
+  mikeweb goto https://<id>.builderapps.osmike.com/
+  mikeweb type '#title' 'a new note'
+  mikeweb click 'button[type=submit]'
+  mikeweb text                       # what the page shows NOW
+  mikeweb eval 'document.querySelectorAll("li.note").length'
+  mikeweb console                    # JS errors + failed requests (exit 1 if any)
+  mikeweb close
+
+Exit codes:  0 = fine   1 = the page is broken   2 = the tool could not run
+
+You may only browse your OWN project's site. Anything else is refused by the control plane,
+which holds the browser credential — you do not have it and do not need it.
+"""
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="mikeweb",
+        description="Load your app in a REAL browser and see what a user would see. "
+                    "curl proves a process answered; this proves the page works.",
+        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("check", help="THE ONE: load a page, click around, report what broke")
+    c.add_argument("url", nargs="?", default="", help="defaults to your own app")
+    c.add_argument("--no-exercise", action="store_true", help="do not click anything")
+    c.add_argument("--max-chars", type=int, default=6000)
+    c.set_defaults(fn=cmd_check)
+
+    o = sub.add_parser("open", help="open a browser session")
+    o.add_argument("url", nargs="?", default="")
+    o.set_defaults(fn=cmd_open)
+
+    g = sub.add_parser("goto", help="load a URL in the current session")
+    g.add_argument("url")
+    g.set_defaults(fn=cmd_goto)
+
+    t = sub.add_parser("text", help="the rendered page as text (what a user reads)")
+    t.add_argument("--max-chars", type=int, default=8000)
+    t.set_defaults(fn=cmd_text)
+
+    e = sub.add_parser("eval", help="evaluate JS in the page and print the value")
+    e.add_argument("expression")
+    e.set_defaults(fn=cmd_eval)
+
+    k = sub.add_parser("click", help="click a CSS selector")
+    k.add_argument("selector")
+    k.set_defaults(fn=cmd_click)
+
+    y = sub.add_parser("type", help="type text into a CSS selector")
+    y.add_argument("selector")
+    y.add_argument("text")
+    y.set_defaults(fn=cmd_type)
+
+    n = sub.add_parser("console", help="JS errors + failed requests (exit 1 if any)")
+    n.set_defaults(fn=cmd_console)
+
+    s = sub.add_parser("screenshot", help="a JPEG of the page")
+    s.add_argument("--out", default="")
+    s.set_defaults(fn=cmd_screenshot)
+
+    x = sub.add_parser("close", help="close the browser session")
+    x.add_argument("--all", action="store_true", help="close everything this beat opened")
+    x.set_defaults(fn=cmd_close)
+
+    # `--json` is a top-level flag, so it exists on every namespace; `--max-chars` only on the
+    # subcommands that print a page. Both are read unconditionally by some handlers.
+    args = p.parse_args()
+    if not hasattr(args, "max_chars"):
+        args.max_chars = 6000
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(TOOL_ERROR)

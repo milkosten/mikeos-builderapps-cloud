@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 from server import assistants as A
 from server import assistant_runtime as R
-from server import introspect, llm_proxy, store
+from server import browser_proxy, introspect, llm_proxy, store
 from server.identity import authenticate
 
 logger = logging.getLogger(__name__)
@@ -427,6 +427,14 @@ async def assistant_record_beat(body: BeatBody, request: Request,
     # it here so the beat's cost is the beat's whole cost, not just the part the container
     # happened to be told about.
     pi_cost = llm_proxy.forget_beat(beat_id)
+    # THE BACKSTOP FOR BROWSER SESSIONS. The beat closes its own, but a container that is
+    # OOM-killed or times out mid-navigation never gets to; chrome-pool is a shared fleet with
+    # a fixed number of Chromes, so a leak here is everyone else's outage. Closing at the one
+    # point every beat passes through means a leak needs BOTH the container and this to fail.
+    try:
+        await browser_proxy.close_beat_sessions(beat_id)
+    except Exception:  # noqa: BLE001 — never lose a beat record over a browser cleanup
+        logger.debug("browser session cleanup failed for beat %s", beat_id, exc_info=True)
     await A.finish_beat(beat_id, status=status, thought=body.thought,
                         actions=body.actions, log=body.log, tokens=body.tokens,
                         cost_usd=float(body.cost_usd or 0.0) + pi_cost,

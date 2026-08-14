@@ -21,8 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from server import (assistant_api, assistant_runtime, db, deployer, gitea, introspect,
-                    llm_proxy, naming, runner, store, workspace, usage)
+from server import (assistant_api, assistant_runtime, browser_proxy, db, deployer, gitea,
+                    introspect, llm_proxy, naming, runner, store, workspace, usage)
 from server.harness import pipeline
 from server.identity import authenticate, current_user
 
@@ -83,6 +83,12 @@ app.include_router(assistant_api.router)
 # what keeps the OpenRouter key OUT of an LLM-driven container while every token it spends
 # still lands in this project's usage accounting.
 app.include_router(llm_proxy.router)
+
+# The BROWSER an assistant sees the page with (phase 31). Same pattern, different credential:
+# chrome-pool's shared Basic auth stays here and the container authenticates with its own
+# `asst_…` token, so an agent gets to look at its app without ever holding the estate's key.
+# `curl` proves a process is up; only this proves a UI works.
+app.include_router(browser_proxy.router)
 
 _CORS_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS", "https://builderapps.osmike.com").split(",") if o.strip()]

@@ -62,6 +62,10 @@ PI_DIR = os.environ.get("PI_CODING_AGENT_DIR", "/tmp/pi/agent")
 PI_MODEL = os.environ.get("PI_MODEL", "builderapps/kimi-k3")
 PI_TIMEOUT_SEC = int(os.environ.get("PI_TIMEOUT_SEC", "780"))
 DEPLOY_WAIT_SEC = int(os.environ.get("DEPLOY_WAIT_SEC", "900"))
+# The browser tool baked into this image, and the skill that teaches Pi to reach for it.
+MIKEWEB = os.environ.get("MIKEWEB_BIN", "/usr/local/bin/mikeweb")
+PI_SKILLS = os.environ.get("PI_SKILLS_DIR", "/app/skills/browser-verify")
+BROWSER_TIMEOUT_SEC = int(os.environ.get("BROWSER_TIMEOUT_SEC", "180"))
 
 # House rule: never slurp a file into RAM without a cap.
 FILE_CAP = 200 * 1024
@@ -386,7 +390,7 @@ def write_pi_config() -> None:
         json.dump(cfg, f, indent=2)
 
 
-def build_grounding(docs: str, context: dict, survey: str) -> str:
+def build_grounding(docs: str, context: dict, survey: str, app_url: str = "") -> str:
     """The system-prompt preamble Pi gets, in Mike's order.
 
     docs (what the product is for) -> SOUL/role/capabilities (who is deciding) -> repo state
@@ -461,11 +465,26 @@ def build_grounding(docs: str, context: dict, survey: str) -> str:
         "rejected outright and your beat is wasted.\n"
         "- Re-read the files you edited and check the change is actually complete: the route "
         "exists, the page posts to it, the migration creates what the code queries, and every "
-        "column you SELECT is one the migration created.\n\n"
-        "The real verification is the health gate: your change is committed, built and "
-        "started for real, and if the app does not come up healthy it is rolled back "
-        "automatically and your beat is recorded as a failure. So the bar is not 'it looks "
-        "right' — it is 'this boots and works'.\n"
+        "column you SELECT is one the migration created.\n"
+        "- **`mikeweb check`** — you have a REAL BROWSER. Use it to SEE the currently live "
+        "page before you claim anything works. `curl` and `/health` prove a process answered; "
+        "only a browser shows you an empty list, a dead button, a JS error or a blank screen. "
+        "(An assistant here once blamed 'certificate provisioning at the ingress layer' for a "
+        "broken site whose real cause was a CSP header it had added itself — it had no "
+        "browser, so it guessed.) `mikeweb --help`, and the `browser-verify` skill, have the "
+        "details. It exits non-zero when the page is broken.\n"
+        + (f"- Your app is live at {app_url} — `mikeweb check` with no argument checks "
+           f"exactly that.\n" if app_url else "")
+        + "\nNote the ordering: the browser shows you the version that is live RIGHT NOW, "
+        "which is the code BEFORE your edit. Use it to understand the bug you were asked to "
+        "fix and to see the page you are changing — the version WITH your change is checked "
+        "automatically after it deploys.\n\n"
+        "The real verification is the health gate plus that browser check: your change is "
+        "committed, built and started for real, and if the app does not come up healthy it is "
+        "rolled back automatically and your beat is recorded as a failure. Then the page is "
+        "loaded in a browser, and a beat that ships a page which is broken for a user is "
+        "recorded as a failure too. So the bar is not 'it looks right' — it is 'this boots, "
+        "and a person can use it'.\n"
         + ("\n" + rules + "\n" if rules else ""))
     return "\n\n---\n\n".join(out)
 
@@ -541,7 +560,7 @@ def _on_pi_event(ev: dict, seen: dict) -> None:
         activity("phase", "✓", "coding agent finished", flush=True)
 
 
-def run_pi(task: str, grounding: str) -> dict:
+def run_pi(task: str, grounding: str, app_url: str = "") -> dict:
     """Run ONE non-interactive Pi session over the checkout, STREAMING its events out.
 
     `--mode json` (not `-p`) is what makes the /builder pane live: Pi writes one JSON event
@@ -561,6 +580,13 @@ def run_pi(task: str, grounding: str) -> dict:
                           same reasoning, for discovery of anything outside this image
       --no-context-files  AGENTS.md / CLAUDE.md discovery off: WE decide the grounding
                           (the project's real docs), it is not scavenged from the tree
+      --skill <dir>       the ONE skill we ship: `browser-verify`, which tells the agent it
+                          has a real browser (`mikeweb`) and when to use it. This is Pi's own
+                          idiomatic mechanism (the Agent Skills spec), and it survives
+                          `--no-skills` by design — verified in Pi 0.84.2's resource-loader:
+                          `--no-skills` drops DISCOVERED skills but still merges explicit
+                          `--skill` paths. So the agent gets our tool and nothing the
+                          LLM-written repository might try to hand it.
       --append-system-prompt  the grounding block, appended to Pi's own coding prompt so its
                           tool instructions stay intact
     A hard wall-clock timeout wraps the lot, because Pi has no step or turn cap of its own
@@ -575,11 +601,14 @@ def run_pi(task: str, grounding: str) -> dict:
         "pi", "--mode", "json", "--offline", "--no-session", "--no-approve",
         "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
         "--model", PI_MODEL,
-        "--append-system-prompt", prompt_path,
-        task,
     ]
+    if os.path.isdir(PI_SKILLS):
+        cmd += ["--skill", PI_SKILLS]
+    cmd += ["--append-system-prompt", prompt_path, task]
     env = {**os.environ, "HOME": "/tmp", "PI_CODING_AGENT_DIR": PI_DIR,
            "ASSISTANT_TOKEN": TOKEN, "BEAT_ID": BEAT_ID,
+           # so `mikeweb check` with no argument means "my own app"
+           "MIKEWEB_APP_URL": app_url or "",
            "PI_OFFLINE": "1", "PI_TELEMETRY": "0", "NO_COLOR": "1"}
     t0 = time.monotonic()
     seen: dict = {}
@@ -742,6 +771,75 @@ def gate_changes() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 3b. LOOK AT IT — the health gate is necessary, not sufficient
+# ---------------------------------------------------------------------------
+def browser_check(url: str, label: str = "") -> dict:
+    """Load the LIVE app in a real browser and report what a user would actually see.
+
+    THIS RUNS DETERMINISTICALLY, on every beat that shipped something — it is not a skill the
+    model has to remember to pick. That is the hard-won rule of this platform: a capability
+    that only fires when an LLM chooses it is a capability that mostly does not fire. The
+    coding agent ALSO has `mikeweb` and a skill telling it to use one mid-turn, but the beat
+    does not depend on that happening.
+
+    Why it exists at all: an assistant here once explained a broken site as "a certificate
+    provisioning issue at the platform ingress layer" while the real cause was a CSP header
+    it had added itself, blocking the preview iframe. Health was green throughout. A green
+    health gate says the process started; only a browser says the page works.
+    """
+    if not url:
+        return {"ok": False, "ran": False, "detail": "no app url to check"}
+    activity("phase", "🔎", f"opening {label or url} in a real browser to see what a user "
+                            f"sees", flush=True)
+    rc, out = sh([MIKEWEB, "--json", "check", url], cwd="/tmp",
+                 timeout=BROWSER_TIMEOUT_SEC)
+    if rc == 127:
+        return {"ok": False, "ran": False, "detail": "mikeweb is not installed in this image"}
+    data = {}
+    try:
+        data = json.loads(out[out.index("{"):out.rindex("}") + 1])
+    except Exception:  # noqa: BLE001 — a tool failure is reported, never fatal
+        pass
+    if not data:
+        activity("result", "✗", "the browser check could not run", redact(out)[-300:],
+                 ok=False, flush=True)
+        return {"ok": False, "ran": False, "detail": redact(out)[-300:]}
+    errors = data.get("console_errors") or []
+    failed = data.get("failed_requests") or []
+    empty = bool(data.get("empty"))
+    healthy = bool(data.get("ok"))
+    text = str(data.get("text") or "")
+    if healthy:
+        activity("result", "👁", f"browser check passed — the page renders "
+                                 f"({len(text)} chars of text) with no JS errors",
+                 text[:300], ok=True, flush=True)
+    else:
+        why = []
+        if empty:
+            why.append("the page rendered almost nothing (a blank screen for a user)")
+        if errors:
+            why.append(f"{len(errors)} JS console error(s)")
+        if failed:
+            why.append(f"{len(failed)} failed request(s)")
+        activity("result", "👁", "browser check FAILED — " + "; ".join(why),
+                 "\n".join([str(e) for e in (errors + failed)][:6])[:600],
+                 ok=False, flush=True)
+    return {"ok": healthy, "ran": True, "url": data.get("loaded") or url,
+            "console_errors": errors[:8], "failed_requests": failed[:8],
+            "rendered_chars": len(text), "blank": empty,
+            "rendered_text": text[:800]}
+
+
+def close_browser() -> None:
+    """Never leak a chrome-pool session. The control plane closes them again when the beat
+    record lands, but a shared browser fleet deserves both."""
+    try:
+        sh([MIKEWEB, "close", "--all"], cwd="/tmp", timeout=45)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------------------
 # 4. SHIP — commit, push, and ask the control plane to deploy HEAD
 # ---------------------------------------------------------------------------
 def commit_and_push(message: str) -> dict:
@@ -858,10 +956,11 @@ def act_code(action: dict, context: dict, docs: str, survey: str) -> dict:
     if not os.path.isdir(os.path.join(REPO, ".git")):
         return {"ok": False, "detail": "no checkout to work in"}
 
-    grounding = build_grounding(docs, context, survey)
+    app_url = ((context or {}).get("project") or {}).get("url") or ""
+    grounding = build_grounding(docs, context, survey, app_url)
     log(f"code: handing a {len(task)}-char task to Pi with a {len(grounding)}-char grounding")
     activity("phase", "🛠", f"starting on: {task[:160]}", flush=True)
-    pi = run_pi(task, grounding)
+    pi = run_pi(task, grounding, app_url)
     log(f"code: Pi exited rc={pi['rc']} after {pi['seconds']}s, {pi['tools']} tool call(s)")
     tail = pi["output"][-1200:]
 
@@ -888,12 +987,34 @@ def act_code(action: dict, context: dict, docs: str, survey: str) -> dict:
                 "detail": str(pushed.get("detail"))[:300], "pi_tail": tail}
 
     shipped = ship_head(f"assistant {ASSISTANT_ID}: {task[:200]}")
-    return {"ok": bool(shipped.get("ok")), "coded": True, "pushed": True,
-            "sha": pushed.get("sha", "")[:12], "files": gate["files"],
-            "stat": gate.get("stat", ""), "commit_message": message[:200],
-            "pi_seconds": pi["seconds"],
-            "deployed": bool(shipped.get("deployed")),
-            "detail": str(shipped.get("detail"))[:400], "pi_tail": tail}
+    result = {"ok": bool(shipped.get("ok")), "coded": True, "pushed": True,
+              "sha": pushed.get("sha", "")[:12], "files": gate["files"],
+              "stat": gate.get("stat", ""), "commit_message": message[:200],
+              "pi_seconds": pi["seconds"],
+              "deployed": bool(shipped.get("deployed")),
+              "detail": str(shipped.get("detail"))[:400], "pi_tail": tail}
+
+    # HEALTH-GATE GREEN IS NECESSARY, NOT SUFFICIENT. The gate proves the container starts
+    # and answers /health. It cannot see a page that renders an empty list because a script
+    # threw, or a header that breaks the owner's preview. So once it is live, LOOK AT IT.
+    if shipped.get("deployed"):
+        url = ((context or {}).get("project") or {}).get("url") or ""
+        seen = browser_check(url, "the live app")
+        result["browser"] = seen
+        if seen.get("ran") and not seen.get("ok"):
+            # The deploy succeeded and the app is BROKEN FOR A USER. That is a failed beat:
+            # reporting "shipped ✓" here is exactly the confidently-wrong report this whole
+            # feature exists to prevent. The change stays live (it passed the gate and a
+            # rollback is the control plane's call), but the beat says what is true.
+            result["ok"] = False
+            result["detail"] = (
+                "the health gate passed but the page is BROKEN IN A BROWSER: "
+                + "; ".join([str(e) for e in (seen.get("console_errors") or [])][:3]
+                            + [str(n) for n in (seen.get("failed_requests") or [])][:2]
+                            + (["the page rendered almost nothing"] if seen.get("blank")
+                               else []))
+            )[:400]
+    return result
 
 
 def mirror_soul(context: dict) -> str:
@@ -1012,6 +1133,13 @@ def main() -> int:
         except Exception:
             pass
     finally:
+        # A browser session left open is a Chrome held out of a fleet the whole estate shares.
+        # Closed here whatever happened to the beat; the control plane closes them AGAIN when
+        # the record lands, because this line does not run if the container is OOM-killed.
+        try:
+            close_browser()
+        except Exception:
+            pass
         try:
             flush_activity()
         except Exception:
