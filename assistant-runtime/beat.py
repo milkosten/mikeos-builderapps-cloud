@@ -432,7 +432,21 @@ def build_grounding(docs: str, context: dict, survey: str) -> str:
         "- Keep the change SMALL and COMPLETE. One coherent slice that actually works "
         "end-to-end beats three half-wired ones. Existing endpoints keep their existing "
         "response shapes unless the task says otherwise.\n"
-        "- When you are finished, print a short summary of what you changed and why.\n")
+        "- When you are finished, print a short summary of what you changed and why.\n\n"
+        "## What you can and cannot verify from here\n\n"
+        "You are in a bare checkout: there is **no Postgres, no Redis and no running app in "
+        "this container**, so `npm start`, `npm test` and curling localhost will all fail and "
+        "tell you nothing. Do not spend turns on them.\n\n"
+        "What you CAN and SHOULD do before you stop:\n"
+        "- `node --check <file>` on every .js you touched — a file that does not parse is "
+        "rejected outright and your beat is wasted.\n"
+        "- Re-read the files you edited and check the change is actually complete: the route "
+        "exists, the page posts to it, the migration creates what the code queries, and every "
+        "column you SELECT is one the migration created.\n\n"
+        "The real verification is the health gate: your change is committed, built and "
+        "started for real, and if the app does not come up healthy it is rolled back "
+        "automatically and your beat is recorded as a failure. So the bar is not 'it looks "
+        "right' — it is 'this boots and works'.\n")
     return "\n\n---\n\n".join(out)
 
 
