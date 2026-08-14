@@ -185,8 +185,21 @@ def _s_data_layer(brief: str):
 # BUILDERAPPS_FAULT_FEATURE is set, and it must name BOTH the project and the feature
 # ("<shortid>:<n>"), so it can never fire on someone else's build. It fails the health gate,
 # which is exactly what a genuinely broken feature does.
-def _fault_for(project_id: str, feature_no: int) -> bool:
+def _fault_spec() -> str:
+    """The env var, or a `fault.txt` beside the artifacts (so a measurement run can arm the
+    fault AFTER the shortid has been allocated, without restarting the control plane)."""
     spec = os.environ.get("BUILDERAPPS_FAULT_FEATURE", "").strip()
+    if spec:
+        return spec
+    try:
+        p = Path(os.environ.get("ARTIFACTS_ROOT", "/opt/builderapps/artifacts")) / "fault.txt"
+        return p.read_text("utf-8").strip() if p.is_file() else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _fault_for(project_id: str, feature_no: int) -> bool:
+    spec = _fault_spec()
     if not spec or ":" not in spec:
         return False
     proj, _, num = spec.partition(":")
