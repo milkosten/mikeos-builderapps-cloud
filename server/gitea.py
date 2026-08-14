@@ -123,8 +123,11 @@ async def create_project_repo(gitea_user: str, shortid: str) -> dict:
     """Generate `app-<shortid>` in the user's namespace from the template. Idempotent-ish:
     if the repo already exists, return it. Verified by a follow-up GET."""
     repo_name = f"app-{shortid}"
+    # Gitea requires at least one template item flag to be true, else 422.
     body = {"owner": gitea_user, "name": repo_name, "private": True,
-            "description": f"builderapps project {shortid}", "default_branch": "main"}
+            "description": f"builderapps project {shortid}", "default_branch": "main",
+            "git_content": True, "git_hooks": False, "webhooks": False, "topics": True,
+            "avatar": False, "labels": False, "protected_branch": False}
     async with httpx.AsyncClient(timeout=60.0) as c:
         r = await c.post(
             f"{GITEA_API}/repos/{TEMPLATE_OWNER}/{TEMPLATE_REPO}/generate",
