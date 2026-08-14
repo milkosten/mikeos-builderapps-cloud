@@ -238,3 +238,90 @@ async def latest_run_for(project_id: str) -> Optional[dict]:
         "ORDER BY created_at DESC LIMIT 1", project_id,
     )
     return await get_run_with_steps(int(run["id"])) if run else None
+
+
+# Durable chat history: the UI must rebuild a reloaded /builder page from Postgres, never
+# from browser storage (so it survives a reload AND follows the user across devices).
+_MAX_THREAD = 100
+_MAX_MSG_CHARS = 4000
+
+
+def sanitize_messages(items: Any) -> list[dict]:
+    """Keep only {role,text}: role coerced to user/assistant, empty text dropped, each text
+    clamped, and the thread capped to the last _MAX_THREAD entries (bounded memory)."""
+    if not isinstance(items, list):
+        return []
+    out: list[dict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        text = it.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        role = "user" if str(it.get("role", "")).lower() in ("user", "update") else "assistant"
+        out.append({"role": role, "text": text[:_MAX_MSG_CHARS]})
+    return out[-_MAX_THREAD:]
+
+
+async def get_messages(project_id: str) -> list[dict]:
+    """Return the project's chat thread as [{role,text,ts}] (empty list when there is none).
+
+    Pipeline-written entries carry roles like `qa`/`update`; they are normalized to the
+    user/assistant vocabulary the UI renders, with `ts` preserved when present."""
+    thread = await pool().fetchval(
+        "SELECT thread FROM builderapps.messages WHERE project_id=$1", project_id
+    )
+    if not thread:
+        return []
+    if isinstance(thread, str):
+        try:
+            thread = json.loads(thread)
+        except Exception:  # noqa: BLE001
+            return []
+    if not isinstance(thread, list):
+        return []
+    out: list[dict] = []
+    for it in thread[-_MAX_THREAD:]:
+        if not isinstance(it, dict):
+            continue
+        text = it.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        role = "user" if str(it.get("role", "")).lower() in ("user", "update") else "assistant"
+        entry = {"role": role, "text": text[:_MAX_MSG_CHARS]}
+        if it.get("ts"):
+            entry["ts"] = str(it["ts"])
+        out.append(entry)
+    return out
+
+
+async def put_messages(project_id: str, messages: list[dict]) -> int:
+    """Replace the project's chat thread with the sanitized `messages`. Returns the count
+    actually stored (never-trust-200: the write is verified to have affected a row)."""
+    clean = sanitize_messages(messages)
+    res = await pool().execute(
+        "INSERT INTO builderapps.messages(project_id, thread, updated_at) "
+        "VALUES ($1, $2::jsonb, now()) "
+        "ON CONFLICT (project_id) DO UPDATE SET thread = EXCLUDED.thread, "
+        "updated_at = now()",
+        project_id, json.dumps(clean),
+    )
+    if not res.endswith(("INSERT 0 1", "UPDATE 1")):
+        raise RuntimeError(f"put_messages did not affect a row: {res!r}")
+    return len(clean)
+
+
+async def steps_for_latest_run(project_id: str) -> dict:
+    """{"run_id": int|None, "steps": [...]} for the project's most recent run (ordered by
+    idx). Empty list when the project has no run yet — never an error."""
+    run = await pool().fetchrow(
+        "SELECT id FROM builderapps.pipeline_runs WHERE project_id=$1 "
+        "ORDER BY created_at DESC LIMIT 1", project_id,
+    )
+    if not run:
+        return {"run_id": None, "steps": []}
+    rows = await pool().fetch(
+        "SELECT idx,name,status,log,ts FROM builderapps.pipeline_steps "
+        "WHERE run_id=$1 ORDER BY idx", int(run["id"]),
+    )
+    return {"run_id": int(run["id"]), "steps": [dict(r) for r in rows]}

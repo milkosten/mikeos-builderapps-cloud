@@ -102,6 +102,12 @@ class UpdateBody(BaseModel):
     request: str = Field(..., min_length=1, max_length=8000)
 
 
+class MessagesBody(BaseModel):
+    """The durable chat thread. Sanitized server-side (store.sanitize_messages) — the client
+    may send anything; only {role,text} survives."""
+    messages: list[dict] = Field(default_factory=list)
+
+
 # ---- SSE plumbing ---------------------------------------------------------
 def _sse(item: dict) -> str:
     return f"data: {json.dumps(item)}\n\n"
@@ -243,11 +249,42 @@ async def list_projects(request: Request):
 
 @app.get("/api/projects/{project_id}")
 async def get_project(project_id: str, request: Request):
+    """The full restore payload for /builder/<id>: the project, its latest run WITH the
+    ordered `steps` already executed, and the durable chat `messages`. A page reload rebuilds
+    history from here (Postgres), never from browser storage."""
     user_id = await _auth_and_provision(request)
     proj = await store.get_project(project_id, user_id)
     if not proj:
         raise HTTPException(status_code=404, detail="not found")
-    run = await store.latest_run_for(project_id)
+    run = await store.latest_run_for(project_id)   # includes steps ordered by idx
     proj["latest_run"] = run
+    proj["messages"] = await store.get_messages(project_id)
     proj["url"] = f"https://{project_id}.{SITES_BASE}/"
     return proj
+
+
+@app.get("/api/projects/{project_id}/steps")
+async def get_project_steps(project_id: str, request: Request):
+    """Step history of the project's latest run, for independent polling/refresh."""
+    user_id = await _auth_and_provision(request)
+    if not await store.get_project(project_id, user_id):
+        raise HTTPException(status_code=404, detail="not found")
+    return await store.steps_for_latest_run(project_id)
+
+
+@app.get("/api/projects/{project_id}/messages")
+async def get_project_messages(project_id: str, request: Request):
+    user_id = await _auth_and_provision(request)
+    if not await store.get_project(project_id, user_id):
+        raise HTTPException(status_code=404, detail="not found")
+    return {"messages": await store.get_messages(project_id)}
+
+
+@app.put("/api/projects/{project_id}/messages")
+async def put_project_messages(project_id: str, body: MessagesBody, request: Request):
+    """Persist the chat thread so it survives a reload and follows the user across devices."""
+    user_id = await _auth_and_provision(request)
+    if not await store.get_project(project_id, user_id):
+        raise HTTPException(status_code=404, detail="not found")
+    stored = await store.put_messages(project_id, body.messages)
+    return {"ok": True, "stored": stored}
