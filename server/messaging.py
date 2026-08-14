@@ -41,6 +41,14 @@ logger = logging.getLogger(__name__)
 # closing" — and nothing beyond it. Env-overridable; a test sets it to 2 to watch it bite.
 MAX_CHAIN_DEPTH = max(1, int(os.environ.get("ASSISTANT_MAX_CHAIN_DEPTH", "4") or 4))
 
+# How long a message stays "the thing you are replying to". Inside this window a message to a
+# colleague continues the conversation and counts against the depth; outside it, the two start
+# again from one. Both halves matter: without the window a runaway evades the bound by simply
+# answering on a later beat, and without the reset two colleagues who talk regularly would
+# eventually become permanently unable to reach each other — a bound that ends in deadlock is
+# a bug wearing a bound's clothes.
+CHAIN_WINDOW_MIN = max(5, int(os.environ.get("ASSISTANT_CHAIN_WINDOW_MIN", "120") or 120))
+
 MAX_BODY = 8000
 # How much of a referenced item travels inline in the wake task. `full_item` is deliberately
 # fat and a bug with forty comments would otherwise crowd out the project context the
@@ -130,20 +138,32 @@ async def _auto_reply_to(project_id: str, sender_id: Optional[int], recipient_id
                          beat_id: Optional[int]) -> Optional[dict]:
     """The message this send is answering, when the sender did not say.
 
-    Load-bearing for the chain bound. Depth is only meaningful if a reply is LINKED to what
-    it replies to, and an LLM asked to remember to pass `--reply 17` will not — so if this
-    beat was woken by a DM from exactly this counterpart, the send is treated as its reply
-    automatically. Without this, every reply starts a new thread at depth 1 and the chain
-    bound never fires: the loop it exists to stop would run forever while the code that stops
-    it looked correct.
+    LOAD-BEARING FOR THE CHAIN BOUND. Depth only means anything if a reply is LINKED to what
+    it replies to, and an LLM asked to remember `--reply 17` will not — so the link is
+    inferred: a message to a colleague is a reply to the last thing that colleague said to
+    you, if they said it recently.
+
+    The first version only matched messages read by THIS beat, and the first real exchange
+    walked straight through the hole. The Developer was woken by beat 26, but actually
+    answered on beat 27 — so no message carried `wake_beat_id = 27`, the reply linked to
+    nothing, and it was recorded as a brand-new conversation at depth 1. Every subsequent
+    round would have done the same. The bound was in the code, was never going to fire, and
+    nothing looked wrong: a runaway would have run for ever while the counter sat at 1.
+
+    Hence the window rather than the beat. `CHAIN_WINDOW_MIN` is what separates "answering
+    you" from "a new subject next week": within it, a message continues the conversation and
+    counts against the depth; outside it, the pair start again from one. Without some such
+    reset, two assistants that talk regularly would eventually be permanently unable to reach
+    each other — a bound that ends in a deadlock is a bug, not a bound.
     """
-    if sender_id is None or beat_id is None:
+    if sender_id is None:
         return None
     r = await pool().fetchrow(
         f"SELECT {_COLS} FROM builderapps.assistant_messages "
-        "WHERE project_id=$1 AND to_assistant=$2 AND from_assistant=$3 AND wake_beat_id=$4 "
+        "WHERE project_id=$1 AND to_assistant=$2 AND from_assistant=$3 AND blocked='' "
+        "  AND created_at > now() - make_interval(mins => $4::int) "
         "ORDER BY created_at DESC LIMIT 1",
-        project_id, int(sender_id), int(recipient_id), int(beat_id))
+        project_id, int(sender_id), int(recipient_id), CHAIN_WINDOW_MIN)
     return _row(r)
 
 
