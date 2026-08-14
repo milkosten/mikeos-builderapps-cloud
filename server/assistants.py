@@ -126,6 +126,35 @@ def require(assistant: dict, capability: str) -> None:
 # ---------------------------------------------------------------------------
 # starter templates — PRE-FILLS, NOT A MENU OF ALLOWED ROLES
 # ---------------------------------------------------------------------------
+# Every SOUL ends with the same paragraph about working with the others, because every
+# assistant faces the same temptation and it is not role-specific.
+#
+# THE FAILURE MODE THIS EXISTS FOR (phase 33): assistants can now message each other, and a
+# message WAKES the recipient — a whole container, a reasoning round, $0.20-1.59. The default
+# behaviour of a helpful model that receives "fixed, please retest" is to reply "great,
+# thanks, I'll take a look", which wakes the sender, who politely replies again. Two
+# conscientious agents produce an unbounded, entirely reasonable-looking conversation and no
+# product. The chain-depth bound stops it eventually; this stops it happening.
+#
+# So "no reply needed" is written into the persona as a FIRST-CLASS OUTCOME rather than left
+# as an omission. An agent told only "you may message colleagues" concludes that messaging is
+# the collaborative thing to do; an agent told "the board is how you report, a message is how
+# you ask" gets the distinction that actually matters.
+_COLLEAGUES = (
+    "# Working with the other assistants\n"
+    "The workspace board is how I report; a direct message is how I ASK. I file what I find, "
+    "build and decide on the board, where the others and the owner read it without anyone "
+    "being interrupted.\n\n"
+    "I send a colleague a message only when I need THEM to do something I cannot do myself, "
+    "or when I am blocked on an answer only they have — and I reference the board item so "
+    "they receive the whole report instead of my summary of it.\n\n"
+    "**Not replying is a real answer, and usually the right one.** A message wakes a whole "
+    "beat and spends the project's money, so I never send one to acknowledge, to thank, to "
+    "confirm I have read something, or to say I have started. If somebody tells me good news "
+    "and there is nothing they need from me, I say nothing and get on with the work.\n"
+)
+
+
 def _soul(who: str, optimises: str, does: list[str], never: list[str], acts_when: str) -> str:
     bullets = "\n".join(f"- {d}" for d in does)
     nevers = "\n".join(f"- {n}" for n in never)
@@ -134,7 +163,8 @@ def _soul(who: str, optimises: str, does: list[str], never: list[str], acts_when
         f"# What I optimise for\n{optimises}\n\n"
         f"# What I do on a beat\n{bullets}\n\n"
         f"# What I must never do\n{nevers}\n\n"
-        f"# When a beat is worth acting on\n{acts_when}\n"
+        f"# When a beat is worth acting on\n{acts_when}\n\n"
+        + _COLLEAGUES
     )
 
 
@@ -601,6 +631,32 @@ async def start_beat(assistant_id: int, project_id: str, trigger_kind: str,
     if bid is None:
         raise RuntimeError("start_beat returned no id")
     return int(bid)
+
+
+async def set_beat_ask(beat_id: int, ask: str) -> None:
+    """Fill in a beat's task after the row exists (phase 33's DM wake).
+
+    A wake is a chicken-and-egg: the messages must be stamped with the beat that is reading
+    them (so a reply sent during it is correctly counted as a reply, one step deeper in the
+    chain), but the beat id only exists once the row is inserted. So the row is opened empty
+    and the task written here, before the container starts. Deliberately NOT passed in memory
+    to the container: the ask is what the beat spends the project's money on, and it comes
+    from the database like every other ask.
+    """
+    await pool().execute(
+        "UPDATE builderapps.assistant_beats SET user_ask=$2 WHERE id=$1",
+        beat_id, (ask or "")[:MAX_ASK_CHARS])
+
+
+async def beat_trigger(beat_id: int) -> str:
+    """How this beat was started — `schedule` | `manual` | `ask` | `dm`.
+
+    Read from the row for the same reason `beat_ask` is: it decides how the task is framed to
+    the model ("a human is asking you" vs "a colleague has messaged you"), and those two want
+    genuinely different behaviour.
+    """
+    return str(await pool().fetchval(
+        "SELECT trigger_kind FROM builderapps.assistant_beats WHERE id=$1", beat_id) or "")
 
 
 async def beat_ask(beat_id: int) -> str:

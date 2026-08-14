@@ -78,7 +78,8 @@ WORKSPACE_API_KEY = os.environ.get("WORKSPACE_API_KEY", "")
 PI_SKILLS = [s.strip().rstrip("/") for s in os.environ.get(
     "PI_SKILLS_DIRS",
     os.environ.get("PI_SKILLS_DIR",
-                   "/app/skills/browser-verify,/app/skills/workspace")).split(",")
+                   "/app/skills/browser-verify,/app/skills/workspace,"
+                   "/app/skills/messaging")).split(",")
     if s.strip()]
 
 # House rule: never slurp a file into RAM without a cap.

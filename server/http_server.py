@@ -16,14 +16,15 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import (Depends, FastAPI, HTTPException, Request, WebSocket,
+                     WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from server import (assistant_api, assistant_runtime, browser_proxy, db, deployer, gitea,
-                    introspect, llm_proxy, naming, runner, store, workspace, workspace_api,
-                    usage)
+from server import (assistant_api, assistant_runtime, browser_proxy, budget, db, deployer,
+                    gitea, identity, introspect, llm_proxy, messaging, naming, runner, store,
+                    workspace, workspace_api, usage, ws_hub)
 from server.harness import pipeline
 from server.identity import authenticate, current_user
 
@@ -82,6 +83,7 @@ async def lifespan(app: FastAPI):
     yield
     await assistant_runtime.shutdown()
     await runner.shutdown()
+    await ws_hub.close_all()
     await db.close_pool()
 
 
@@ -307,8 +309,85 @@ async def update_project(project_id: str, body: UpdateBody, request: Request):
 # ---- list / get -----------------------------------------------------------
 @app.get("/api/projects")
 async def list_projects(request: Request):
+    """The Apps list — now with a rollup of what happened while you were not looking.
+
+    Phase 33 made this necessary rather than nice: assistants message each other and wake each
+    other with no browser involved, so a project can do a full bug-report/fix/retest cycle
+    between two visits. Without `unread` the list looked identical whether the assistants had
+    been busy all night or asleep — and the one state that MUST be visible from here is
+    `budget.stopped`, because that means work has HALTED, not that it is quietly progressing.
+
+    Both are computed in one query each across the whole list; a per-project round trip would
+    turn a rollup that exists to be glanceable into a spinner.
+    """
     user_id = await _auth_and_provision(request)
-    return {"projects": await store.list_projects(user_id)}
+    projects = await store.list_projects(user_id)
+    ids = [str(p["id"]) for p in projects if p.get("id")]
+    try:
+        unread = await messaging.unread_rollup(user_id, ids)
+        stops = await budget.stopped_projects(ids)
+    except Exception:  # noqa: BLE001 — the list must render even if the rollup fails
+        logger.debug("apps-list rollup failed", exc_info=True)
+        unread, stops = {}, {}
+    for p in projects:
+        pid = str(p.get("id") or "")
+        p["unread"] = unread.get(pid) or {"dms": 0, "beats": 0, "total": 0}
+        p["budget"] = stops.get(pid) or {}
+    return {"projects": projects}
+
+
+# ---- the browser's live channel (phase 33) --------------------------------
+@app.websocket("/api/projects/{project_id}/stream")
+async def project_stream(ws: WebSocket, project_id: str, token: str = ""):
+    """Push beat narration, status changes and assistant DMs to a watching /builder.
+
+    READ THE DIRECTION. This is not how assistants reach each other — that is a row in
+    `assistant_messages` plus a wake, and it happens with the laptop shut. This socket only
+    shows a browser what has already been written, replacing a poll that asked "anything
+    new?" every 2.5 seconds and heard "no" almost every time.
+
+    AUTH: the token comes in the query string because the browser WebSocket API cannot set an
+    `Authorization` header — there is no option to pass one, which is why every WS auth scheme
+    on the web looks like this. It is the same Bearer the SPA already holds, validated by the
+    same `authenticate()`, and ownership of the project is checked before a single frame is
+    sent. The URL is not logged by Caddy's default format, and the token is short-lived.
+
+    The client keeps its poll as a fallback and re-arms it when this closes. A socket that is
+    half-open through a proxy is indistinguishable from a quiet project, and a pane frozen on
+    stale state is worse than one that polls.
+    """
+    user_id = await identity.authenticate_token(token)
+    if not user_id:
+        await ws.close(code=4401)
+        return
+    try:
+        introspect.assert_shortid(project_id)
+    except introspect.BadPath:
+        await ws.close(code=4404)
+        return
+    if not await store.get_project(project_id, user_id):
+        await ws.close(code=4404)
+        return
+
+    await ws.accept()
+    client = ws_hub.subscribe(ws, project_id)
+    try:
+        # An immediate snapshot, so a client that connects mid-beat is correct at once rather
+        # than at the next event. Same payload as the poll — see `messaging.live_feed`.
+        ws_hub.publish_to(client, {"type": "feed", **(await messaging.live_feed(project_id))})
+        while True:
+            # The client sends nothing but pings. Reading is how we notice it has gone: a
+            # server that only ever writes discovers a dead peer only when the OS buffer
+            # fills, which for a low-traffic pane can be never.
+            msg = await ws.receive_text()
+            if msg == "ping":
+                ws_hub.publish_to(client, {"type": "pong"})
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001 — a broken socket is routine, not an incident
+        logger.debug("ws stream ended for %s", project_id, exc_info=True)
+    finally:
+        ws_hub.unsubscribe(client)
 
 
 @app.get("/api/projects/{project_id}")

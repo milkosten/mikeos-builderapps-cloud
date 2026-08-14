@@ -24,7 +24,8 @@ from pydantic import BaseModel, Field
 
 from server import assistants as A
 from server import assistant_runtime as R
-from server import browser_proxy, introspect, llm_proxy, store
+from server import browser_proxy, budget, introspect, llm_proxy, store
+from server import messaging as M
 from server.identity import authenticate
 
 logger = logging.getLogger(__name__)
@@ -275,7 +276,15 @@ async def beat_assistant(project_id: str, assistant_id: int, request: Request,
     Caddy. The client polls `/beats`; the row is already there, marked `running`.
     """
     a = await _owned_assistant(project_id, assistant_id, request)
-    kicked = await R.kick(a, (body.task if body and body.task else "").strip())
+    try:
+        kicked = await R.kick(a, (body.task if body and body.task else "").strip())
+    except R.BudgetStop as e:
+        # 402 Payment Required, and the numbers with it. The owner pressed a button and
+        # nothing happened; "409 busy" would be a lie and a silent success would be worse.
+        raise HTTPException(status_code=402, detail={
+            "message": "This project has reached its daily assistant budget, so no beat was "
+                       "started. Assistant work resumes at midnight UTC.",
+            **e.status})
     if not kicked:
         raise HTTPException(status_code=409,
                             detail="a beat is already running for this assistant")
@@ -307,18 +316,16 @@ async def project_assistant_activity(project_id: str, request: Request,
     truth, and the one that drifts is always the one nobody reloads to check.
     """
     await _owned(project_id, request)
-    feed = await A.recent_activity(project_id, limit)
-    # The thread tail rides along on the SAME poll. A phase-31 deploy-failure `@message` is
-    # written into the thread by the CONTROL PLANE, not by the browser, so without this the
-    # user would only see "the deploy failed" once they happened to reload — and the whole
-    # point of putting the failure in the open is that they watch it happen. Reusing this
-    # poll rather than adding a second one also keeps one cadence and one source of truth.
-    try:
-        messages = (await store.get_messages(project_id))[-12:]
-    except Exception:  # noqa: BLE001 — the feed must never fail on the extra
-        messages = []
-    return {"beats": feed, "beating": any(b.get("status") == "running" for b in feed),
-            "messages": messages}
+    # The thread tail, the DMs between assistants and the budget all ride along on the SAME
+    # poll. A phase-31 deploy-failure `@message` is written into the thread by the CONTROL
+    # PLANE, not by the browser, so without this the user would only see "the deploy failed"
+    # once they happened to reload — and the whole point of putting the failure in the open is
+    # that they watch it happen. Reusing this poll rather than adding a second one also keeps
+    # one cadence and one source of truth.
+    #
+    # `messaging.live_feed` builds it, and the WebSocket pushes the SAME dict — so the live
+    # view and the after-refresh view are the same rows from the same tables, by construction.
+    return await M.live_feed(project_id, limit)
 
 
 @router.get("/api/projects/{project_id}/assistants/{assistant_id}/soul",
@@ -359,10 +366,14 @@ async def assistant_reason(body: ReasonBody, request: Request,
     # body: it decides what this beat spends the project's money on, so it comes from the
     # row the owner's authenticated call created.
     raw = (request.headers.get("x-beat-id") or "").strip()
-    ask = ""
+    ask, trigger = "", ""
     if raw.isdigit() and await A.beat_belongs_to(int(raw), int(a["id"])):
         ask = await A.beat_ask(int(raw))
-    return await R.reason(a, ctx, body.workspace or "", body.docs or "", ask)
+        # How the beat was started decides how the ask is FRAMED — a human asking and a
+        # colleague messaging want opposite defaults about whether to answer at all. Read
+        # from the row, like the ask itself, not from anything the container asserts.
+        trigger = await A.beat_trigger(int(raw))
+    return await R.reason(a, ctx, body.workspace or "", body.docs or "", ask, trigger)
 
 
 @router.post("/api/assistant/act", summary="[beat container] perform one capability-gated act")
@@ -397,6 +408,10 @@ async def assistant_activity(body: ActivityBody, request: Request,
         total = await A.append_activity(int(raw), body.lines or [])
     except RuntimeError:
         raise HTTPException(status_code=404, detail="no such beat")
+    # PUSH, don't wait to be asked. This is the moment the narration actually changes, so it
+    # is the moment a watching browser should see it — that is what replaces the 2.5s poll.
+    # It short-circuits to nothing when no browser is connected, which is the normal case.
+    await M.publish_feed(str(a["project_id"]))
     return {"ok": True, "lines": total}
 
 
@@ -449,4 +464,119 @@ async def assistant_record_beat(body: BeatBody, request: Request,
                         actions=body.actions, log=body.log, tokens=body.tokens,
                         cost_usd=float(body.cost_usd or 0.0) + pi_cost,
                         duration_ms=body.duration_ms)
+    await M.publish_feed(str(a["project_id"]))
     return {"ok": True, "beat_id": beat_id, "coding_agent_cost_usd": pi_cost}
+
+
+# ===========================================================================
+# MESSAGING (phase 33) — the `msg` tool's surface, and the owner's view of it
+# ===========================================================================
+class SendMessageBody(BaseModel):
+    """One DM. `to` is a name, a role or an id — see `messaging.resolve` for why all three."""
+    to: str = Field(..., max_length=200,
+                    description="A colleague's name, role or numeric id, as listed in "
+                                "`/api/assistant/colleagues`.")
+    body_md: str = Field(..., max_length=M.MAX_BODY)
+    refs_item_id: Optional[int] = Field(
+        None, description="A workspace item id. The recipient receives the WHOLE item — "
+                          "body, comments, history, links — inline in its wake task.")
+    reply_to: Optional[int] = Field(
+        None, description="The message being answered. Usually unnecessary: a message sent "
+                          "during a beat that was itself woken by this colleague is linked "
+                          "automatically, which is what keeps the chain-depth bound honest.")
+
+
+@router.get("/api/assistant/colleagues",
+            summary="[beat container] who this assistant can message")
+async def assistant_colleagues(x_assistant_token: str = Header("")) -> dict:
+    """The address book. Also in every beat's perception — this endpoint exists so the `msg`
+    tool can answer `msg who` without a reasoning round."""
+    a = await _from_token(x_assistant_token)
+    return {"you": {"id": int(a["id"]), "name": a.get("name") or "", "role": a.get("role") or ""},
+            "colleagues": await M.roster(str(a["project_id"]), exclude_id=int(a["id"])),
+            "max_chain_depth": M.MAX_CHAIN_DEPTH}
+
+
+@router.post("/api/assistant/messages", summary="[beat container] send a colleague a DM")
+async def assistant_send_message(body: SendMessageBody, request: Request,
+                                 x_assistant_token: str = Header("")) -> dict:
+    """Send, and (unless a bound says otherwise) wake the recipient.
+
+    THE SENDER IS THE TOKEN, never the request body. An assistant cannot post as a colleague,
+    for the same reason it cannot file a board item under one: the identity comes from the
+    row the token resolves to. `to` is the only party the caller gets to choose.
+
+    A bound that refuses is **200 with `blocked` set**, not an error status: the message WAS
+    stored and IS visible in the thread — what did not happen is the wake. Returning 4xx would
+    make an agent retry, and retrying is precisely the loop the bound exists to stop.
+    """
+    a = await _from_token(x_assistant_token)
+    project_id = str(a["project_id"])
+    to = await M.resolve(project_id, body.to)
+    if not to:
+        people = await M.roster(project_id, exclude_id=int(a["id"]))
+        raise HTTPException(status_code=404, detail={
+            "message": f"no colleague matching {body.to!r} on this project",
+            "colleagues": [{"id": p["id"], "name": p["name"], "role": p["role"]}
+                           for p in people]})
+    raw = (request.headers.get("x-beat-id") or "").strip()
+    beat_id = int(raw) if raw.isdigit() and await A.beat_belongs_to(int(raw), int(a["id"])) \
+        else None
+    res = await M.send(project_id, sender=a, to=to, body_md=body.body_md,
+                       refs_item_id=body.refs_item_id, reply_to=body.reply_to,
+                       beat_id=beat_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=422, detail=res.get("detail") or "could not send")
+    return res
+
+
+@router.get("/api/assistant/messages", summary="[beat container] this assistant's inbox")
+async def assistant_inbox(unread: bool = True, limit: int = 25,
+                          x_assistant_token: str = Header("")) -> dict:
+    a = await _from_token(x_assistant_token)
+    msgs = await M.inbox(int(a["id"]), unread_only=unread, limit=limit)
+    return {"messages": msgs, "unread": sum(1 for m in msgs if not m.get("read_at"))}
+
+
+@router.get("/api/assistant/messages/thread/{thread_id}",
+            summary="[beat container] one conversation, in order")
+async def assistant_thread(thread_id: int, x_assistant_token: str = Header("")) -> dict:
+    a = await _from_token(x_assistant_token)
+    msgs = await M.thread(thread_id, str(a["project_id"]))
+    if not msgs:
+        raise HTTPException(status_code=404, detail="no such thread in this project")
+    return {"thread_id": thread_id, "messages": msgs, "max_chain_depth": M.MAX_CHAIN_DEPTH}
+
+
+@router.get("/api/projects/{project_id}/messages/assistants",
+            summary="Every DM between this project's assistants")
+async def project_dms(project_id: str, request: Request, limit: int = 40) -> dict:
+    """The owner's read-only window on what the assistants have said to each other.
+
+    Named `/messages/assistants` rather than `/messages` because `/api/projects/{id}/messages`
+    is already the HUMAN thread. Two different conversations, two different URLs — the same
+    reason the table is `assistant_messages` and not `messages`.
+    """
+    await _owned(project_id, request)
+    return {"dms": await M.project_feed(project_id, limit),
+            "max_chain_depth": M.MAX_CHAIN_DEPTH}
+
+
+@router.get("/api/projects/{project_id}/budget", summary="Today's spend against the daily cap")
+async def project_budget(project_id: str, request: Request) -> dict:
+    await _owned(project_id, request)
+    return (await budget.status(project_id)).as_dict()
+
+
+@router.post("/api/projects/{project_id}/seen",
+             summary="Mark this project's assistant activity as seen")
+async def project_seen(project_id: str, request: Request) -> dict:
+    """Moves the "3 new since you were last here" high-water mark.
+
+    A write, not a side effect of reading, and called explicitly by the client when the pane
+    is actually visible — a GET that mutated the unread count would clear it for a background
+    tab, which is exactly the case the marker exists for.
+    """
+    proj = await _owned(project_id, request)
+    await M.seen(project_id, str(proj.get("user_id") or ""))
+    return {"ok": True}

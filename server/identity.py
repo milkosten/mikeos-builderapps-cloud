@@ -94,6 +94,31 @@ async def authenticate(request: Request) -> Optional[str]:
     return await resolve_agent_key(key)
 
 
+async def authenticate_token(token: Optional[str]) -> Optional[str]:
+    """Resolve a bare credential string, with no Request to read headers from.
+
+    Exists for the WebSocket (phase 33): the browser's WebSocket API has no way to set an
+    `Authorization` header — the constructor accepts a URL and a subprotocol list and nothing
+    else — so a browser socket can only carry its credential in the query string. This is the
+    SAME validation as `authenticate`, deliberately reusing `_verify_bearer` and
+    `resolve_agent_key` rather than being a second, slightly different auth path: a socket
+    that authenticated more loosely than the REST surface would be the way in.
+
+    Accepts either credential form, matching `authenticate`, and fails closed on both.
+    """
+    tok = (token or "").strip()
+    if not tok:
+        return None
+    if tok.lower().startswith("bearer "):
+        tok = tok[7:].strip()
+    # A JWT is three dot-separated segments; anything else is treated as a legacy agent key.
+    # Cheap disambiguation, and being wrong either way just fails closed.
+    if tok.count(".") == 2:
+        claims = _verify_bearer(tok)
+        return str(claims["sub"]) if claims else None
+    return await resolve_agent_key(tok)
+
+
 # ---- FastAPI dependencies -------------------------------------------------
 async def current_user(request: Request) -> str:
     """Dependency: resolved user_id, or 401."""

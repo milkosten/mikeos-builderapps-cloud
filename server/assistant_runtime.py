@@ -46,7 +46,8 @@ import time
 from typing import Any, Optional
 
 from server import assistants as A
-from server import chrome, gitea, gpu, runner, store, usage
+from server import budget, chrome, gitea, gpu, runner, store, usage, ws_hub
+from server import messaging as M
 from server import workspace_store as W
 from server.harness import codegen
 
@@ -333,11 +334,90 @@ async def _scheduler_loop() -> None:
     while not _shutting_down:
         try:
             await asyncio.sleep(SCHED_INTERVAL_SEC)
+            # The WAKE pass runs FIRST and on the same loop. A message from a colleague is
+            # the most time-sensitive reason to beat — somebody is blocked on the answer —
+            # and running it on its own timer would be a second scheduler racing the first
+            # for the single beat slot.
+            await wake_tick()
             await tick()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — the scheduler must never die
             logger.exception("assistant scheduler iteration failed")
+
+
+async def _budget_blocks(project_id: str) -> Optional[dict]:
+    """THE $10/DAY HARD STOP. Returns the budget status when this project may not beat.
+
+    Checked before the claim, not after: a claimed assistant with no beat is an assistant
+    that looks busy and is not. And checked for EVERY trigger — schedule, DM wake and the
+    owner's own button — because a ceiling with a manual override is not a ceiling.
+    """
+    try:
+        st = await budget.allows_beat(project_id)
+    except Exception:  # noqa: BLE001 — never let the accounting query stop the platform
+        logger.debug("budget check failed for %s", project_id, exc_info=True)
+        return None
+    if not st.stopped:
+        return None
+    try:
+        if await budget.announce_once(project_id, st):
+            ws_hub.publish(project_id, {"type": "budget", "budget": st.as_dict()})
+    except Exception:  # noqa: BLE001
+        logger.debug("budget announce failed for %s", project_id, exc_info=True)
+    return st.as_dict()
+
+
+async def wake_tick() -> int:
+    """One WAKE pass: start a beat for every assistant that has been sent a message.
+
+    This function is the delivery mechanism, and it does not know what a browser is. A DM was
+    written to Postgres and a flag was raised; here the flag becomes a beat. Everything it
+    relies on — `claim`, `release`, the boot sweep — is the machinery the scheduled path
+    already uses, so a redeploy mid-wake is recovered by code that was already being
+    exercised every hour rather than by a second, untested path.
+    """
+    if _shutting_down or not ENABLED:
+        return 0
+    try:
+        woken = await M.wake_due()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("assistant wake query failed: %s", e)
+        return 0
+    n = 0
+    for w in woken:
+        project_id = str(w["project_id"])
+        if await _budget_blocks(project_id):
+            # Leave the flag raised. The messages stay unread and the wake happens after
+            # midnight — held, not dropped, which is what the owner is told.
+            continue
+        claimed = await A.claim(int(w["id"]), runner.INSTANCE_ID, any_status=True)
+        if not claimed:
+            continue                     # it is already beating; it will read its inbox there
+        try:
+            # Clear the flag only once we hold the claim, so a crash before this point simply
+            # wakes again, and coalescing resumes from here: a DM arriving DURING this beat
+            # raises the flag afresh and earns its own beat afterwards.
+            await M.clear_wake(int(w["id"]))
+            beat_id = await open_beat(claimed, "dm")
+            msgs = await M.claim_for_beat(int(w["id"]), beat_id)
+            if not msgs:
+                # The flag was raised but the inbox is empty — another beat already read it.
+                # Close the empty beat rather than spending a reasoning round on nothing.
+                await _finish_if_running(beat_id, "skipped",
+                                         log="woken with an empty inbox — already read")
+                await A.release(int(w["id"]))
+                continue
+            await A.set_beat_ask(beat_id, await M.wake_task(project_id, msgs))
+            await M.publish_feed(project_id)
+            await execute_beat(claimed, beat_id, "dm")
+            await M.mark_read([int(m["id"]) for m in msgs], beat_id)
+            await M.publish_feed(project_id)
+            n += 1
+        except Exception:  # noqa: BLE001
+            logger.exception("assistant %s wake beat failed", w.get("id"))
+            await A.release(int(w["id"]))
+    return n
 
 
 async def tick() -> int:
@@ -351,6 +431,12 @@ async def tick() -> int:
         return 0
     n = 0
     for a in due:
+        if await _budget_blocks(str(a["project_id"])):
+            # Push the next attempt out rather than spinning on a due row every 60s: the
+            # scheduler would otherwise re-announce and re-check the same stopped project
+            # once a minute until midnight.
+            await A.release(int(a["id"]), schedule_next_minutes=30)
+            continue
         claimed = await A.claim(int(a["id"]), runner.INSTANCE_ID)
         if not claimed:
             continue                     # another scheduler won the race
@@ -372,11 +458,26 @@ async def kick(assistant: dict, user_ask: str = "") -> Optional[tuple[dict, int]
     `user_ask` is set when a human addressed this assistant directly from the composer
     (`@Developer add a search box`). It is stored on the beat row, so the reasoning call
     reads it from the database rather than from anything the container asserts.
+
+    Raises `BudgetStop` when the project has spent its day. Deliberately an exception on THIS
+    path and a `continue` on the scheduler's: a human who pressed a button is owed an answer
+    saying why nothing happened, whereas a scheduler has nobody to tell.
     """
+    stop = await _budget_blocks(str(assistant["project_id"]))
+    if stop:
+        raise BudgetStop(stop)
     claimed = await A.claim(int(assistant["id"]), runner.INSTANCE_ID, any_status=True)
     if not claimed:
         return None
     return claimed, await open_beat(claimed, "ask" if user_ask else "manual", user_ask)
+
+
+class BudgetStop(RuntimeError):
+    """The project has spent its daily budget; no beat was started."""
+
+    def __init__(self, status: dict):
+        super().__init__("daily budget reached")
+        self.status = status
 
 
 async def sweep_on_boot() -> int:
@@ -384,9 +485,15 @@ async def sweep_on_boot() -> int:
     it left behind and mark the orphaned beats failed, so no assistant is stranded."""
     released = await A.sweep_orphaned_claims(runner.INSTANCE_ID)
     failed = await A.sweep_running_beats("control plane restarted mid-beat")
-    if released or failed:
-        logger.warning("assistant boot sweep: released %d claim(s), failed %d orphan beat(s)",
-                       released, failed)
+    # THE SAME CONTRACT FOR MAIL. A beat that died after claiming its inbox left those rows
+    # `delivered` but never `read`, and the wake flag cleared — so without this the message
+    # is in the table, nobody is coming for it, and the sender is waiting for a reply that
+    # will never arrive. Re-raising the flag is safe precisely because raising it is
+    # idempotent (that is also what makes duplicate wakes coalesce).
+    rewoken = await M.resweep_unread()
+    if released or failed or rewoken:
+        logger.warning("assistant boot sweep: released %d claim(s), failed %d orphan beat(s), "
+                       "re-woke %d assistant(s) with unread mail", released, failed, rewoken)
     return released
 
 
@@ -470,6 +577,20 @@ async def perceive(assistant: dict, *, include_soul: bool = False) -> dict:
     except Exception as e:  # noqa: BLE001 — perception must never fail a beat
         logger.info("workspace board unavailable for %s: %s", project_id, e)
 
+    # WHO ELSE IS HERE (phase 33). An assistant cannot message a colleague it does not know
+    # exists, so the roster is perception, not a tool call — the same reasoning as the board
+    # above, and for the same position reason it sits next to it rather than at the end.
+    # `you_are` is included because a model given a list of five names and no marker for
+    # itself will eventually address itself; `send` refuses that, but a refused action is a
+    # wasted beat and this costs twelve tokens.
+    try:
+        ctx["colleagues"] = await M.roster(project_id, exclude_id=int(assistant["id"]))
+        ctx["you_are"] = {"id": int(assistant["id"]),
+                          "name": assistant.get("name") or "",
+                          "role": assistant.get("role") or ""}
+    except Exception as e:  # noqa: BLE001
+        logger.info("roster unavailable for %s: %s", project_id, e)
+
     try:
         thread = await store.get_raw_thread(project_id)
         ctx["recent_thread"] = [
@@ -538,6 +659,8 @@ _ACTION_SCHEMA = {
                     "title": {"type": "string"},
                     "status": {"type": "string"},
                     "item_id": {"type": "integer"},
+                    # messaging a colleague (phase 33)
+                    "to": {"type": "string"},
                 },
                 "required": ["type"],
             },
@@ -598,12 +721,28 @@ def _action_menu(assistant: dict) -> str:
         '"text":"a comment explaining the change"} — move an item on the board (its id is in '
         "the `workspace` block of your context) and/or comment on it. Only mark something "
         "`done` if you actually verified it.")
+    # MESSAGING A COLLEAGUE (phase 33). Ungated, like the board: talking to the people you
+    # work with is not a privilege. Bounded instead of forbidden — see `act_message`.
+    #
+    # The description leads with the cost and with "no reply needed", because the failure
+    # mode here is not an agent that refuses to message, it is an agent that is unfailingly
+    # polite: every message it receives gets a courteous acknowledgement, each of which wakes
+    # a container and costs real money to say "thanks".
+    lines.append(
+        '- {"type":"message","to":"<colleague name or role>","text":"...","item_id":42} — '
+        "send a direct message to another assistant on this project (they are listed in the "
+        "`colleagues` block of your context). It WAKES them: a whole beat starts to read it, "
+        "which costs the project real money. `item_id` is optional and is the point of the "
+        "action — reference a board item and they receive the entire report, not your "
+        "summary of it. Message someone when you need THEM to do something you cannot. Do "
+        "not message to acknowledge, to thank, or to confirm you have read something: "
+        "silence is the correct answer to good news.")
     lines.append('- {"type":"none"} — nothing is worth doing this beat. Preferred over noise.')
     return "\n".join(lines)
 
 
 async def reason(assistant: dict, context: dict, workspace_report: str = "",
-                 docs: str = "", ask: str = "") -> dict:
+                 docs: str = "", ask: str = "", trigger_kind: str = "") -> dict:
     """ONE LLM call: docs + SOUL + role + context -> {thought, actions[], done}.
 
     The ORDER of the prompt is deliberate and is Mike's: **the project's own documents come
@@ -666,7 +805,29 @@ async def reason(assistant: dict, context: dict, workspace_report: str = "",
     user = ("PROJECT CONTEXT (JSON):\n" + json.dumps(context, default=str)[:14000]
             + ("\n\nWORKSPACE (what your checkout looks like right now):\n"
                + workspace_report[:12000] if workspace_report else ""))
-    if ask:
+    if ask and trigger_kind == "dm":
+        # A COLLEAGUE, not a customer. Same position in the prompt as a human ask — last and
+        # unmistakable — but framed differently on purpose, because the two want opposite
+        # default behaviour at the end. A human who asks deserves an answer; a colleague who
+        # says "fixed, please retest" deserves a RETEST, and a reply saying "great, thanks"
+        # is a beat, a container and up to $1.59 spent on politeness. So the closing
+        # instruction here is explicitly permission to say nothing.
+        user += (
+            "\n\n=== A COLLEAGUE ON THIS PROJECT HAS MESSAGED YOU ===\n"
+            f"{ask[:A.MAX_ASK_CHARS]}\n"
+            "=== end of the message(s) ===\n\n"
+            "You were woken by that message: this beat exists because of it, so it decides "
+            "what you do now. DO THE WORK IT ASKS FOR, using the capabilities you hold — if "
+            "it points at a workspace item, the whole item is quoted above, so act on it "
+            "rather than asking for more detail.\n\n"
+            "**Replying is optional and is usually wrong.** Every message you send wakes a "
+            "whole container and costs the project real money. Reply ONLY if the sender "
+            "cannot continue without something from you — an answer to a question, or the "
+            "news that the thing they are waiting on is ready. Do NOT reply to acknowledge, "
+            "to thank, to confirm receipt, or to say you have started. Recording what you "
+            "did on the workspace board is how you report; it costs nobody a beat, and the "
+            "sender sees it there. If nothing needs saying, say nothing.")
+    elif ask:
         # LAST, and unmistakable. The grounding order is docs -> SOUL -> state -> the ask, so
         # an addressed assistant still knows what the product is for before it acts. But a
         # human who typed `@you <something>` is not asking for the agent's opinion on what
@@ -911,6 +1072,42 @@ async def act_workspace_update(assistant: dict, action: dict) -> dict:
                       + (" + comment" if text else "")}
 
 
+async def act_message(assistant: dict, action: dict,
+                      beat_id: Optional[int] = None) -> dict:
+    """Send a DM to a colleague on this project (phase 33). No capability gate.
+
+    Ungated for the same reason the board is: this is how an assistant reaches the one
+    colleague who CAN do the thing it cannot, and it touches no code and leaves no project.
+    What it does cost is a beat — so every bound lives in `messaging.send`, and the refusals
+    it returns come back as an action RESULT the human can read, not as a silent no-op.
+    """
+    project_id = str(assistant["project_id"])
+    body = str(action.get("text") or action.get("message") or "").strip()
+    if not body:
+        return {"ok": False, "detail": "message needs `text`"}
+    to_ref = action.get("to") or action.get("assistant") or action.get("title") or ""
+    to = await M.resolve(project_id, to_ref)
+    if not to:
+        names = ", ".join(
+            f"{c['name'] or c['role']}" for c in await M.roster(
+                project_id, exclude_id=int(assistant["id"]))) or "(nobody else)"
+        return {"ok": False,
+                "detail": f"no colleague matching {str(to_ref)[:60]!r}. On this project: {names}"}
+    item_id = action.get("item_id") or action.get("refs_item_id")
+    try:
+        item_id = int(item_id) if item_id else None
+    except (TypeError, ValueError):
+        item_id = None
+    res = await M.send(project_id, sender=assistant, to=to, body_md=body,
+                       refs_item_id=item_id, beat_id=beat_id)
+    if not res.get("ok"):
+        return res
+    msg = res.get("message") or {}
+    return {"ok": True, "message_id": msg.get("id"), "to": msg.get("to_name"),
+            "blocked": res.get("blocked") or "", "woke": bool(res.get("woke")),
+            "detail": f"-> {msg.get('to_name')}: {res.get('detail')}"}
+
+
 async def apply_action(assistant: dict, action: dict,
                        beat_id: Optional[int] = None) -> dict:
     """Dispatch one action. A denied capability is a recorded action RESULT, not a crash —
@@ -936,6 +1133,9 @@ async def apply_action(assistant: dict, action: dict,
             return await act_workspace_add(assistant, action)
         if kind in ("workspace_update", "workspace_comment", "ws_update"):
             return await act_workspace_update(assistant, action)
+        # messaging a colleague (phase 33). Ungated on purpose — see `_action_menu`.
+        if kind in ("message", "dm", "msg", "send_message"):
+            return await act_message(assistant, action, beat_id=beat_id)
         return {"ok": False, "detail": f"unknown action type {kind!r}"}
     except A.Denied as e:
         return {"ok": False, "denied": True, "detail": str(e)}

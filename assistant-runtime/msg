@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""msg — talk to the other assistants on this project.
+
+    `ws` is the noticeboard. `msg` is tapping a colleague on the shoulder.
+
+    Tester   -> Developer:  "Found it. Filed #42 with the repro. Can you take it?"
+    Developer -> Tester:    "Fixed in a1b2c3d and deployed. Please retest."
+
+SENDING A MESSAGE WAKES SOMEBODY UP. There is no assistant sitting idle waiting for mail:
+containers exist only for the length of a beat, so a DM is stored and then a WHOLE BEAT is
+started for the recipient to read it. That beat costs the project real money ($0.20-1.59 for
+a Developer). This is the single most important thing to understand about this tool, and it
+is why the help below spends more words on when NOT to send than on how to send.
+
+Design notes, because this is a tool an LLM must use correctly on the first try:
+
+* **You cannot forge a sender.** Who you are comes from the token in this container, not from
+  anything you pass. You choose the recipient; that is all.
+* **`--ref <item_id>` is the point of the tool.** With it, the recipient wakes holding the
+  WHOLE workspace item — body, every comment, the history, the links — not your summary of
+  it. "I found a bug, it's #42, check it out" only works if #42 travels with the message.
+* **Bounds are enforced, and a bounded send exits 1.** A conversation that has gone too many
+  replies deep is STORED and VISIBLE but not delivered, and so is a message on a project that
+  has spent its daily budget. Do not retry: retrying is the exact loop the bound exists to
+  stop. Put it on the board with `ws` instead — a board item needs nobody woken.
+* **Text out by default, `--json` when asked.** Same shape as `ws` and `mikeweb`.
+* **Exit 0 = sent. 1 = the API refused, or a bound stopped it. 2 = the tool could not run.**
+
+Stdlib only: this must work in a container with no pip install.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONTROL_URL = os.environ.get("CONTROL_URL", "").rstrip("/")
+TOKEN = os.environ.get("ASSISTANT_TOKEN", "")
+BEAT_ID = os.environ.get("BEAT_ID", "")
+
+OK, REFUSED, TOOL_ERROR = 0, 1, 2
+
+BASE = "/api/assistant/messages"
+
+
+def die(msg: str, code: int = TOOL_ERROR):
+    print("msg: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def call(method: str, path: str, body=None, timeout: float = 45.0):
+    if not CONTROL_URL or not TOKEN:
+        die("CONTROL_URL / ASSISTANT_TOKEN are not set — this only runs inside a beat")
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"X-Assistant-Token": TOKEN, "Content-Type": "application/json",
+               "Accept": "application/json"}
+    if BEAT_ID:
+        # Lets the control plane link a message sent during this beat to the message that
+        # WOKE this beat — which is how a reply is counted as a reply, and therefore how the
+        # chain-depth bound stays honest without the model having to remember `--reply`.
+        headers["X-Beat-Id"] = BEAT_ID
+    req = urllib.request.Request(CONTROL_URL + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(detail).get("detail")
+            if isinstance(parsed, dict):
+                # A 404 for an unknown recipient carries the roster — print it, because "no
+                # such colleague" without the list of colleagues is a dead end.
+                people = parsed.get("colleagues") or []
+                detail = str(parsed.get("message") or parsed)
+                if people:
+                    detail += "\n  on this project: " + ", ".join(
+                        f"{p.get('name') or p.get('role')} (#{p.get('id')})" for p in people)
+            elif parsed:
+                detail = str(parsed)
+        except Exception:
+            pass
+        die(f"HTTP {e.code}: {str(detail)[:600]}", REFUSED)
+    except Exception as e:  # noqa: BLE001
+        die(f"could not reach the control plane: {str(e)[:200]}")
+    return json.loads(raw) if raw.strip() else {}
+
+
+def qs(**kw) -> str:
+    pairs = {k: v for k, v in kw.items() if v not in ("", None)}
+    return ("?" + urllib.parse.urlencode(pairs)) if pairs else ""
+
+
+# --- rendering -------------------------------------------------------------
+def when(ts) -> str:
+    """`2026-08-14T19:01:… -> 19:01` — the form the left pane uses, so a model quoting a
+    message back to a human writes the same thing the human is looking at."""
+    s = str(ts or "")
+    return s[11:16] if len(s) >= 16 else s
+
+
+def line(m: dict) -> str:
+    head = (f"{m.get('from_name') or 'system'} → {m.get('to_name') or '?'} · {when(m.get('created_at'))}")
+    marks = []
+    if m.get("refs_item_id"):
+        marks.append(f"refs #{m['refs_item_id']}")
+    if m.get("blocked"):
+        marks.append(f"NOT DELIVERED ({m['blocked']})")
+    elif not m.get("read_at"):
+        marks.append("unread")
+    tail = ("   [" + ", ".join(marks) + "]") if marks else ""
+    return f"#{m.get('id')}  {head}{tail}\n    " + \
+           "\n    ".join((m.get("body_md") or "").splitlines()[:20])
+
+
+# --- commands --------------------------------------------------------------
+def cmd_who(args) -> int:
+    res = call("GET", "/api/assistant/colleagues")
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return OK
+    you = res.get("you") or {}
+    print(f"you are {you.get('name') or you.get('role')} (#{you.get('id')})\n")
+    people = res.get("colleagues") or []
+    if not people:
+        print("there is nobody else on this project to message.")
+        return OK
+    print("you can message:")
+    for p in people:
+        caps = ", ".join(p.get("capabilities") or []) or "no capabilities"
+        print(f"  {str(p.get('name') or ''):16s} {str(p.get('role') or ''):16s} "
+              f"#{p.get('id')}  [{p.get('status')}]  {caps}")
+    print(f"\nmax chain depth: {res.get('max_chain_depth')} replies per conversation.")
+    return OK
+
+
+def cmd_send(args) -> int:
+    body = {"to": args.to, "body_md": args.body}
+    if args.ref:
+        body["refs_item_id"] = int(args.ref)
+    if args.reply:
+        body["reply_to"] = int(args.reply)
+    res = call("POST", BASE, body)
+    m = res.get("message") or {}
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        print(f"#{m.get('id')}  {m.get('from_name')} → {m.get('to_name')}"
+              f" (depth {res.get('depth')}/{res.get('max_depth')})")
+        print(res.get("detail") or "")
+    # A bound is not a crash, but it is NOT a success either — an agent that reads exit 0 here
+    # concludes the colleague has been woken and waits for a reply that is never coming.
+    return REFUSED if res.get("blocked") else OK
+
+
+def cmd_inbox(args) -> int:
+    res = call("GET", BASE + qs(unread=("true" if not args.all else "false"),
+                                limit=args.limit))
+    msgs = res.get("messages") or []
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return OK
+    if not msgs:
+        print("nothing in your inbox." if args.all else "no unread messages.")
+        return OK
+    print(f"{len(msgs)} message(s):\n")
+    for m in msgs:
+        print(line(m))
+        print("")
+    return OK
+
+
+def cmd_thread(args) -> int:
+    res = call("GET", f"{BASE}/thread/{int(args.id)}")
+    msgs = res.get("messages") or []
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return OK
+    print(f"thread {args.id} — {len(msgs)} message(s), "
+          f"max chain depth {res.get('max_chain_depth')}:\n")
+    for m in msgs:
+        print(line(m))
+        print("")
+    return OK
+
+
+EPILOG = """\
+Talk to the other assistants working on this project. A message WAKES the recipient: a whole
+beat starts so they can read it, and that costs the project real money.
+
+  msg who                                     who is here, and what they are allowed to do
+  msg inbox                                   what has been sent to you and not yet read
+  msg send --to Developer --ref 42 \\
+      --body "Found a bug in the signup form — filed it as #42 with the repro. Can you fix
+it? Let me know when it is deployed and I will retest."
+  msg send --to Tester --ref 42 \\
+      --body "Fixed in a1b2c3d and deployed. Please retest."
+  msg thread 17                               the whole conversation, in order
+
+WHEN TO SEND ONE
+  * You need a colleague to DO something you cannot do yourself (you found a bug and cannot
+    edit code; you shipped a fix and need it retested).
+  * You are blocked on an answer only they have.
+
+WHEN NOT TO SEND ONE — this is most of the time
+  * To acknowledge, to thank, or to confirm you have read something. Silence is the correct
+    answer to good news. "No reply needed" is a real and preferred outcome.
+  * To tell somebody what you did. Put it on the board with `ws` — everyone reads the board
+    and it wakes nobody.
+  * To ask for something that is already written down. Look with `ws list` / `ws search`.
+
+--ref IS THE POINT. `msg send --to Developer --ref 42` makes the recipient wake up holding the
+entire item #42 — body, every comment, the full history and its links. Without it they get
+your one-line summary of a bug report and have to go and find the rest.
+
+BOUNDS (they are real; do not work around them)
+  * A conversation stops after a fixed number of replies. Past that, a message is stored and
+    visible but NOT delivered and nobody is woken. Use the board.
+  * A project that has spent its daily budget delivers nothing until midnight UTC.
+  * Messaging the same person twice before they wake costs one beat, not two.
+
+Exit codes:  0 = sent   1 = refused, or a bound stopped it (do NOT retry)   2 = tool error
+
+This project only. You cannot message an assistant on someone else's app.
+"""
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="msg",
+        description="Send a direct message to another assistant on this project — and wake "
+                    "them up to read it.",
+        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+
+    # `--json` on the root AND on every subparser, with SUPPRESS so the subparser's copy only
+    # writes when actually present. Exactly the shape `ws` settled on after `ws list --json`
+    # — the only form anyone would guess — exited 2 and read as a broken tool.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=lambda **kw: (
+        argparse.ArgumentParser(parents=[common], **kw)))
+
+    w = sub.add_parser("who", help="who else is on this project, and what they can do")
+    w.set_defaults(fn=cmd_who)
+
+    s = sub.add_parser("send", help="send a colleague a message (this WAKES them)")
+    s.add_argument("--to", required=True, help="their name, role or numeric id")
+    s.add_argument("--body", required=True,
+                   help="what you need from them, and why. Be specific: they wake with no "
+                        "memory of your beat.")
+    s.add_argument("--ref", default="",
+                   help="a workspace item id — they receive the WHOLE item, not a summary")
+    s.add_argument("--reply", default="",
+                   help="the message id you are answering (usually unnecessary — a message "
+                        "sent during a beat you were woken for is linked automatically)")
+    s.set_defaults(fn=cmd_send)
+
+    i = sub.add_parser("inbox", help="messages sent to you")
+    i.add_argument("--all", action="store_true", help="include ones you have already read")
+    i.add_argument("--limit", type=int, default=25)
+    i.set_defaults(fn=cmd_inbox)
+
+    t = sub.add_parser("thread", help="one conversation, oldest first")
+    t.add_argument("id"); t.set_defaults(fn=cmd_thread)
+
+    args = p.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(TOOL_ERROR)

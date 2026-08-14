@@ -96,6 +96,19 @@ RUN chmod 0555 /usr/local/bin/mikeweb
 COPY ws /usr/local/bin/ws
 RUN chmod 0555 /usr/local/bin/ws
 
+# TALKING TO COLLEAGUES (phase 33). `ws` is the noticeboard; `msg` is tapping one assistant on
+# the shoulder — and because containers are ephemeral, "tapping on the shoulder" means the
+# control plane stores the message and STARTS A BEAT for the recipient. So this one CLI can
+# spend the project's money, and every bound that stops it running away (chain depth,
+# coalesced wakes, the daily budget) is enforced server-side in `server/messaging.py`, not
+# here: a tool in an LLM-driven container is a suggestion, not a control.
+#
+# Same credential rule as mikeweb and ws: nothing baked in. It authenticates with the
+# per-assistant `asst_…` token already in the environment, which is also what makes a forged
+# sender impossible — the FROM of a message is the token, never the request body.
+COPY msg /usr/local/bin/msg
+RUN chmod 0555 /usr/local/bin/msg
+
 # The skills that tell the coding agent these tools exist and when to reach for them. Pi's
 # own mechanism (the Agent Skills spec: a directory with SKILL.md + frontmatter), loaded by
 # beat.py with an explicit `--skill` per directory. They live in the IMAGE, not in the repo:
