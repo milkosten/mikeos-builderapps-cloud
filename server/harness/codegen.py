@@ -73,14 +73,44 @@ EMBED_CONTRACT = (
     "error, and an app that is serving 200s and passing its health check looks completely dead."
 )
 
-# What an assistant's coding agent is told about the platform. Same words as rules 6 and 9,
+# The blue/green consequence — and the one genuinely sharp edge of zero-downtime deploys.
+#
+# The app runs `db/migrate.js` on boot and both colours share ONE database. So the new colour
+# migrates the schema out from under the old colour WHILE the old colour is serving every user,
+# and it does it BEFORE it has passed the health gate. A `DROP COLUMN` therefore breaks the live
+# app at the moment the *candidate* starts; and if the candidate then fails its gate, the
+# platform correctly keeps the old colour on the air — now running against a schema that no
+# longer has the column its queries name. Blue/green contains a bad CONTAINER, it cannot contain
+# a bad DATABASE change: a destructive migration is the one thing that can still take a working
+# app down. Hence expand now, contract in a later release.
+MIGRATION_CONTRACT = (
+    "Migrations must be BACKWARD-COMPATIBLE with the version of the app that is already "
+    "running. Deploys are zero-downtime (blue/green): the new container boots and runs the "
+    "migrations while the PREVIOUS version is still serving live traffic against the SAME "
+    "database, and the previous version keeps serving if the new one fails its health check. "
+    "A migration must therefore never break the older code that is still reading.\n"
+    "  * ALLOWED: create a new table; ADD a column (nullable, or with a DEFAULT); add an index; "
+    "backfill data; add a constraint that existing rows already satisfy.\n"
+    "  * FORBIDDEN in the same release as the code change: DROP COLUMN, DROP TABLE, RENAME a "
+    "column or table, a lossy type change, or adding a NOT NULL column with no default. Every "
+    "one of those breaks the running version instantly.\n"
+    "  * To rename `foo` to `bar`: add `bar`, have the new code write BOTH, backfill — and leave "
+    "`foo` alone. Dropping it is a SEPARATE, LATER change, made only once no running version "
+    "reads it. This is the expand/contract pattern and it is not optional here.\n"
+    "  * Never edit a migration file that has already been applied: the runner tracks which "
+    "files it has run, so an edited one is never re-applied and the schema silently diverges "
+    "from what the file says."
+)
+
+# What an assistant's coding agent is told about the platform. Same words as rules 6, 9 and 10,
 # without the numbering that only makes sense inside NO_SAAS_RULE.
 PLATFORM_CONTRACTS = (
     "## Platform contracts (the hosting platform's, not the app's)\n\n"
-    "Breaking either of these makes a working app look broken to its owner. They are not "
+    "Breaking any of these makes a working app look broken to its owner. They are not "
     "style preferences and they are not negotiable.\n\n"
     "- **Health endpoint.** " + HEALTH_CONTRACT + "\n\n"
-    "- **Stay embeddable.** " + EMBED_CONTRACT
+    "- **Stay embeddable.** " + EMBED_CONTRACT + "\n\n"
+    "- **Backward-compatible migrations.** " + MIGRATION_CONTRACT
 )
 
 # The constraint that must appear in EVERY codegen system prompt.
@@ -116,7 +146,8 @@ NO_SAAS_RULE = (
     "Create each table exactly once across all migrations (never both `notes` and `public.notes`), "
     "always `IF NOT EXISTS`, and never ALTER or re-shape the scaffold's existing `app_meta` table. Any "
     "`ON CONFLICT (col)` you write REQUIRES a matching UNIQUE/PRIMARY KEY constraint on that column.\n"
-    "9. PLATFORM CONTRACT — " + EMBED_CONTRACT
+    "9. PLATFORM CONTRACT — " + EMBED_CONTRACT + "\n"
+    "10. PLATFORM CONTRACT — " + MIGRATION_CONTRACT
 )
 
 

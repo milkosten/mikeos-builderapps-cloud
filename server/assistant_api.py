@@ -308,7 +308,17 @@ async def project_assistant_activity(project_id: str, request: Request,
     """
     await _owned(project_id, request)
     feed = await A.recent_activity(project_id, limit)
-    return {"beats": feed, "beating": any(b.get("status") == "running" for b in feed)}
+    # The thread tail rides along on the SAME poll. A phase-31 deploy-failure `@message` is
+    # written into the thread by the CONTROL PLANE, not by the browser, so without this the
+    # user would only see "the deploy failed" once they happened to reload — and the whole
+    # point of putting the failure in the open is that they watch it happen. Reusing this
+    # poll rather than adding a second one also keeps one cadence and one source of truth.
+    try:
+        messages = (await store.get_messages(project_id))[-12:]
+    except Exception:  # noqa: BLE001 — the feed must never fail on the extra
+        messages = []
+    return {"beats": feed, "beating": any(b.get("status") == "running" for b in feed),
+            "messages": messages}
 
 
 @router.get("/api/projects/{project_id}/assistants/{assistant_id}/soul",

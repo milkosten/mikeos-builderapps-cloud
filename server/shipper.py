@@ -1,16 +1,16 @@
-"""Ship HEAD (phase 30) — build + health-gate the commit that is ALREADY in git, or roll back.
+"""Ship HEAD (phases 30 + 31) — build + health-gate the commit that is ALREADY in git.
 
 This is the chain behind an assistant's `request_deploy`, and it is deliberately **not** the
 build pipeline.
 
     checkout origin/HEAD  ->  compose normalizer  ->  docker build  ->  HEALTH GATE
-                                                              |
-                                            green ------------+------------ red
-                                              |                              |
-                                    record the deployment        roll the repo back to the
-                                    against the beat, live       last commit that passed the
-                                                                 gate, redeploy THAT, and
-                                                                 record the beat `failed`
+                                                              |            (the NEW colour,
+                                            green ------------+---- red     still detached)
+                                              |                        |
+                                    flip traffic to the new     delete the new colour and
+                                    colour, retire the old,     TELL THE ASSISTANT what
+                                    record the deployment       broke (phase 31). The live
+                                                                app was never touched.
 
 ## Why this is its own module and not another `pipeline.py` function
 
@@ -31,21 +31,29 @@ unattended commit from taking a live app down, and it is what lets the assistant
 stay on the right side of the boundary that matters — **it never gets the Docker socket.**
 Docker access is host root; the assistant asks, the control plane acts.
 
-## Never leave the app broken
+## Never leave the app broken — and, since phase 31, never even touch it
 
-Every failure path ends with a running app:
-  * the health gate goes red        -> roll back to the last good commit and redeploy it
-  * the rollback deploy ALSO fails  -> say so, loudly, in the run error and the beat log
-  * there is no known good commit   -> refuse to guess; leave the stack alone and fail
+The old contract was "roll back to the last good commit if the gate goes red". Blue/green
+makes that unnecessary and, more importantly, makes it *wrong*:
 
-The rollback is a FORWARD commit (`workspace.roll_back_to`), never a force-push: the bad
-commit stays in the log where a human can read it.
+  * the new colour is health-gated while it is still detached from Caddy's network, so a
+    failed deploy has already been contained before anyone could see it. There is nothing to
+    restore — the previous colour never stopped serving.
+  * an automatic revert commit would actively FIGHT the repair the assistant is about to
+    write. Phase 31 says fix forward; a control plane that reverts the agent's work between
+    its beats is a second author with an opposite opinion.
+
+So a red gate now leaves the repo alone (HEAD carries the bad commit, in the log, where a
+human can read it), leaves the app alone (still on the last good colour), and spends its
+effort on the thing that was actually missing: **telling the assistant what broke**
+(`server.repair`). `last_good_sha` still names the commit that is genuinely on the air,
+because it is derived from the deployments table, which only records a colour that went live.
 """
 import logging
 import os
 from typing import Callable, Optional
 
-from server import deployer, gitea, store, workspace
+from server import deployer, gitea, repair, store, workspace
 from server.harness import engine
 from server.harness.engine import Ctx, Step
 
@@ -100,7 +108,8 @@ async def _secrets_for(project_id: str) -> tuple[str, str]:
 def build_ship_steps(user_id: str, email: Optional[str], *, reason: str,
                      assistant_id: Optional[int] = None,
                      beat_id: Optional[int] = None,
-                     outcome: Optional[dict] = None) -> list[Step]:
+                     outcome: Optional[dict] = None,
+                     run_id: Optional[int] = None) -> list[Step]:
     """The three steps. `outcome` is a caller-owned dict the steps fill in, so the caller can
     still learn what happened on the failure path (where no state is returned)."""
     out = outcome if outcome is not None else {}
@@ -143,58 +152,62 @@ def build_ship_steps(user_id: str, email: Optional[str], *, reason: str,
                 ctx.project_id, ws, db_password=db_password, app_secret=app_secret,
                 title=title, assistant_id=assistant_id, beat_id=beat_id)
         except Exception as first:  # noqa: BLE001
-            # ---- THE ROLLBACK -------------------------------------------------------
-            # No repair pass, no second LLM opinion: this module has no reasoning in it by
-            # design. The commit failed the gate, so the commit goes away and the last
-            # thing that WORKED goes back on the air.
+            # ---- THE CONTAINED FAILURE ---------------------------------------------
+            # No repair pass and no second LLM opinion HERE: this module still has no
+            # reasoning in it. What it does have, since phase 31, is a return path — the
+            # evidence goes to the agent that caused it (`server.repair`), and the agent
+            # does the thinking on its own beat, in the open, with a budget.
+            envelope = getattr(first, "envelope", None) or {
+                "stage": "unknown", "summary": str(first)[:600],
+                "commit": ctx.state.get("head_sha", "")[:12],
+                "live_unaffected": bool(ctx.state.get("last_good_sha")),
+            }
             reason_txt = str(first)[:600]
-            logger.warning("ship: %s failed the health gate at %s — rolling back: %s",
-                           ctx.project_id, ctx.state.get("head_sha", "")[:8], reason_txt)
+            live = bool(envelope.get("live_unaffected"))
+            logger.warning("ship: %s failed at %s for %s (live app %s): %s",
+                           ctx.project_id, envelope.get("stage"),
+                           ctx.state.get("head_sha", "")[:8],
+                           "unaffected" if live else "HAS NO PREVIOUS COLOUR", reason_txt)
             ctx.emit({"type": "progress", "stage": "deploy",
-                      "detail": "health gate failed — rolling back to the last good commit"})
+                      "detail": (f"{envelope.get('stage')} failed — the new colour was "
+                                 f"discarded; the live app was never given traffic"
+                                 if live else
+                                 f"{envelope.get('stage')} failed and this project has no "
+                                 f"previously-working version")})
             out["failed_sha"] = ctx.state.get("head_sha", "")
             out["failure"] = reason_txt
-            good = ctx.state.get("last_good_sha") or ""
-            if not good:
-                out["rollback"] = "impossible"
-                raise RuntimeError(
-                    f"deploy of {ctx.state.get('head_sha', '')[:8]} failed the health gate "
-                    f"and there is NO recorded good commit to roll back to — the stack was "
-                    f"left as it is. Original error: {reason_txt}")
-            new_sha = await workspace.roll_back_to(
-                ctx.project_id, good,
-                f"revert: roll back to {good[:8]} — "
-                f"{ctx.state.get('head_sha', '')[:8]} failed the health gate\n\n"
-                f"Automatic rollback by the control plane after an assistant deploy did not "
-                f"go green. The reverted commit is still in the log above.\n\n"
-                f"Reason: {reason_txt[:400]}",
-                ctx.state["gitea_user"], ctx.state["repo"], ctx.state["gitea_token"])
-            out["rollback_sha"] = new_sha or ""
-            try:
-                await deployer.deploy(
-                    ctx.project_id, ws, db_password=db_password, app_secret=app_secret,
-                    title=title, assistant_id=assistant_id, beat_id=beat_id)
-            except Exception as second:  # noqa: BLE001
-                out["rollback"] = "failed"
-                await store.set_project_status(ctx.project_id, "failed")
-                raise RuntimeError(
-                    f"deploy failed AND the rollback to {good[:8]} also failed — the app may "
-                    f"be down. Original: {reason_txt} | Rollback: {str(second)[:400]}")
-            out["rollback"] = "healthy"
-            # The app is up again on the last good commit, so the PROJECT is live even
-            # though the RUN failed. Those are two different facts and the code says so.
-            await store.set_project_status(ctx.project_id, "live")
+            out["stage"] = envelope.get("stage")
+            out["live_unaffected"] = live
+            # No rollback of the repo and no redeploy: the previous colour never stopped.
+            # The PROJECT is still live even though the RUN failed — two different facts.
+            await store.set_project_status(ctx.project_id, "live" if live else "failed")
+            fb = await repair.on_deploy_failed(
+                ctx.project_id, envelope, assistant_id=assistant_id, beat_id=beat_id,
+                run_id=run_id)
+            out["feedback"] = fb
             raise RuntimeError(
-                f"health gate failed for {ctx.state.get('head_sha', '')[:8]}; rolled back to "
-                f"{good[:8]} and the app is healthy again. Reason: {reason_txt}")
+                f"deploy of {ctx.state.get('head_sha', '')[:8]} failed at "
+                f"{envelope.get('stage')}"
+                + (" — the live app was NOT affected (the new colour never took traffic)"
+                   if live else " and this project has no previously-working version")
+                + (f"; escalated to the owner after {fb.get('attempts')} repair attempt(s)"
+                   if fb.get("escalated") else
+                   f"; the error was handed to the assistant (repair attempt "
+                   f"{fb.get('attempt')})" if fb.get("delivered") else "")
+                + f". Reason: {reason_txt}")
+        await repair.on_deploy_healthy(ctx.project_id)
         ctx.state["public_health"] = res["public_health"]
+        out["colour"] = res.get("colour", "")
+        out["retired_colour"] = res.get("retired_colour", "")
         out["deployed_sha"] = res.get("git_sha") or ctx.state.get("head_sha", "")
         out["deployment_id"] = res.get("deployment_id")
         out["health"] = res["public_health"]
         ctx.emit({"type": "deploy",
                   "url": f"https://{ctx.project_id}.{SITES_BASE}/",
                   "health": res["public_health"]})
-        return f"live on {out['deployed_sha'][:8]}: {res['public_health']}"
+        return (f"live on {out['deployed_sha'][:8]} ({res.get('colour', '')}"
+                + (f", retired {res['retired_colour']}" if res.get("retired_colour") else "")
+                + f"): {res['public_health']}")
 
     async def s_record(ctx: Ctx):
         await store.set_project_status(ctx.project_id, "live")
@@ -222,7 +235,7 @@ async def run_ship(project_id: str, run_id: int, user_id: str, email: Optional[s
     the SAME lock the build pipeline takes — a ship can never race a build over one checkout,
     and two ships queue rather than stampede."""
     steps = build_ship_steps(user_id, email, reason=reason, assistant_id=assistant_id,
-                             beat_id=beat_id, outcome=outcome)
+                             beat_id=beat_id, outcome=outcome, run_id=run_id)
     async with workspace.lock(project_id):
         try:
             return await engine.run_partial(project_id, run_id, steps, emit, base_idx=0,

@@ -576,7 +576,11 @@ def _beat_row(r) -> dict:
     return d
 
 
-MAX_ASK_CHARS = 4000
+# A human's `@Developer add a search box` is a sentence. A phase-31 repair task is a sentence
+# PLUS the evidence — a build log tail or 120 lines of the container's own crash output — and
+# that evidence is the entire reason the assistant can fix anything. Clamped at 4000 the error
+# was arriving with its cause cut off, which is the same as not sending it.
+MAX_ASK_CHARS = 12000
 
 
 async def start_beat(assistant_id: int, project_id: str, trigger_kind: str,

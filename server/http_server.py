@@ -59,6 +59,17 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001 — never block startup on recovery
         logger.exception("boot sweep failed")
     runner.start_janitor()
+    # BLUE/GREEN HYGIENE. A control plane that died mid-deploy leaves a built, health-gated
+    # but never-flipped colour behind. It is not live (the network alias says who is), nobody
+    # will ever look at it again, and it is holding its whole memory limit — and the next
+    # deploy would pick that same slot and collide with it. Reaping on boot is what stops a
+    # crash leaving both colours running forever.
+    try:
+        reaped = await deployer.reap_orphan_colours()
+        if reaped:
+            logger.warning("boot reap removed %d orphaned app colour(s)", reaped)
+    except Exception:  # noqa: BLE001 — never block startup on housekeeping
+        logger.exception("blue/green boot reap failed")
     # SAME RECOVERY CONTRACT FOR ASSISTANTS (phase 29). A redeploy kills every beat
     # container's supervisor; without this the assistant row stays claimed and never beats
     # again — the exact bug class that once stranded builds.

@@ -66,21 +66,25 @@ _STAGE_WORDS = {
     "public_check": "the public route check",
 }
 
-# A line that is actually about the failure, as opposed to the fifty lines of npm banner around
-# it. Ordered by how specific it is; the first hit wins.
-_ERROR_LINE_RE = re.compile(
-    r"^\s*(?:"
-    r"(?:Uncaught\s+)?(?:Type|Range|Reference|Syntax|Eval|URI)?Error\b"
-    r"|Error:"
-    r"|error\b.*"
-    r"|throw\b"
-    r"|Cannot find module"
-    r"|E[A-Z]{3,}\b"                       # EACCES, ECONNREFUSED, ENOENT…
-    r"|[0-9A-Z]{5}:"                       # Postgres SQLSTATE, e.g. 28P01:
-    r"|npm ERR!"
-    r"|failed to "
-    r").*$",
-    re.I | re.M)
+# A line that is actually about the failure, as opposed to the fifty lines of banner around it.
+#
+# Tried in PRIORITY order, not in the order they appear in the log. A node crash prints
+# `throw err;` three lines ABOVE `Error: Cannot find module './lib/nope'`, so "the first line
+# that looks like an error" reliably picks the least informative one in the dump. What we want
+# is the most specific match anywhere in the text.
+_ERROR_LINE_PATTERNS = [
+    re.compile(p, re.I | re.M) for p in (
+        r"^.*Cannot find module.*$",
+        r"^.*\bE(?:ACCES|CONNREFUSED|CONNRESET|NOENT|ADDRINUSE|PERM|NOTFOUND|AI_AGAIN)\b.*$",
+        r"^.*\b[0-9][0-9A-Z]{4}\b.*(?:password|permission|denied|does not exist|violat|"
+        r"syntax error).*$",                      # Postgres SQLSTATE lines, e.g. 28P01
+        r"^\s*(?:Uncaught\s+)?(?:Type|Range|Reference|Syntax|Eval|URI|Assertion)?Error:.*$",
+        r"^\s*npm ERR!.*$",
+        r"^.*\bfailed to\b.*$",
+        r"^.*\berror\b.*$",
+        r"^\s*throw\b.*$",
+    )
+]
 
 
 def first_error_line(envelope: dict) -> str:
@@ -95,9 +99,10 @@ def first_error_line(envelope: dict) -> str:
         text = str(envelope.get(field) or "")
         if not text.strip():
             continue
-        m = _ERROR_LINE_RE.search(text)
-        if m:
-            return " ".join(m.group(0).split())[:300]
+        for pattern in _ERROR_LINE_PATTERNS:
+            m = pattern.search(text)
+            if m:
+                return " ".join(m.group(0).split())[:300]
     health = envelope.get("health") or {}
     if isinstance(health, dict) and health.get("http"):
         return f"public /health answered HTTP {health.get('http')}"

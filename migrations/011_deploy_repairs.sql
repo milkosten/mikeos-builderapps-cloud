@@ -1,4 +1,4 @@
--- 010 — a failed deploy tells the assistant what broke, and is BOUNDED (phase 31).
+-- 011 — a failed deploy tells the assistant what broke, and is BOUNDED (phase 31).
 --
 -- The loop this table exists to close: assistant ships -> deploy fails -> assistant is told
 -- the real error -> it fixes forward -> reships. Without it an assistant is write-only and
