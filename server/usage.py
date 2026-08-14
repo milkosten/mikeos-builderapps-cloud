@@ -9,9 +9,10 @@ Accounting must NEVER break a build: every path here swallows its own errors, an
 written on a fire-and-forget task so an LLM call is never blocked on a DB write.
 """
 import asyncio
+import contextlib
 import contextvars
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from server import gpu, store
 
@@ -33,7 +34,35 @@ def clear_context() -> None:
     _ctx.set((None, None, None))
 
 
+# Per-CALLER capture (phase 29). An assistant beat must report what THAT beat cost, and the
+# global sink only knows how to write rows. A ContextVar bucket is the right tool: it is set
+# in the calling task, so the synchronous sink invoked from inside the awaited LLM call sees
+# it, and concurrent builds in other tasks cannot leak into it.
+_capture: contextvars.ContextVar[Optional[List[Dict[str, Any]]]] = \
+    contextvars.ContextVar("usage_capture", default=None)
+
+
+@contextlib.contextmanager
+def capture() -> Iterator[List[Dict[str, Any]]]:
+    """Collect the accounting records produced by LLM calls inside this block.
+
+        with usage.capture() as recs:
+            await gpu.chat(...)
+        cost = sum(r["cost_usd"] for r in recs)
+
+    Purely additive: the rows are still written by the normal sink."""
+    bucket: List[Dict[str, Any]] = []
+    tok = _capture.set(bucket)
+    try:
+        yield bucket
+    finally:
+        _capture.reset(tok)
+
+
 def _sink(rec: Dict[str, Any]) -> None:
+    bucket = _capture.get()
+    if bucket is not None:
+        bucket.append(dict(rec))
     project_id, run_id, step = _ctx.get()
     if not project_id:
         return                      # a call outside any project (e.g. a healthcheck) — ignore
