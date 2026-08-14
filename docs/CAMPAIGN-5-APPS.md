@@ -40,11 +40,11 @@ exactly the 5 chips a real user would click:
 |---|---|---|---|---|---|---|
 | 1 | URL shortener + analytics | `iukghl` (run 34) | yes | **done** — 12/12 features, 0 skipped, ~28 min | **PASS** — created `/mikecamp1` in the UI, followed the redirect (landed on wikipedia), reloaded the dashboard: row persisted with `clicks=1`; `/links/4` stats page renders totals + 30-day chart + the recent-click row; `/health` `{"status":"ok","db":"ok","redis":"ok"}`; zero console/network errors | **none** (unattended) |
 | 2 | Team standup + digest | `3lq510` (run 35) | yes | **done** — 12/12 features, 0 skipped, ~22 min | **PASS (with a caveat)** — registered a member, posted yesterday/today/blockers, reloaded: the board renders my entry server-side; `POST /api/digests/generate` produces a correct digest of both members. Caveat: the digest has **no page** — it exists only as an API. `/health` green, zero console/network errors | **none** (unattended) |
-| 3 | Expense tracker + chart + CSV | — | — | — | — | — |
+| 3 | Expense tracker + chart + CSV | `cj1qbm` (run 36) | yes | **done** — 12/12 features, 0 skipped, ~18 min | **PASS** — registered, added a $123.45 Dining expense (`MIKECAMP3-COFFEE`), reloaded: the row, the *Spending by category* SVG bar chart and the month total all render from the server; `←/→` month nav works; `GET /api/export.csv?month=2026-08` returns real CSV (`2026-08-14,Dining,123.45,MIKECAMP3-COFFEE`); `/health` green, zero console errors | **none** (unattended) |
 | 4 | Changelog + admin + RSS | — | — | — | — | — |
 | 5 | Job board + applications | — | — | — | — | — |
 
-**Status: 2 / 5**
+**Status: 3 / 5**
 
 ## Pipeline fixes made during the campaign
 (append: symptom → root cause → fix → commit)
@@ -72,6 +72,21 @@ exactly the 5 chips a real user would click:
   reply retries the create **once** with every short string suffixed, skipping dates/numbers/booleans
   (suffixing those would turn a 409 into a real 422).
 - **Commit:** `3cccb52`.
+
+### 3. QA read a required query parameter as a broken read path
+- **Symptom (app 3, `cj1qbm`):** `live-with-warnings`, critic: *"`GET /api/expenses` rejects the
+  dashboard's month parameter with HTTP 400 `invalid_month`, so newly created expenses cannot be
+  listed"*. By hand the app is perfect — the expense saves, survives a reload, renders in the chart,
+  and the CSV export returns real rows.
+- **Root cause:** the app's collection endpoint requires `?month=YYYY-MM` (a sane design — the
+  dashboard always sends one), while `plan_flows` is instructed that `list` is the collection
+  endpoint **"(no params)"**. QA called it bare, got 400, and blamed the app.
+- **Fix (two parts):** the planner is told to include REQUIRED query parameters with values that
+  match the record it is creating; and a 4xx on the cross-check list no longer fails the flow — it
+  is recorded on the step and QA proceeds to the RENDER assertion, which is what actually decides
+  whether the user's flow works. A genuinely broken read path still fails (the page has nothing to
+  show).
+- **Commit:** `566fd11`.
 
 ### Observations that did NOT need a fix
 - **App 1, `runtime_qa` reported `live-with-warnings`** — the critic claimed the
