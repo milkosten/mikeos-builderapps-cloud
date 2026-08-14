@@ -195,11 +195,15 @@ def thread_message(name: str, envelope: dict, *, verdict: str, attempt: int = 0)
         f"```\n{first_error_line(envelope)}\n```\n"
     )
     detail = _evidence_block(envelope)
-    room = 3800 - len(body) - len(verdict) - 40
+    room = 3800 - len(body) - len(verdict) - 60
     if detail and room > 200:
         if len(detail) > room:
             detail = "…(truncated)…\n" + detail[-room:]
-        body += f"\n<details>\n{detail}\n</details>\n"
+        # Plain text delimiters, not `<details>`: the thread bubble renders text content, so
+        # an HTML tag arrives as the literal characters "<details>" on the user's screen. That
+        # is correct escaping (agent output must never be injected as markup) and therefore
+        # the message has to be written for a renderer that shows exactly what it is given.
+        body += f"\n— evidence —\n{detail}\n— end of evidence —\n"
     return (body + "\n" + verdict)[:4000]
 
 

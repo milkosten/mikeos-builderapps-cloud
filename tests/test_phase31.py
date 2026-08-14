@@ -211,6 +211,119 @@ def test_bounds_are_declared():
           "otherwise the budget is per-lifetime and the second ever failure escalates")
 
 
+def test_the_cap_actually_binds():
+    """Drive the REAL decision function through three failures and watch it stop.
+
+    Live, this branch is hard to reach: the stronger rule (identical failure twice) fires
+    first, because an agent that cannot fix something tends to fail the same way again. That
+    is the right behaviour and it is what the acceptance run demonstrated — but it means the
+    COUNTING itself never got exercised end to end. So it is exercised here, with three
+    DIFFERENT signatures, which is the case the counter exists for: an agent that keeps
+    finding new ways to be wrong is still an agent that has to be stopped.
+
+    The store and the beat dispatch are stubbed; `repair._on_deploy_failed` is not. What is
+    under test is the decision, not asyncpg.
+    """
+    import asyncio
+    from server import repair
+
+    episodes = {"attempts": 0, "sig": "", "status": "open"}
+    dispatched, messages, paused, statuses = [], [], [], []
+
+    class FakeStore:
+        @staticmethod
+        async def record_repair_failure(project_id, *, assistant_id, failed_sha, stage,
+                                        signature):
+            first = episodes["sig"] == ""
+            prev_sig, episodes["sig"] = episodes["sig"], signature
+            return {"episode_id": 1, "attempts": episodes["attempts"],
+                    "previous_signature": prev_sig, "repeat": (not first
+                                                               and prev_sig == signature),
+                    "first": first, "origin_sha": "aaaa1111"}
+
+        @staticmethod
+        async def count_repair_attempt(episode_id):
+            episodes["attempts"] += 1
+            return episodes["attempts"]
+
+        @staticmethod
+        async def close_repair(project_id, status="resolved", detail=""):
+            episodes["status"] = status
+            return True
+
+        @staticmethod
+        async def append_message(project_id, role, text, meta=None):
+            messages.append(text)
+
+        @staticmethod
+        async def set_project_status(project_id, status):
+            statuses.append(status)
+
+    class FakeAssistants:
+        MAX_SOUL_CHARS = 8000
+
+        @staticmethod
+        async def get(aid, project_id=None):
+            return {"id": 7, "name": "Developer", "role": "Developer",
+                    "project_id": project_id}
+
+        @staticmethod
+        async def set_status(aid, project_id, status):
+            paused.append(status)
+
+    async def fake_dispatch(assistant_id, project_id, task, run_id):
+        dispatched.append(task)
+
+    # `_on_deploy_failed` does `from server import assistants as A` at call time, which reads
+    # the ATTRIBUTE off the package — patching sys.modules alone would not be seen.
+    import server
+    from server import assistants as real_A          # also binds it onto the package
+    real_store, real_dispatch = repair.store, repair._dispatch_repair_beat
+    server.assistants = FakeAssistants
+    repair.store = FakeStore
+    repair._dispatch_repair_beat = fake_dispatch
+    try:
+        # Genuinely different errors, not the same sentence with a different NUMBER in it —
+        # signatures collapse digits on purpose, so "failure 1" and "failure 2" are correctly
+        # the same bug. (Writing it the naive way is how this test first failed, which is the
+        # best evidence the collapsing works.)
+        async def drive():
+            for n, log in enumerate((
+                "Error: Cannot find module './widgets'\n",
+                "Error: connect ECONNREFUSED to the cache\n",
+                "Error: relation \"invoices\" does not exist\n",
+            ), start=1):
+                await repair._on_deploy_failed(
+                    "zzz999",
+                    {"stage": "health_gate", "commit": f"sha{n}", "live_unaffected": True,
+                     "app_logs": log},
+                    assistant_id=7, beat_id=None, run_id=None)
+        asyncio.run(drive())
+    finally:
+        repair.store, repair._dispatch_repair_beat = real_store, real_dispatch
+        server.assistants = real_A
+
+    check("three DIFFERENT failures dispatch exactly two repair beats",
+          len(dispatched) == 2, f"dispatched {len(dispatched)}")
+    check("the third is escalated instead of retried", episodes["status"] == "escalated")
+    check("escalation flags the project for the owner", statuses == ["needs_attention"],
+          f"got {statuses}")
+    check("escalation pauses the assistant", paused == ["paused"], f"got {paused}")
+    check("every failure was announced in the thread", len(messages) == 3,
+          "including the one that stopped — silence is the failure mode this whole phase "
+          "exists to remove")
+    check("the escalation message says what was tried",
+          "could not fix this" in messages[-1] and "Attempts made: 2 of 2" in messages[-1],
+          messages[-1][-300:] if messages else "")
+    check("the repair task tells the agent which attempt it is on",
+          "attempt 1 of 2" in dispatched[0] and "attempt 2 of 2" in dispatched[1])
+    check("the repair task carries the real error",
+          "Cannot find module './widgets'" in dispatched[0])
+    check("the repair task says the live app is safe",
+          "live app was NOT affected" in dispatched[0],
+          "the agent must know it is not racing a down app")
+
+
 def test_migration_contract():
     from server.harness import codegen
 
@@ -227,6 +340,7 @@ def main():
     test_signature()
     test_no_secret_leak()
     test_bounds_are_declared()
+    test_the_cap_actually_binds()
     test_migration_contract()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     for name, why in FAIL:
