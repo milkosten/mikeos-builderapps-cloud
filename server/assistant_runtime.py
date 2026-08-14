@@ -363,7 +363,7 @@ async def shutdown() -> None:
 # The act surface — what a beat container may ask the control plane to do.
 # EVERY function here calls A.require() first. That call is the enforcement.
 # ===========================================================================
-async def perceive(assistant: dict) -> dict:
+async def perceive(assistant: dict, *, include_soul: bool = False) -> dict:
     """A compact, honest snapshot of the project for the reasoning prompt.
 
     Deliberately small: an assistant that is handed 40k tokens of context every 15 minutes
@@ -415,6 +415,19 @@ async def perceive(assistant: dict) -> dict:
             for b in prior]
     except Exception:  # noqa: BLE001
         ctx["my_recent_beats"] = []
+    if include_soul:
+        # Only for the container's GET /context, so it can mirror the SOUL into the repo at
+        # `docs/assistants/<role>.SOUL.md` — the SOUL should live in git next to the app it
+        # serves. NEVER included in the reasoning context: the SOUL is already the system
+        # prompt, and sending it twice is pure waste.
+        ctx["assistant"] = {
+            "id": int(assistant["id"]),
+            "role": assistant.get("role") or "",
+            "name": assistant.get("name") or "",
+            "capabilities": assistant.get("capabilities") or [],
+            "soul_path": f"docs/assistants/{A.slug(assistant.get('role') or 'assistant')}.SOUL.md",
+            "soul_md": assistant.get("soul_md") or "",
+        }
     return ctx
 
 

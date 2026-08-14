@@ -292,7 +292,9 @@ async def _from_token(token: Optional[str]) -> dict:
 @router.get("/api/assistant/context", summary="[beat container] perceive the project")
 async def assistant_context(x_assistant_token: str = Header("")) -> dict:
     a = await _from_token(x_assistant_token)
-    return await R.perceive(a)
+    # include_soul: the container mirrors it into the repo. `reason` deliberately does NOT
+    # include it — there it is already the system prompt.
+    return await R.perceive(a, include_soul=True)
 
 
 @router.post("/api/assistant/reason", summary="[beat container] one LLM round")

@@ -214,6 +214,34 @@ def act_commit_push(action: dict) -> dict:
 LOCAL_ACTIONS = {"write_file": act_write_file, "commit_push": act_commit_push}
 
 
+def mirror_soul(context: dict) -> str:
+    """Write the SOUL into the repo at `docs/assistants/<role>.SOUL.md`.
+
+    The SOUL should live in git next to the app it serves, not only in a control-plane table:
+    that is what makes it reviewable in a diff like everything else about the project. Only
+    done when the assistant may actually commit — otherwise it would leave a permanently
+    dirty checkout that `git status` reports on every future beat.
+    """
+    if "commit_push" not in CAPS:
+        return "soul mirror skipped (commit_push not granted)"
+    a = (context or {}).get("assistant") or {}
+    rel, body = a.get("soul_path"), a.get("soul_md")
+    if not rel or not body:
+        return "soul mirror skipped (nothing to write)"
+    dest = os.path.realpath(os.path.join(REPO, str(rel).lstrip("/")))
+    if not dest.startswith(os.path.realpath(REPO) + os.sep):
+        return "soul mirror refused (path escapes the checkout)"
+    try:
+        if os.path.isfile(dest) and read_capped(dest) == body:
+            return "soul already in the repo, unchanged"
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(body)
+        return f"wrote {rel} ({len(body)} chars) — it ships with the next commit"
+    except OSError as e:
+        return "soul mirror failed: " + str(e)[:200]
+
+
 # ---------------------------------------------------------------------------
 # the beat
 # ---------------------------------------------------------------------------
@@ -235,6 +263,8 @@ def main() -> int:
         log(f"perceive: workspace survey is {len(survey)} chars")
         context = call("GET", "/api/assistant/context", timeout=90)
         log("perceive: control plane context received")
+        if os.path.isdir(os.path.join(REPO, ".git")):
+            log("perceive: " + mirror_soul(context))
 
         # --- reason (ONE call; the control plane owns the model credential) ---
         log("reason: asking the control plane to run one LLM round")
