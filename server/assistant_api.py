@@ -71,6 +71,14 @@ class ActBody(BaseModel):
     action: dict = Field(default_factory=dict)
 
 
+class BeatNowBody(BaseModel):
+    """`@Developer add a search box` — a human addressing one assistant from the composer.
+
+    `task` is optional: an empty body is the plain "beat now" button, which lets the
+    assistant decide for itself what is worth doing."""
+    task: Optional[str] = Field(None, max_length=A.MAX_ASK_CHARS)
+
+
 class ActivityBody(BaseModel):
     """What the assistant is doing, streamed out of the beat container as it happens.
 
@@ -258,7 +266,8 @@ async def pause_assistant(project_id: str, assistant_id: int, request: Request) 
 
 @router.post("/api/projects/{project_id}/assistants/{assistant_id}/beat",
              summary="Run one beat right now")
-async def beat_assistant(project_id: str, assistant_id: int, request: Request) -> dict:
+async def beat_assistant(project_id: str, assistant_id: int, request: Request,
+                         body: Optional[BeatNowBody] = None) -> dict:
     """Kick one beat immediately.
 
     Returns as soon as the beat row exists — a beat takes tens of seconds (a container start
@@ -266,7 +275,7 @@ async def beat_assistant(project_id: str, assistant_id: int, request: Request) -
     Caddy. The client polls `/beats`; the row is already there, marked `running`.
     """
     a = await _owned_assistant(project_id, assistant_id, request)
-    kicked = await R.kick(a)
+    kicked = await R.kick(a, (body.task if body and body.task else "").strip())
     if not kicked:
         raise HTTPException(status_code=409,
                             detail="a beat is already running for this assistant")
@@ -329,13 +338,21 @@ async def assistant_context(x_assistant_token: str = Header("")) -> dict:
 
 
 @router.post("/api/assistant/reason", summary="[beat container] one LLM round")
-async def assistant_reason(body: ReasonBody, x_assistant_token: str = Header("")) -> dict:
+async def assistant_reason(body: ReasonBody, request: Request,
+                           x_assistant_token: str = Header("")) -> dict:
     """The model call happens HERE, not in the container — so no model credential ever
     lives inside an LLM-driven container, and the tokens land in the project's own
     accounting."""
     a = await _from_token(x_assistant_token)
     ctx = await R.perceive(a)
-    return await R.reason(a, ctx, body.workspace or "", body.docs or "")
+    # The human's instruction is read from the BEAT ROW, not from the container's request
+    # body: it decides what this beat spends the project's money on, so it comes from the
+    # row the owner's authenticated call created.
+    raw = (request.headers.get("x-beat-id") or "").strip()
+    ask = ""
+    if raw.isdigit() and await A.beat_belongs_to(int(raw), int(a["id"])):
+        ask = await A.beat_ask(int(raw))
+    return await R.reason(a, ctx, body.workspace or "", body.docs or "", ask)
 
 
 @router.post("/api/assistant/act", summary="[beat container] perform one capability-gated act")

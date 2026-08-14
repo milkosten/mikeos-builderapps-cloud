@@ -534,8 +534,8 @@ async def sweep_orphaned_claims(owner_not: str) -> int:
 
 
 # ---- beats ----------------------------------------------------------------
-_BEAT_COLS = ("id, assistant_id, project_id, status, trigger_kind, thought, actions, log, "
-              "activity, tokens, cost_usd, duration_ms, ts, finished_at")
+_BEAT_COLS = ("id, assistant_id, project_id, status, trigger_kind, user_ask, thought, "
+              "actions, log, activity, tokens, cost_usd, duration_ms, ts, finished_at")
 
 # How many activity lines ONE beat may keep. An agent in a tool loop can emit hundreds; the
 # feed exists so a human can see what is happening, and the last N lines are what answers
@@ -557,16 +557,38 @@ def _beat_row(r) -> dict:
     return d
 
 
-async def start_beat(assistant_id: int, project_id: str, trigger_kind: str) -> int:
+MAX_ASK_CHARS = 4000
+
+
+async def start_beat(assistant_id: int, project_id: str, trigger_kind: str,
+                     user_ask: str = "") -> int:
     """Open the beat row BEFORE the container starts, so the UI shows a running beat
-    immediately and a beat that dies mid-flight still leaves a trace."""
+    immediately and a beat that dies mid-flight still leaves a trace.
+
+    `user_ask` is what a human typed when they addressed this assistant directly
+    (`@Developer add a search box`). Stored here, not merely passed in memory: the container
+    is launched asynchronously, so a control-plane restart in between would otherwise drop
+    the instruction without a word.
+    """
     bid = await pool().fetchval(
         "INSERT INTO builderapps.assistant_beats"
-        "(assistant_id, project_id, status, trigger_kind) VALUES ($1,$2,'running',$3) "
-        "RETURNING id", assistant_id, project_id, trigger_kind[:16])
+        "(assistant_id, project_id, status, trigger_kind, user_ask) "
+        "VALUES ($1,$2,'running',$3,$4) RETURNING id",
+        assistant_id, project_id, trigger_kind[:16], (user_ask or "")[:MAX_ASK_CHARS])
     if bid is None:
         raise RuntimeError("start_beat returned no id")
     return int(bid)
+
+
+async def beat_ask(beat_id: int) -> str:
+    """What the human asked this beat to do, read from the DATABASE.
+
+    Deliberately not taken from the container's own request body: the ask decides what the
+    assistant spends its beat (and the project's money) on, so it comes from the row the
+    owner's authenticated call created, not from something the beat says about itself.
+    """
+    return str(await pool().fetchval(
+        "SELECT user_ask FROM builderapps.assistant_beats WHERE id=$1", beat_id) or "")
 
 
 async def finish_beat(beat_id: int, *, status: str, thought: str = "",
@@ -644,8 +666,8 @@ async def recent_activity(project_id: str, limit: int = 6) -> list[dict]:
     (Postgres), exactly like the pipeline's step history is — never from browser storage.
     """
     rows = await pool().fetch(
-        "SELECT b.id, b.assistant_id, b.project_id, b.status, b.trigger_kind, b.thought, "
-        "       b.activity, b.cost_usd, b.ts, b.finished_at, a.name, a.role "
+        "SELECT b.id, b.assistant_id, b.project_id, b.status, b.trigger_kind, b.user_ask, "
+        "       b.thought, b.activity, b.cost_usd, b.ts, b.finished_at, a.name, a.role "
         "FROM builderapps.assistant_beats b "
         "JOIN builderapps.assistants a ON a.id = b.assistant_id "
         "WHERE b.project_id=$1 AND (jsonb_array_length(b.activity) > 0 "
@@ -658,6 +680,7 @@ async def recent_activity(project_id: str, limit: int = 6) -> list[dict]:
             "beat_id": int(d["id"]), "assistant_id": int(d["assistant_id"]),
             "name": d.get("name") or "", "role": d.get("role") or "",
             "status": d.get("status") or "", "trigger_kind": d.get("trigger_kind") or "",
+            "user_ask": (d.get("user_ask") or "")[:MAX_ASK_CHARS],
             "thought": (d.get("thought") or "")[:2000],
             "activity": d.get("activity") or [],
             "cost_usd": float(d.get("cost_usd") or 0),

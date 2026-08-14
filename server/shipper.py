@@ -58,6 +58,32 @@ SITES_BASE = os.environ.get("SITES_BASE", "builderapps.osmike.com")
 STEP_NAMES = ("ship_checkout", "ship_deploy", "ship_record")
 
 
+def _guard_placeholder(project_id: str) -> str:
+    """Make sure we are not about to put the builder's holding page back on the air.
+
+    The template ships `public/index.html` — "Your app is being built" — and `express.static`
+    is mounted before the app's own routes, so that file SHADOWS a server-rendered `/`. The
+    create pipeline deletes it at `final_deploy`, but it records its deployment sha *before*
+    the commit that carries the deletion. So the very first "last good commit" for a project
+    is one whose tree still contains the placeholder.
+
+    Which means a rollback — the code whose entire job is "never leave the app broken" —
+    could faithfully restore a healthy stack serving the holding page, pass its own health
+    gate (which only reads /health) and report success. Exactly the failure that once shipped
+    a finished app with the builder's placeholder as its public home page.
+
+    So: before every build here, forward or rollback, drop the placeholder if the app has a
+    `/` of its own. Cheap, idempotent, and it closes the hole at the point of use.
+    """
+    try:
+        if workspace.placeholder_state(project_id) == "shadowing":
+            workspace.drop_placeholder(project_id)
+            return "removed the build placeholder that was shadowing the app's own /"
+    except Exception as e:  # noqa: BLE001 — never block a deploy on this
+        logger.info("placeholder guard skipped for %s: %s", project_id, e)
+    return ""
+
+
 async def _secrets_for(project_id: str) -> tuple[str, str]:
     """The project's existing db password + app secret. A ship NEVER mints new ones: this
     deploys an app that already has data, and a fresh DB_PASSWORD would lock it out of its
@@ -106,6 +132,9 @@ def build_ship_steps(user_id: str, email: Optional[str], *, reason: str,
         title = (proj or {}).get("title", "")
         ws = workspace.path_for(ctx.project_id)
         await store.set_project_status(ctx.project_id, "deploying")
+        note = _guard_placeholder(ctx.project_id)
+        if note:
+            ctx.emit({"type": "progress", "stage": "deploy", "detail": note})
         ctx.emit({"type": "progress", "stage": "deploy",
                   "detail": f"building {ctx.state.get('head_sha', '')[:8]} and "
                             f"health-gating it"})

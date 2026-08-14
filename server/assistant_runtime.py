@@ -16,11 +16,15 @@ per beat means no drifting state. A per-assistant workspace directory keeps the 
 ## The safety boundary (the part that must never be softened)
 
 **An assistant container NEVER gets the Docker socket.** It may read, edit, commit and push
-its own project repo — but to DEPLOY it asks the control plane
-(`POST /api/projects/{id}/update` via `act_request_deploy`), which runs the existing
-normalizer + health gate + rollback. Docker-socket access is host root; handing that to an
-LLM-driven container would make every isolation guarantee in this platform meaningless. It is
-the same reason project apps never get it.
+its own project repo — but to DEPLOY it asks the control plane (`act_request_deploy` ->
+`server.shipper`), which builds the pushed HEAD through the compose normalizer and the
+health gate, and rolls back to the last good commit if the gate goes red. Docker-socket
+access is host root; handing that to an LLM-driven container would make every isolation
+guarantee in this platform meaningless. It is the same reason project apps never get it.
+
+Note what `request_deploy` is NOT: it is not the build pipeline's update path. Assistants are
+disconnected from that pipeline — running it here would re-plan a minimal diff with a second
+LLM and overwrite the change the assistant just pushed. It means "ship the current HEAD".
 
 Alongside that: `cap_drop ALL`, `no-new-privileges`, a non-root uid, memory/cpu/pids caps, a
 read-only rootfs with a tmpfs for scratch, and a per-assistant credential scoped to exactly
@@ -234,11 +238,11 @@ def _redact(text: str) -> str:
     return re.sub(r"://[^/@\s]+:[^/@\s]+@", "://***:***@", text)
 
 
-async def open_beat(assistant: dict, trigger_kind: str) -> int:
+async def open_beat(assistant: dict, trigger_kind: str, user_ask: str = "") -> int:
     """Open the beat row. Split out from `execute_beat` so `POST /beat` can hand the caller a
     beat id immediately and let the UI show a running beat while the container works."""
     return await A.start_beat(int(assistant["id"]), str(assistant["project_id"]),
-                              trigger_kind)
+                              trigger_kind, user_ask)
 
 
 async def execute_beat(assistant: dict, beat_id: int, trigger_kind: str) -> int:
@@ -329,15 +333,20 @@ async def tick() -> int:
     return n
 
 
-async def kick(assistant: dict) -> Optional[tuple[dict, int]]:
+async def kick(assistant: dict, user_ask: str = "") -> Optional[tuple[dict, int]]:
     """`POST /beat` — claim + open a beat row and return (assistant, beat_id) NOW; the caller
     runs `execute_beat` in the background so the HTTP request does not block for a minute.
     Returns None when a beat is already in flight, so two impatient clicks can never
-    double-run an assistant."""
+    double-run an assistant.
+
+    `user_ask` is set when a human addressed this assistant directly from the composer
+    (`@Developer add a search box`). It is stored on the beat row, so the reasoning call
+    reads it from the database rather than from anything the container asserts.
+    """
     claimed = await A.claim(int(assistant["id"]), runner.INSTANCE_ID, any_status=True)
     if not claimed:
         return None
-    return claimed, await open_beat(claimed, "manual")
+    return claimed, await open_beat(claimed, "ask" if user_ask else "manual", user_ask)
 
 
 async def sweep_on_boot() -> int:
@@ -505,7 +514,7 @@ def _action_menu(assistant: dict) -> str:
 
 
 async def reason(assistant: dict, context: dict, workspace_report: str = "",
-                 docs: str = "") -> dict:
+                 docs: str = "", ask: str = "") -> dict:
     """ONE LLM call: docs + SOUL + role + context -> {thought, actions[], done}.
 
     The ORDER of the prompt is deliberate and is Mike's: **the project's own documents come
@@ -554,6 +563,20 @@ async def reason(assistant: dict, context: dict, workspace_report: str = "",
     user = ("PROJECT CONTEXT (JSON):\n" + json.dumps(context, default=str)[:14000]
             + ("\n\nWORKSPACE (what your checkout looks like right now):\n"
                + workspace_report[:12000] if workspace_report else ""))
+    if ask:
+        # LAST, and unmistakable. The grounding order is docs -> SOUL -> state -> the ask, so
+        # an addressed assistant still knows what the product is for before it acts. But a
+        # human who typed `@you <something>` is not asking for the agent's opinion on what
+        # would be most valuable this beat — this beat has already been decided for it.
+        user += (
+            "\n\n=== A HUMAN IS ADDRESSING YOU DIRECTLY ===\n"
+            f"{ask[:A.MAX_ASK_CHARS]}\n"
+            "=== end of the request ===\n\n"
+            "This overrides your own judgement about what to do this beat: do THIS, using "
+            "the capabilities you hold. If it is a change to the app and you can edit code, "
+            "make the change. If you cannot do what was asked — wrong capability, or the "
+            "request is unclear or unsafe — say so plainly in a comment rather than doing "
+            "something else instead.")
 
     usage.set_context(project_id, None, f"assistant:{assistant.get('id')}")
     try:
