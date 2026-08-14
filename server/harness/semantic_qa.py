@@ -84,7 +84,10 @@ _PLAN_SYS = (
     "- Put the literal token __MARKER__ inside exactly one short TEXT field whose value a user "
     "would SEE on the page (a title, name, note body, label). That token is how we detect the "
     "record in the rendered page, so it must not be a field the UI hides.\n"
-    "- `list` is the GET endpoint that returns the collection you just wrote to (no params).\n"
+    "- `list` is the GET endpoint that returns the collection you just wrote to. If it REQUIRES "
+    "query parameters (a month, a date, a status filter), include them with values that MATCH "
+    "the record you are creating — `/api/expenses?month=2026-08` for an expense dated "
+    "2026-08-14 — or the endpoint will reject the call.\n"
     "- `page` is the frontend path where that record should become visible, usually \"/\". "
     "If it is a detail page for the record you just created, write the id as `:id` "
     "(e.g. \"/links/:id\") — the id of the created record is substituted in for you.\n"
@@ -361,6 +364,17 @@ async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
                             f"/column. Response was: {ltext[:300]}")
                         result["detail"].append({**step, "verdict": "read_missing"})
                         continue
+                elif 400 <= lstatus < 500:
+                    # A 4xx here is usually OUR call being wrong, not the app's read path: the
+                    # planner is asked for a bare collection URL, so it drops required query
+                    # params and an endpoint like `GET /api/expenses?month=YYYY-MM` answers
+                    # 400 invalid_month. Reporting that as "the page cannot list what it just
+                    # created" accused a healthy expense tracker. The RENDER assertion below is
+                    # the real test — if the page shows the marker, the user's flow works — so
+                    # note the status and carry on instead of failing the flow here.
+                    step["list_status"] = lstatus
+                    step["list_note"] = (f"GET {list_path} -> HTTP {lstatus} "
+                                         f"(likely a missing query parameter): {ltext[:200]}")
                 else:
                     result["findings"].append(
                         f"FLOW '{flow['name']}': GET {list_path} returned HTTP {lstatus} — "

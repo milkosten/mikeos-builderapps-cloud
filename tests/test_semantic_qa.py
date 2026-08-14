@@ -69,6 +69,9 @@ class FakeApp:
         if method == "GET" and path == "/api/links":
             if self.mode == "read_missing":
                 return 200, '{"links":[]}'
+            if self.mode == "list_needs_param":
+                # like the expense tracker: the collection endpoint demands ?month=YYYY-MM
+                return 400, '{"error":"invalid_month"}'
             return 200, '{"links":%s}' % json_dumps(self.rows)
         return 404, "not found"
 
@@ -156,6 +159,16 @@ async def main() -> int:
     out = await _run_with("ok", lambda app: "My Links\n" + "\n".join(app.rows))
     check("a rendered record passes", out["passed"] == 1 and not out["findings"], out)
     check("verdict is ok", out["detail"][0]["verdict"] == "ok", out)
+
+    # --- 4b. a 4xx on the cross-check list is OUR bad call, not a broken app --
+    # The expense tracker's GET /api/expenses requires ?month=YYYY-MM; the planner is asked for
+    # a bare collection URL, so it 400s and QA accused a healthy app of dropping the write.
+    print("\n[list endpoint needs a query param]")
+    out = await _run_with("list_needs_param", lambda app: "My Links\n" + "\n".join(app.rows))
+    check("a 4xx list does NOT fail the flow when the page renders the record",
+          out["passed"] == 1 and not out["findings"], out)
+    check("but the status is still recorded for the report",
+          out["detail"][0].get("list_status") == 400, out["detail"])
 
     # --- 5. a blank page is never silently a pass ---------------------------
     print("\n[blank page]")
