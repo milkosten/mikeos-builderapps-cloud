@@ -1179,7 +1179,12 @@ def main() -> int:
             activity("text", "🧠", thought[:4000], flush=True)
 
         # --- act ------------------------------------------------------------
-        for action in planned[:2]:
+        # The cap comes from the control plane, which is the only side that knows WHY this
+        # beat is running. A beat woken by a colleague gets one extra slot, because the
+        # answer to the colleague is not scope creep — and a cap this container decided for
+        # itself would silently drop the third action the model was just invited to plan.
+        cap = max(1, min(int(r.get("max_actions") or 2), 3))
+        for action in planned[:cap]:
             kind = str(action.get("type") or "").strip().lower()
             log(f"act: {kind}")
             if kind in ("code", "write_file", "edit"):

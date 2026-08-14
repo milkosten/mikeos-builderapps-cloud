@@ -764,6 +764,7 @@ async def reason(assistant: dict, context: dict, workspace_report: str = "",
     soul = (assistant.get("soul_md") or "").strip()[:A.MAX_SOUL_CHARS]
     role = assistant.get("role") or "Assistant"
     caps = assistant.get("capabilities") or []
+    max_actions = MAX_ACTIONS_DM if trigger_kind == "dm" else MAX_ACTIONS
 
     system = (
         # 1. THE PRODUCT — what this thing is for, from the project's own docs.
@@ -802,7 +803,8 @@ async def reason(assistant: dict, context: dict, workspace_report: str = "",
         "- Reply with JSON only: {\"thought\": str, \"actions\": [...], \"done\": bool}.\n"
         "- `thought` is one short paragraph a busy human would actually read: what you "
         "looked at and what you concluded. No preamble.\n"
-        "- At most 2 actions. Emit {\"type\":\"none\"} when the honest answer is that "
+        f"- At most {max_actions} actions. Emit {{\"type\":\"none\"}} when the honest "
+        "answer is that "
         "nothing changed and nothing is worth saying.\n"
         "- Never claim to have done something you did not do.\n"
     )
@@ -830,7 +832,11 @@ async def reason(assistant: dict, context: dict, workspace_report: str = "",
             "news that the thing they are waiting on is ready. Do NOT reply to acknowledge, "
             "to thank, to confirm receipt, or to say you have started. Recording what you "
             "did on the workspace board is how you report; it costs nobody a beat, and the "
-            "sender sees it there. If nothing needs saying, say nothing.")
+            "sender sees it there. If nothing needs saying, say nothing.\n\n"
+            "But if they asked to be TOLD when something is done — 'message me when it is "
+            "deployed so I can retest' — then telling them IS the work, and you have an "
+            "extra action slot this beat precisely so you can do the job AND close the loop. "
+            "Do not leave a colleague waiting on a promise you kept but never mentioned.")
     elif ask:
         # LAST, and unmistakable. The grounding order is docs -> SOUL -> state -> the ask, so
         # an addressed assistant still knows what the product is for before it acts. But a
@@ -861,13 +867,29 @@ async def reason(assistant: dict, context: dict, workspace_report: str = "",
                  for r in recs)
     cost = sum(float(r.get("cost_usd") or 0.0) for r in recs)
 
-    parsed = _parse_reply(raw)
+    parsed = _parse_reply(raw, max_actions)
     parsed["tokens"] = tokens
     parsed["cost_usd"] = round(cost, 6)
+    # Told to the CONTAINER, not just applied here: it is the container that walks the action
+    # list, so a cap the control plane knows about and the container does not is a cap that
+    # silently drops the third action after the model was invited to plan it.
+    parsed["max_actions"] = max_actions
     return parsed
 
 
-def _parse_reply(raw: str) -> dict:
+# How many actions ONE beat may take. Two, so a beat is a decision and not a shopping list —
+# except when a colleague woke it, where the third slot is not scope creep but the ANSWER.
+#
+# Found the hard way on the first real hand-off: the Tester asked the Developer to fix #21 and
+# to say when it was live. The Developer fixed it, shipped it, moved the board item — and had
+# no slot left to reply, so the Tester was never told and the loop it was explicitly asked to
+# close stayed open. Making it choose between doing the work and answering is the wrong
+# trade; the reply is what makes the hand-off a hand-off.
+MAX_ACTIONS = 2
+MAX_ACTIONS_DM = 3
+
+
+def _parse_reply(raw: str, max_actions: int = MAX_ACTIONS) -> dict:
     """Tolerant parse — a model that wraps its JSON in prose must not fail the beat."""
     text = (raw or "").strip()
     if text.startswith("```"):
@@ -889,7 +911,7 @@ def _parse_reply(raw: str) -> dict:
     acts = data.get("actions")
     if not isinstance(acts, list):
         acts = []
-    clean = [a for a in acts if isinstance(a, dict) and a.get("type")][:2]
+    clean = [a for a in acts if isinstance(a, dict) and a.get("type")][:max(1, max_actions)]
     return {"thought": str(data.get("thought") or "")[:8000], "actions": clean,
             "done": bool(data.get("done", True))}
 
