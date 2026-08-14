@@ -203,6 +203,20 @@ async def main() -> int:
     check("marker injected in nested strings only",
           injected == {"a": m1, "b": [f"x/{m1}"], "n": 3}, injected)
 
+    # --- 8. a detail page gets the created record's id substituted in --------
+    # The campaign's first build was reported broken by QA purely because the flow's page was
+    # the literal "/links/:id": the app answered "Link not found" for a route that works.
+    print("\n[detail page id]")
+    check("`:id` is filled from the create response",
+          semantic_qa._resolve_page("/links/:id", '{"link":{"id":"4"}}') == "/links/4")
+    check("`{id}` and `__ID__` work too",
+          semantic_qa._resolve_page("/n/{id}", '{"id":12}') == "/n/12"
+          and semantic_qa._resolve_page("/a/__ID__", '{"id":"ab-cd"}') == "/a/ab-cd")
+    check("no id in the response -> fall back to the index, never a bogus URL",
+          semantic_qa._resolve_page("/links/:id", '{"ok":true}') == "/")
+    check("a plain page is untouched",
+          semantic_qa._resolve_page("/", '{"id":9}') == "/")
+
     print(f"\n{_passed} passed, {len(_failed)} failed")
     if _failed:
         print("failed: " + ", ".join(_failed))

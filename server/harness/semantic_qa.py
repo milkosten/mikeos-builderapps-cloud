@@ -85,7 +85,9 @@ _PLAN_SYS = (
     "would SEE on the page (a title, name, note body, label). That token is how we detect the "
     "record in the rendered page, so it must not be a field the UI hides.\n"
     "- `list` is the GET endpoint that returns the collection you just wrote to (no params).\n"
-    "- `page` is the frontend path where that record should become visible, usually \"/\".\n"
+    "- `page` is the frontend path where that record should become visible, usually \"/\". "
+    "If it is a detail page for the record you just created, write the id as `:id` "
+    "(e.g. \"/links/:id\") — the id of the created record is substituted in for you.\n"
     "Respond ONLY as JSON:\n"
     '{"flows":[{"name":"...","create":{"method":"POST","path":"/api/x","body":{...}},'
     '"list":"/api/x","page":"/"}]}'
@@ -148,6 +150,29 @@ async def plan_flows(project_id: str, brief: str, tech_plan: str) -> List[Dict[s
             "page": str(f.get("page") or "/") or "/",
         })
     return out
+
+
+_PLACEHOLDER_RE = re.compile(r":[A-Za-z_]\w*|\{[A-Za-z_]\w*\}|__ID__")
+
+
+def _resolve_page(page: str, create_response: str) -> str:
+    """Substitute the id of the record we just created into a detail-page path.
+
+    The planner is allowed to answer `page: "/links/:id"` — the natural place to look for a
+    freshly created record. Nothing used to fill `:id` in, so the browser was sent to the
+    literal path, the app answered "not found", and QA reported a *broken* app that was
+    perfectly healthy (measured on the campaign's first build). `_ID_RE` was written for this
+    and then never wired up.
+
+    If the create response carries no id we fall back to the index rather than assert against
+    a URL we know is wrong — a weaker assertion beats a false accusation.
+    """
+    if not _PLACEHOLDER_RE.search(page or ""):
+        return page or "/"
+    m = _ID_RE.search(create_response or "")
+    if not m:
+        return "/"
+    return _PLACEHOLDER_RE.sub(m.group(2), page)
 
 
 def _same_route(template: str, concrete: str) -> bool:
@@ -299,11 +324,13 @@ async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
                     continue
 
             # 3. the RENDER — the only assertion that catches "No links yet" with rows in the DB
-            shown = await br.page_text(flow.get("page") or "/")
+            page = _resolve_page(flow.get("page") or "/", text)
+            step["page"] = page
+            shown = await br.page_text(page)
             if not shown:
                 result["detail"].append({**step, "verdict": "page_unreadable"})
                 result["findings"].append(
-                    f"FLOW '{flow['name']}': the page {flow.get('page') or '/'} rendered no "
+                    f"FLOW '{flow['name']}': the page {page} rendered no "
                     f"readable text at all — it is blank or the JS threw before painting.")
                 continue
             if marker in shown:
@@ -315,7 +342,7 @@ async def run_flows(project_id: str, base_url: str, flows: List[Dict[str, Any]]
             result["findings"].append(
                 f"FLOW '{flow['name']}': a record was created via {flow['method']} "
                 f"{flow['path']} (HTTP {status}) {api_note}, but it does NOT appear anywhere "
-                f"in the rendered page {flow.get('page') or '/'} — the marker {marker} is "
+                f"in the rendered page {page} — the marker {marker} is "
                 f"absent from the page text. The FRONTEND is not rendering data the API "
                 f"returns: read what that endpoint actually returns and unwrap that exact key "
                 f"in the client before iterating. The page currently shows: "
