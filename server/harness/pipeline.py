@@ -5,10 +5,15 @@ create-application-pipeline (the 20-30+ step run):
   -> strategy docs (phase 13) -> parse backlog -> data layer (phase 15) -> per-feature build loop
   (phase 15) -> final redeploy (phase 16) -> runtime QA + autofix (phase 17) -> finalize.
 
-update-application-pipeline (phase 18):
-  checkout latest -> context block (brief + TECHNICAL-PLAN + last N commits) -> minimal-diff
-  codegen -> apply -> deploy (health-gate, last-good rollback) -> runtime QA on the change ->
-  commit + push.
+update-application-pipeline (phase 18, on the tool loop since phase 26/28):
+  checkout latest -> context (brief + TECHNICAL-PLAN + last N commits + the file list) ->
+  AGENTIC minimal diff (read/grep/edit, syntax-gated, full transcript on disk) -> deploy
+  (health-gate; repair pass first, last-good rollback only if that fails) -> runtime QA on the
+  change -> commit + push.
+
+  A change request is the "read before you write" case par excellence: the `{"links"}` ->
+  `{"items"}` regression happened because a whole-file rewrite renamed a server response key
+  while fixing the client. The agent must now open the endpoint before it touches the caller.
 
 Structural work (repo/compose/deploy/git) stays deterministic. The LLM (Kimi) decides *what the
 app is* and writes *app code*. The SSE vocabulary the SPA consumes is preserved; new steps add
@@ -508,6 +513,10 @@ def build_update_steps(user_id: str, email: Optional[str], request_text: str) ->
             project_id=ctx.project_id, run_id=ctx.run_id, step="plan_and_apply",
             brief=ctx.state["brief"], tech_plan=ctx.state["tech_plan"],
             task=request_text, recent_changes=ctx.state.get("recent_commits", []),
+            extra="This app is ALREADY LIVE with real user data. Read every file you touch "
+                  "first, and if the change spans the client and the server, read the server "
+                  "endpoint's actual response shape before you edit the client — never rename "
+                  "an existing endpoint's keys to make the frontend work.",
             mode="update", emit=ctx.emit)
         ctx.state["changed_files"] = list(res["changed"])
         return (f"applied minimal diff -> {res['changed'] or 'no file changes'} "
@@ -525,16 +534,44 @@ def build_update_steps(user_id: str, email: Optional[str], request_text: str) ->
             res = await deployer.deploy(
                 ctx.project_id, ws, db_password=ctx.state["db_password"],
                 app_secret=ctx.state["app_secret"], title=(proj or {}).get("title", ""))
-        except Exception as e:  # noqa: BLE001 — rollback the source to last commit + redeploy
-            logger.warning("update deploy failed for %s, rolling back: %s", ctx.project_id, e)
-            await workspace.checkout(ctx.project_id, ctx.state["gitea_user"],
-                                     ctx.state["repo"], ctx.state["gitea_token"])
-            if last_good:
-                norm.write_text(last_good, "utf-8")
-            await deployer.deploy(
-                ctx.project_id, ws, db_password=ctx.state["db_password"],
-                app_secret=ctx.state["app_secret"], title=(proj or {}).get("title", ""))
-            raise RuntimeError(f"update reverted (deploy failed): {e}")
+        except Exception as e:  # noqa: BLE001
+            # Try to REPAIR before reverting: the agent still has the change in the tree and
+            # can tail the container's own crash (app_logs). Reverting a user's requested
+            # change because of a typo it could have fixed is a worse outcome than a retry.
+            logger.warning("update deploy failed for %s, one repair pass: %s", ctx.project_id, e)
+            ctx.emit({"type": "progress", "stage": "deploy",
+                      "detail": "deploy failed — repair pass before rollback"})
+            repaired = False
+            try:
+                await agentic.run_agent(
+                    project_id=ctx.project_id, run_id=ctx.run_id, step="plan_and_apply_fix",
+                    brief=ctx.state["brief"], tech_plan=ctx.state["tech_plan"],
+                    task=f"The change just applied for '{request_text[:120]}' broke the build "
+                         f"or the health gate. Diagnose and fix it with the smallest possible "
+                         f"change — do NOT undo the requested change.",
+                    extra=f"Deploy/health error:\n{str(e)[:2000]}\n"
+                          f"Files just changed: "
+                          f"{', '.join(ctx.state.get('changed_files') or []) or '(none)'}\n"
+                          "Use app_logs to see what the container itself reported.",
+                    recent_changes=ctx.state.get("recent_commits", []), mode="fix",
+                    require_change=False, emit=ctx.emit)
+                res = await deployer.deploy(
+                    ctx.project_id, ws, db_password=ctx.state["db_password"],
+                    app_secret=ctx.state["app_secret"], title=(proj or {}).get("title", ""))
+                repaired = True
+            except Exception as e2:  # noqa: BLE001 — repair failed: revert to last commit
+                logger.warning("update repair failed for %s, rolling back: %s",
+                               ctx.project_id, e2)
+                await workspace.checkout(ctx.project_id, ctx.state["gitea_user"],
+                                         ctx.state["repo"], ctx.state["gitea_token"])
+                if last_good:
+                    norm.write_text(last_good, "utf-8")
+                await deployer.deploy(
+                    ctx.project_id, ws, db_password=ctx.state["db_password"],
+                    app_secret=ctx.state["app_secret"], title=(proj or {}).get("title", ""))
+                raise RuntimeError(f"update reverted (deploy failed): {e}")
+            if repaired:
+                ctx.state["repaired"] = True
         ctx.state["public_health"] = res["public_health"]
         ctx.emit({"type": "deploy", "url": f"https://{ctx.project_id}.{deployer.SITES_BASE}/",
                   "health": res["public_health"]})
