@@ -143,15 +143,24 @@ async def name_for(prompt: str, *, budget: float = NAME_BUDGET_SEC) -> str:
 # The strategy pass may name the product explicitly ("Product name: LinkPulse"). If it does,
 # that beats the name we invented from the raw prompt — still capped at 15 characters. No
 # extra tokens are spent: this only reads what the docs already say.
+#
+# TWO GUARDS, both learned on the first live build. A bare `Name:` matched
+# "**Name:** Dana Whitfield" in BUYER-PERSONA.md — that doc's spec literally asks the model
+# for a persona's NAME — and the project got renamed after a fictional book-club member
+# instead of the product. So: only docs that describe the PRODUCT are searched (a persona /
+# ICP doc describes people), and the key must actually say product/app/brand.
+_BRAND_DOCS = ("VISION.md", "MARKETING.md")
 _BRAND_RE = re.compile(
-    r"^\s*[*#\-\s]*(?:product\s+name|app\s+name|brand(?:\s+name)?|name)\s*[:\-]\s*(.+)$",
+    r"^\s*[*#\-\s]*(?:product(?:\s+name)?|app\s+name|brand(?:\s+name)?)\**\s*[:\-]\s*(.+)$",
     re.I | re.M)
 
 
 def brand_from_docs(docs: Dict[str, str]) -> Optional[str]:
-    """Return a <=15-char brand name if the generated docs state one, else None."""
+    """Return a <=15-char brand name if the PRODUCT docs state one, else None."""
     for path, body in (docs or {}).items():
         if not isinstance(body, str):
+            continue
+        if not any(str(path).endswith(d) for d in _BRAND_DOCS):
             continue
         m = _BRAND_RE.search(body[:4000])
         if not m:

@@ -80,11 +80,26 @@ def main() -> int:
           == "LinkPulse")
     check("docs without a name yield None",
           naming.brand_from_docs({"docs/VISION.md": "# Vision\n\nnothing to see\n"}) is None)
-    check("a brand name is capped too",
-          len(naming.brand_from_docs(
-              {"d": "Brand: SomethingVeryLongIndeed"}) or "") <= naming.MAX_NAME)
+    long_brand = naming.brand_from_docs(
+        {"docs/MARKETING.md": "Brand: Something Very Long Indeed"})
+    check("a brand name is found AND capped",
+          long_brand and len(long_brand) <= naming.MAX_NAME, long_brand)
     check("a non-string doc body cannot crash the parse",
-          naming.brand_from_docs({"d": None, "e": 42}) is None)
+          naming.brand_from_docs({"docs/VISION.md": None, "docs/MARKETING.md": 42}) is None)
+
+    # THE bug the first live build produced: BUYER-PERSONA.md is *asked* for a persona's
+    # name, so a bare `Name:` there renamed a book-club app "DanaWhitfield".
+    persona = ("# Ideal Buyer Persona\n\n**Name:** Dana Whitfield\n\n"
+               "**Role:** Book club organiser\n")
+    check("a persona's name is NOT the product's name",
+          naming.brand_from_docs({"docs/BUYER-PERSONA.md": persona}) is None)
+    check("an ICP doc is not searched either",
+          naming.brand_from_docs({"docs/ICP.md": "Name: Someone Else"}) is None)
+    check("a persona alongside a real product name still yields the product name",
+          naming.brand_from_docs({"docs/BUYER-PERSONA.md": persona,
+                                  "docs/VISION.md": "Product name: BookVote\n"}) == "BookVote")
+    check("a bare 'Name:' in a product doc is not enough",
+          naming.brand_from_docs({"docs/VISION.md": "Name: Dana Whitfield\n"}) is None)
 
     print(f"\n{_passed} passed, {len(_failed)} failed")
     return 1 if _failed else 0
