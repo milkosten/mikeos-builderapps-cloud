@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from server import db, deployer, gitea, introspect, store, workspace
+from server import db, deployer, gitea, introspect, runner, store, workspace
 from server.harness import pipeline
 from server.identity import authenticate, current_user
 
@@ -45,8 +45,20 @@ def _spawn(coro) -> asyncio.Task:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_pool()
-    logger.info("builderapps-cloud up; public=%s sites=%s", PUBLIC_BASE, SITES_BASE)
+    logger.info("builderapps-cloud up (%s); public=%s sites=%s",
+                runner.INSTANCE_ID, PUBLIC_BASE, SITES_BASE)
+    # RECOVERY: a control-plane redeploy kills every in-flight pipeline. Take over anything
+    # left `running` by the previous process and resume it (or fail it with a reason) — a run
+    # is never left in limbo. Then keep a janitor sweeping for the same condition.
+    try:
+        recovered = await runner.sweep_on_boot()
+        if recovered:
+            logger.warning("boot sweep recovered %d interrupted run(s)", recovered)
+    except Exception:  # noqa: BLE001 — never block startup on recovery
+        logger.exception("boot sweep failed")
+    runner.start_janitor()
     yield
+    await runner.shutdown()
     await db.close_pool()
 
 
@@ -117,6 +129,46 @@ def _sse(item: dict) -> str:
     return f"data: {json.dumps(item)}\n\n"
 
 
+def _observe(run_id: int, head: Optional[dict] = None) -> StreamingResponse:
+    """Stream a background run's events to this client.
+
+    The client is a pure OBSERVER: it subscribes to the run's event broker and, when it goes
+    away, we merely unsubscribe. The pipeline itself is an independent task owned by
+    `server.runner`, so closing the tab (or losing the connection) can no longer kill a build
+    — which is precisely what used to orphan runs.
+    """
+    async def event_gen():
+        q, replay = runner.subscribe(run_id)
+        try:
+            if head:
+                yield _sse(head)
+            for ev in replay:                       # catch a reconnecting client up
+                if ev.get("type") != "eof":
+                    yield _sse(ev)
+            if not runner.is_active(run_id):
+                return
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=20)
+                except asyncio.TimeoutError:
+                    # SSE comment keep-alive: proves the connection is healthy through Caddy
+                    # without inventing an event the SPA would have to understand.
+                    yield ": keepalive\n\n"
+                    if not runner.is_active(run_id):
+                        return
+                    continue
+                if item.get("type") == "eof":
+                    return
+                yield _sse(item)
+        finally:
+            runner.unsubscribe(run_id, q)
+
+    return StreamingResponse(
+        event_gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Connection": "keep-alive"})
+
+
 # ---- health ---------------------------------------------------------------
 @app.get("/api/health")
 async def health():
@@ -149,8 +201,9 @@ async def tls_allow(domain: str = ""):
 @app.post("/api/projects")
 async def create_project(body: CreateBody, request: Request):
     """Start the create-pipeline. Returns the project id immediately and streams the run's
-    steps as SSE. The project + repo binding are created up-front; the pipeline runs inline
-    on this request so the client sees live progress."""
+    steps as SSE. The project + repo binding are created up-front; the pipeline then runs as a
+    DURABLE BACKGROUND TASK (server.runner) and this response merely observes it, so the build
+    survives both a client disconnect and a control-plane redeploy."""
     user_id = await _auth_and_provision(request)
     email = getattr(request.state, "user_email", None)
 
@@ -166,43 +219,23 @@ async def create_project(body: CreateBody, request: Request):
     )
     run_id = await store.create_run(shortid, "create", body.prompt, total_steps=7)
 
-    async def event_gen():
-        q: asyncio.Queue = asyncio.Queue()
+    emit = runner.emitter(run_id)
+    await runner.start(
+        run_id, shortid,
+        lambda: pipeline.run_create(shortid, run_id, user_id, email, emit))
 
-        # initial event so the client immediately learns the id + url
-        await q.put({"type": "created", "id": shortid,
-                     "url": f"https://{shortid}.{SITES_BASE}/", "run_id": run_id})
-
-        async def body_task():
-            try:
-                await pipeline.run_create(shortid, run_id, user_id, email, q.put_nowait)
-            except Exception as e:  # noqa: BLE001
-                logger.exception("create pipeline failed for %s", shortid)
-                q.put_nowait({"type": "error", "message": str(e)})
-            finally:
-                q.put_nowait(None)
-
-        task = _spawn(body_task())
-        try:
-            while True:
-                item = await q.get()
-                if item is None:
-                    break
-                yield _sse(item)
-        finally:
-            await task
-
-    return StreamingResponse(
-        event_gen(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-                 "Connection": "keep-alive"})
+    # initial event so the client immediately learns the id + url
+    return _observe(run_id, head={"type": "created", "id": shortid,
+                                  "url": f"https://{shortid}.{SITES_BASE}/",
+                                  "run_id": run_id})
 
 
 # ---- update project (phase 18) --------------------------------------------
 @app.post("/api/projects/{project_id}/update")
 async def update_project(project_id: str, body: UpdateBody, request: Request):
     """Apply a natural-language change to an existing app (ownership-checked). Streams the
-    update run as SSE, same vocabulary as create."""
+    update run as SSE, same vocabulary as create. As with create, the run itself is a durable
+    background task — this response only observes it."""
     user_id = await _auth_and_provision(request)
     email = getattr(request.state, "user_email", None)
 
@@ -213,35 +246,14 @@ async def update_project(project_id: str, body: UpdateBody, request: Request):
     await store.set_project_status(project_id, "building")
     run_id = await store.create_run(project_id, "update", body.request, total_steps=5)
 
-    async def event_gen():
-        q: asyncio.Queue = asyncio.Queue()
-        await q.put({"type": "created", "id": project_id,
-                     "url": f"https://{project_id}.{SITES_BASE}/", "run_id": run_id})
+    emit = runner.emitter(run_id)
+    await runner.start(
+        run_id, project_id,
+        lambda: pipeline.run_update(project_id, run_id, user_id, email, body.request, emit))
 
-        async def body_task():
-            try:
-                await pipeline.run_update(project_id, run_id, user_id, email,
-                                          body.request, q.put_nowait)
-            except Exception as e:  # noqa: BLE001
-                logger.exception("update pipeline failed for %s", project_id)
-                q.put_nowait({"type": "error", "message": str(e)})
-            finally:
-                q.put_nowait(None)
-
-        task = _spawn(body_task())
-        try:
-            while True:
-                item = await q.get()
-                if item is None:
-                    break
-                yield _sse(item)
-        finally:
-            await task
-
-    return StreamingResponse(
-        event_gen(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-                 "Connection": "keep-alive"})
+    return _observe(run_id, head={"type": "created", "id": project_id,
+                                  "url": f"https://{project_id}.{SITES_BASE}/",
+                                  "run_id": run_id})
 
 
 # ---- list / get -----------------------------------------------------------
@@ -274,6 +286,25 @@ async def get_project_steps(project_id: str, request: Request):
     if not await store.get_project(project_id, user_id):
         raise HTTPException(status_code=404, detail="not found")
     return await store.steps_for_latest_run(project_id)
+
+
+@app.get("/api/projects/{project_id}/events")
+async def project_events(project_id: str, request: Request):
+    """RE-ATTACH to the live run's SSE stream after a reload/disconnect.
+
+    Because the run outlives the request that started it, a client that dropped can come back
+    and pick the stream up (with the events it missed replayed first). Returns immediately
+    when the run is already finished — the durable record is `/steps`.
+    """
+    user_id = await _auth_and_provision(request)
+    if not await store.get_project(project_id, user_id):
+        raise HTTPException(status_code=404, detail="not found")
+    latest = await store.steps_for_latest_run(project_id)
+    run_id = latest.get("run_id")
+    if not run_id:
+        raise HTTPException(status_code=404, detail="no run for this project")
+    return _observe(int(run_id), head={"type": "attached", "id": project_id,
+                                       "run_id": int(run_id)})
 
 
 @app.get("/api/projects/{project_id}/messages")

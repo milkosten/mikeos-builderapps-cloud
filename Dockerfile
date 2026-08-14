@@ -22,5 +22,13 @@ COPY server/ ./server/
 COPY migrations/ ./migrations/
 
 EXPOSE 8000
-# A couple of workers so a slow build on one request doesn't block health/list.
-CMD ["uvicorn", "server.http_server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# ONE worker, deliberately. Pipeline runs are now durable in-process background tasks
+# (server.runner); their per-project workspace lock, event broker and run registry are all
+# per-process, so with 2 workers a run started in worker A is invisible to worker B and an
+# SSE re-attach or a concurrent update could land on the wrong process and stomp the same git
+# checkout. Nothing in the request path is CPU-bound (every subprocess/HTTP call is awaited),
+# so one event loop still serves health/list while a build is in flight.
+# --timeout-graceful-shutdown lets an interrupted run release its DB ownership on SIGTERM so
+# the next boot's sweep resumes it instantly instead of waiting out the staleness window.
+CMD ["uvicorn", "server.http_server:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--timeout-graceful-shutdown", "20"]

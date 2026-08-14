@@ -5,6 +5,7 @@ A Run = an ordered list of Steps; each Step = (name, async fn(ctx)). The engine 
 and writes a per-project current_work.json after every step so a human/fresh session sees
 exactly where it is. On resume, steps already `done` for the run are skipped.
 """
+import asyncio
 import json
 import logging
 import os
@@ -18,6 +19,38 @@ from server import store
 logger = logging.getLogger(__name__)
 
 WORK_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/opt/builderapps/workspaces"))
+
+# ---- per-step hard timeout -------------------------------------------------
+# A wedged LLM/docker call must fail the STEP, never wedge the whole run forever (an
+# OpenRouter hang once left a run "running" for over an hour with nothing in flight). The
+# heartbeat says "the process is alive"; this says "this step has taken absurdly long".
+# Generous by design — LLM codegen + a docker build are legitimately slow.
+_DEFAULT_STEP_TIMEOUT = float(os.environ.get("BUILDERAPPS_STEP_TIMEOUT_SEC", "1800"))
+_STEP_TIMEOUTS: dict[str, float] = {
+    "ensure_gitea_account": 300,
+    "create_repo": 300,
+    "checkout": 600,
+    "allocate_secrets": 120,
+    "parse_backlog": 120,
+    "finalize": 120,
+    "update_context": 600,
+    "commit_push": 600,
+    "strategy_artifacts": 2700,   # six LLM docs in one step
+    "data_layer": 1200,
+    "deploy_skeleton": 1800,
+    "final_deploy": 1800,
+    "deploy": 1800,
+    "runtime_qa": 2400,
+    "plan_and_apply": 1800,
+}
+
+
+def step_timeout(name: str) -> float:
+    if name in _STEP_TIMEOUTS:
+        return _STEP_TIMEOUTS[name]
+    if name.startswith("build_"):     # LLM codegen + docker rebuild + health gate
+        return 2400.0
+    return _DEFAULT_STEP_TIMEOUT
 
 
 @dataclass
@@ -97,7 +130,7 @@ async def run_partial(project_id: str, run_id: int, steps: list[Step],
         emit({"type": "step_start", "idx": idx, "name": name})
         t0 = time.time()
         try:
-            result = await fn(ctx)
+            result = await asyncio.wait_for(fn(ctx), timeout=step_timeout(name))
             log = ""
             if isinstance(result, str):
                 log = result
@@ -108,13 +141,32 @@ async def run_partial(project_id: str, run_id: int, steps: list[Step],
                                 {"step_name": name})
             emit({"type": "step_done", "idx": idx, "name": name,
                   "ms": int((time.time() - t0) * 1000), "detail": log[:400]})
+        except asyncio.CancelledError:
+            # The container is going down (uvicorn cancels the task on SIGTERM). This is NOT
+            # a step failure: leave the step `running` and the run `running` so the next
+            # boot's sweep resumes it from exactly here. Swallowing this as a generic
+            # Exception is what used to strand a run silently.
+            logger.warning("step %s cancelled — leaving run %s resumable", name, run_id)
+            _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "running",
+                                {"step_name": name, "interrupted": True})
+            raise
+        except asyncio.TimeoutError:
+            msg = (f"step timed out after {step_timeout(name):.0f}s "
+                   f"(hung LLM/build call) — failing the step instead of wedging the run")
+            logger.error("step %s: %s", name, msg)
+            await store.upsert_step(run_id, idx, name, "failed", msg)
+            _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "failed",
+                                {"step_name": name, "error": msg})
+            emit({"type": "error", "idx": idx, "name": name, "message": msg})
+            await store.finish_run(run_id, "failed", msg)
+            raise RuntimeError(f"{name}: {msg}")
         except Exception as e:  # noqa: BLE001
             logger.exception("step %s failed", name)
             await store.upsert_step(run_id, idx, name, "failed", str(e)[:8000])
             _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "failed",
                                 {"step_name": name, "error": str(e)[:500]})
             emit({"type": "error", "idx": idx, "name": name, "message": str(e)})
-            await store.finish_run(run_id, "failed")
+            await store.finish_run(run_id, "failed", f"{name}: {e}")
             raise
 
     if finish:

@@ -279,15 +279,96 @@ def _s_finalize():
 
 
 # --------------------------------------------------------------------------
+# resume support — rebuilding ctx.state for a run that is picked up mid-flight
+# --------------------------------------------------------------------------
+async def rehydrate_state(project_id: str, user_id: str, email: Optional[str]) -> dict:
+    """Reconstruct the pipeline's `ctx.state` from durable storage.
+
+    Resuming skips every step already marked `done`, which also means those steps never run
+    their side effect of *populating ctx.state* — so a naive resume would blow up on the first
+    step that reads `state["workspace"]`. Everything the steps put in state is derivable from
+    a durable source, so we re-derive it here instead:
+
+        gitea_user/token       <- gitea.ensure_user (idempotent)
+        repo                   <- projects.gitea_repo
+        workspace              <- re-clone/fetch of that repo (idempotent)
+        db_password/app_secret <- project_secrets (encrypted at rest)
+        tech_plan              <- docs/TECHNICAL-PLAN.md in the workspace
+
+    Best-effort by design: a run that died BEFORE create_repo has nothing to check out, and
+    the (still not-done) prelude steps will simply create it.
+    """
+    state: dict = {"changes": []}
+    proj = await store.get_project(project_id)
+    acct = await gitea.ensure_user(user_id, email)
+    state["gitea_user"] = acct["gitea_username"]
+    state["gitea_token"] = acct["token"]
+    state["repo"] = (proj or {}).get("gitea_repo") or f"app-{project_id}"
+    state["brief"] = (proj or {}).get("prompt", "") or ""
+    try:
+        ws = await workspace.checkout(
+            project_id, state["gitea_user"], state["repo"], state["gitea_token"],
+            author_name=state["gitea_user"],
+            author_email=email or f"{state['gitea_user']}@builderapps.osmike.com")
+        state["workspace"] = str(ws)
+    except Exception as e:  # noqa: BLE001 — repo may not exist yet; the prelude will make it
+        logger.info("resume %s: no checkout yet (%s)", project_id, e)
+    dbp = await store.get_secret(project_id, "db_password")
+    aps = await store.get_secret(project_id, "app_secret")
+    if dbp:
+        state["db_password"] = dbp
+    if aps:
+        state["app_secret"] = aps
+    if state.get("workspace"):
+        try:
+            state["tech_plan"] = workspace.read_file_capped(
+                project_id, "docs/TECHNICAL-PLAN.md") or ""
+        except Exception:  # noqa: BLE001
+            state["tech_plan"] = ""
+        try:
+            state["recent_commits"] = await workspace.recent_commits(project_id, n=8)
+        except Exception:  # noqa: BLE001
+            state["recent_commits"] = []
+    return state
+
+
+def _stabilize_backlog(items: list[str], stored_total: int, n_prelude: int) -> list[str]:
+    """Keep the step INDICES of a resumed run identical to the original run.
+
+    The tail is `data_layer + N features + final_deploy + runtime_qa + finalize`, so the
+    original run's feature count is recoverable from its recorded total_steps. The backlog is
+    re-parsed from the same TECHNICAL-PLAN.md and is normally identical — but if that doc were
+    ever regenerated, a different N would shift every later idx and corrupt the resume. So pin
+    N to what the run actually recorded.
+    """
+    if stored_total <= 0:
+        return items
+    want = stored_total - n_prelude - 4        # data_layer + final_deploy + runtime_qa + finalize
+    if want <= 0 or want == len(items):
+        return items
+    logger.warning("resume: backlog re-parsed to %d items but the run recorded %d — pinning",
+                   len(items), want)
+    if len(items) > want:
+        return items[:want]
+    return items + ["Complete the app per the technical plan: finish any route, page or "
+                    "wiring that is still missing."] * (want - len(items))
+
+
+# --------------------------------------------------------------------------
 # create-pipeline assembly (two-pass: spine+strategy -> derive backlog -> tail)
 # --------------------------------------------------------------------------
 async def run_create(project_id: str, run_id: int, user_id: str, email: Optional[str],
-                     emit: Callable[[dict], None]) -> dict:
+                     emit: Callable[[dict], None], *, resume: bool = False) -> dict:
     """Run the full create pipeline. The backlog is derived from the strategy docs during the
     run; because the step list must be known to the engine up front (for stable idx), we build
-    the strategy+backlog first (deterministically resumable), then assemble the full step list."""
+    the strategy+backlog first (deterministically resumable), then assemble the full step list.
+
+    `resume=True` re-enters an interrupted run: ctx.state is rebuilt from durable storage
+    (`rehydrate_state`) and the engine skips every step already recorded `done`.
+    """
     proj = await store.get_project(project_id)
     brief = (proj or {}).get("prompt", "") or ""
+    resumed_state = await rehydrate_state(project_id, user_id, email) if resume else None
 
     lk = workspace.lock(project_id)
     async with lk:
@@ -304,8 +385,22 @@ async def run_create(project_id: str, run_id: int, user_id: str, email: Optional
                 ("parse_backlog", _s_parse_backlog()),
             ]
             state = await engine.run_partial(project_id, run_id, prelude_steps, emit,
-                                             base_idx=0)
+                                             base_idx=0, state=resumed_state)
             backlog_items = state.get("backlog", [])
+            if not backlog_items:
+                # Resuming past a `done` parse_backlog step: re-derive it from the same
+                # TECHNICAL-PLAN.md (deterministic), then pin its length to the recorded run
+                # so every later step keeps its original idx.
+                run_row = await store.get_run(run_id)
+                stored_total = int((run_row or {}).get("total_steps") or 0)
+                backlog_items = backlog_mod.parse_backlog(
+                    state.get("tech_plan", "") or "", cap=_MAX_FEATURES)
+                backlog_items = _stabilize_backlog(backlog_items, stored_total,
+                                                   len(prelude_steps))
+                if not backlog_items:
+                    raise RuntimeError(
+                        "cannot resume: no backlog and no TECHNICAL-PLAN.md to derive one")
+                state["backlog"] = backlog_items
 
             # Assemble the remainder (data layer + features + deploy + QA + finalize) and run,
             # continuing the same run_id at the next idx.
@@ -429,12 +524,16 @@ def build_update_steps(user_id: str, email: Optional[str], request_text: str) ->
 
 
 async def run_update(project_id: str, run_id: int, user_id: str, email: Optional[str],
-                     request_text: str, emit: Callable[[dict], None]) -> dict:
+                     request_text: str, emit: Callable[[dict], None], *,
+                     resume: bool = False) -> dict:
     steps = build_update_steps(user_id, email, request_text)
+    resumed_state = await rehydrate_state(project_id, user_id, email) if resume else None
     lk = workspace.lock(project_id)
     async with lk:
         try:
-            return await engine.run(project_id, run_id, steps, emit)
+            return await engine.run_partial(project_id, run_id, steps, emit, base_idx=0,
+                                            state=resumed_state, finish=True,
+                                            total=len(steps))
         except Exception:
             await store.set_project_status(project_id, "failed")
             raise

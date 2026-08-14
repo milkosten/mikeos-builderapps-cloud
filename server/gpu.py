@@ -128,8 +128,46 @@ async def chat(
     keep_alive: str = "30m",
     max_retries: int = 4,
 ) -> str:
-    """One chat call. `schema` requests JSON output (plan/classify steps). Returns the
-    assistant message content. Routes to OpenRouter/Kimi when configured, else Ollama."""
+    """One chat call, with a HARD overall deadline across all retries.
+
+    `timeout` bounds a single attempt; with `max_retries` + exponential backoff the retry loop
+    could otherwise run for the better part of an hour on a flaky provider and wedge the
+    pipeline step behind it. `_deadline()` caps the whole thing so a hang always surfaces as a
+    failed step, never as a run stuck in `running` forever.
+    """
+    return await asyncio.wait_for(
+        _chat_impl(messages, model=model, schema=schema, temperature=temperature,
+                   num_ctx=num_ctx, num_predict=num_predict, timeout=timeout,
+                   keep_alive=keep_alive, max_retries=max_retries),
+        timeout=_deadline(timeout),
+    )
+
+
+def _deadline(timeout: float) -> float:
+    """Overall wall-clock budget for one `chat()` (all attempts + backoff included)."""
+    env = os.environ.get("BUILDERAPPS_LLM_DEADLINE_SEC", "").strip()
+    if env:
+        try:
+            return max(30.0, float(env))
+        except ValueError:
+            pass
+    return min(3.0 * float(timeout), 900.0)
+
+
+async def _chat_impl(
+    messages: List[Dict[str, Any]],
+    *,
+    model: Optional[str] = None,
+    schema: Optional[Dict[str, Any]] = None,
+    temperature: float = 0.7,
+    num_ctx: int = 8192,
+    num_predict: int = 6144,
+    timeout: float = 420.0,
+    keep_alive: str = "30m",
+    max_retries: int = 4,
+) -> str:
+    """`schema` requests JSON output (plan/classify steps). Returns the assistant message
+    content. Routes to OpenRouter/Kimi when configured, else Ollama."""
     if OPENROUTER_API_KEY:
         return await _openrouter_chat(messages, schema, temperature, num_predict,
                                       timeout, max_retries)

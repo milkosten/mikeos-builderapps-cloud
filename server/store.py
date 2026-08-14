@@ -201,10 +201,11 @@ async def set_run_total(run_id: int, total_steps: int) -> None:
     )
 
 
-async def finish_run(run_id: int, status: str) -> None:
+async def finish_run(run_id: int, status: str, error: str = "") -> None:
     await pool().execute(
-        "UPDATE builderapps.pipeline_runs SET status=$2, finished_at=now() WHERE id=$1",
-        run_id, status,
+        "UPDATE builderapps.pipeline_runs SET status=$2, finished_at=now(), error=$3 "
+        "WHERE id=$1",
+        run_id, status, (error or "")[:4000],
     )
 
 
@@ -219,10 +220,109 @@ async def upsert_step(run_id: int, idx: int, name: str, status: str, log: str = 
     if not res.endswith(("INSERT 0 1", "UPDATE 1")):
         raise RuntimeError(f"upsert_step did not affect a row: {res!r}")
     if status in ("running", "done", "failed"):
+        # A step transition is also proof of life — keep the heartbeat fresh so the janitor
+        # never reaps a run that is demonstrably making progress.
         await pool().execute(
-            "UPDATE builderapps.pipeline_runs SET current_step=$2 WHERE id=$1",
+            "UPDATE builderapps.pipeline_runs SET current_step=$2, heartbeat_at=now() "
+            "WHERE id=$1",
             run_id, idx,
         )
+
+
+# ---- run liveness: heartbeat / claim / sweep (phase 19) -------------------
+# A run only counts as ALIVE while some api process keeps bumping `heartbeat_at`. Everything
+# else (boot sweep, janitor) is derived from that one fact, so a redeploy / OOM-kill / client
+# disconnect can never leave a run in limbo.
+async def get_run(run_id: int) -> Optional[dict]:
+    row = await pool().fetchrow(
+        "SELECT * FROM builderapps.pipeline_runs WHERE id=$1", run_id)
+    return dict(row) if row else None
+
+
+async def heartbeat_run(run_id: int, owner: str) -> bool:
+    """Bump heartbeat_at. Returns False when this process no longer owns the run (another
+    process claimed it), which tells the caller to stand down instead of double-running."""
+    res = await pool().execute(
+        "UPDATE builderapps.pipeline_runs SET heartbeat_at=now() "
+        "WHERE id=$1 AND owner=$2 AND status='running'",
+        run_id, owner,
+    )
+    return res == "UPDATE 1"
+
+
+async def claim_run(run_id: int, owner: str, stale_sec: int) -> Optional[dict]:
+    """Atomically take ownership of a run, but ONLY if it is unowned or its heartbeat is
+    stale. This is the cross-process mutex: two api workers sweeping the same orphan at boot
+    race on this single UPDATE and exactly one wins (`UPDATE 1`).
+
+    Returns the claimed row, or None if somebody else owns a live run.
+    """
+    row = await pool().fetchrow(
+        "UPDATE builderapps.pipeline_runs SET owner=$2, attempts=attempts+1, "
+        "heartbeat_at=now() "
+        "WHERE id=$1 AND status='running' "
+        "  AND (owner = '' OR owner IS NULL OR heartbeat_at IS NULL "
+        "       OR heartbeat_at < now() - make_interval(secs => $3::double precision)) "
+        "RETURNING *",
+        run_id, owner, float(stale_sec),
+    )
+    return dict(row) if row else None
+
+
+async def claim_new_run(run_id: int, owner: str) -> bool:
+    """Take ownership of a run this process just created (no staleness test needed)."""
+    res = await pool().execute(
+        "UPDATE builderapps.pipeline_runs SET owner=$2, attempts=attempts+1, "
+        "heartbeat_at=now() WHERE id=$1 AND status='running'",
+        run_id, owner,
+    )
+    return res == "UPDATE 1"
+
+
+async def release_run(run_id: int, owner: str) -> None:
+    """Drop ownership without changing status (used when a run is cancelled at shutdown, so
+    the next boot's sweep sees an unowned running run and resumes it immediately)."""
+    await pool().execute(
+        "UPDATE builderapps.pipeline_runs SET owner='' WHERE id=$1 AND owner=$2",
+        run_id, owner,
+    )
+
+
+async def stale_running_runs(stale_sec: int, limit: int = 50) -> list[dict]:
+    """Runs still marked `running` whose heartbeat has gone stale — i.e. orphans."""
+    rows = await pool().fetch(
+        "SELECT * FROM builderapps.pipeline_runs "
+        "WHERE status='running' "
+        "  AND (heartbeat_at IS NULL "
+        "       OR heartbeat_at < now() - make_interval(secs => $1::double precision)) "
+        "ORDER BY created_at LIMIT $2",
+        float(stale_sec), max(1, min(int(limit), 200)),
+    )
+    return [dict(r) for r in rows]
+
+
+async def running_runs(limit: int = 100) -> list[dict]:
+    """Every run still marked `running`, oldest first."""
+    rows = await pool().fetch(
+        "SELECT * FROM builderapps.pipeline_runs WHERE status='running' "
+        "ORDER BY created_at LIMIT $1", max(1, min(int(limit), 500)),
+    )
+    return [dict(r) for r in rows]
+
+
+async def fail_stuck_steps(run_id: int, reason: str) -> int:
+    """Mark any step left `running` on a dead run as failed, so the UI stops spinning on it.
+    Returns the number of rows changed."""
+    res = await pool().execute(
+        "UPDATE builderapps.pipeline_steps SET status='failed', "
+        "log = left(coalesce(log,'') || $2, 8000), ts=now() "
+        "WHERE run_id=$1 AND status='running'",
+        run_id, f"\n[interrupted] {reason}"[:2000],
+    )
+    try:
+        return int(str(res).rsplit(" ", 1)[-1])
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 async def get_run_with_steps(run_id: int) -> Optional[dict]:
@@ -385,16 +485,25 @@ async def get_raw_thread(project_id: str) -> list[dict]:
 
 
 async def steps_for_latest_run(project_id: str) -> dict:
-    """{"run_id": int|None, "steps": [...]} for the project's most recent run (ordered by
-    idx). Empty list when the project has no run yet — never an error."""
+    """{"run_id","status","error","total_steps","heartbeat_at","steps":[...]} for the
+    project's most recent run (steps ordered by idx). Empty list when the project has no run
+    yet — never an error.
+
+    `status`/`error` are what let a polling client distinguish "still building" from "this run
+    died"; without them the UI could only ever show a spinner.
+    """
     run = await pool().fetchrow(
-        "SELECT id FROM builderapps.pipeline_runs WHERE project_id=$1 "
+        "SELECT id,status,error,total_steps,heartbeat_at,finished_at "
+        "FROM builderapps.pipeline_runs WHERE project_id=$1 "
         "ORDER BY created_at DESC LIMIT 1", project_id,
     )
     if not run:
-        return {"run_id": None, "steps": []}
+        return {"run_id": None, "status": None, "steps": []}
     rows = await pool().fetch(
         "SELECT idx,name,status,log,ts FROM builderapps.pipeline_steps "
         "WHERE run_id=$1 ORDER BY idx", int(run["id"]),
     )
-    return {"run_id": int(run["id"]), "steps": [dict(r) for r in rows]}
+    return {"run_id": int(run["id"]), "status": run["status"],
+            "error": run["error"] or "", "total_steps": run["total_steps"],
+            "heartbeat_at": run["heartbeat_at"], "finished_at": run["finished_at"],
+            "steps": [dict(r) for r in rows]}
