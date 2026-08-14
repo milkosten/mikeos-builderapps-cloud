@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from server import db, deployer, gitea, introspect, runner, store, workspace, usage
+from server import db, deployer, gitea, introspect, naming, runner, store, workspace, usage
 from server.harness import pipeline
 from server.identity import authenticate, current_user
 
@@ -211,7 +211,11 @@ async def create_project(body: CreateBody, request: Request):
     shortid = await store.alloc_shortid()
     gitea_user = gitea.gitea_username_for(user_id)
     repo_name = f"app-{shortid}"
-    title = (body.title or body.prompt[:60]).strip()
+    # A real, short product name instead of a truncated prompt. Generated HERE (not later in
+    # the pipeline) so the topbar dropdown and the Apps list read well from the first render.
+    # Bounded + best-effort: a naming failure degrades to a deterministic slug, never a 500.
+    usage.set_context(shortid, None, "name")     # attribute the naming tokens to this project
+    title = naming.clean(body.title) or await naming.name_for(body.prompt)
 
     await store.create_project(
         id=shortid, user_id=user_id, gitea_owner=gitea_user, gitea_repo=repo_name,

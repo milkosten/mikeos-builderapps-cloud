@@ -77,6 +77,14 @@ async def create_project(*, id: str, user_id: str, gitea_owner: str, gitea_repo:
     return dict(row)
 
 
+async def set_project_title(project_id: str, title: str) -> None:
+    """Rename a project. The title is cosmetic, so callers treat a failure as non-fatal."""
+    await pool().execute(
+        "UPDATE builderapps.projects SET title=$2, updated_at=now() WHERE id=$1",
+        project_id, title,
+    )
+
+
 async def set_project_status(project_id: str, status: str) -> None:
     res = await pool().execute(
         "UPDATE builderapps.projects SET status=$2, updated_at=now() WHERE id=$1",

@@ -25,7 +25,7 @@ import secrets
 from pathlib import Path
 from typing import Callable, Optional
 
-from server import deployer, gitea, store, workspace
+from server import deployer, gitea, naming, store, workspace
 from server.harness import backlog as backlog_mod
 from server.harness import agentic, codegen, engine, runtime_qa
 from server.harness.engine import Ctx, Step
@@ -159,6 +159,18 @@ def _s_strategy(brief: str):
         for relpath, content in docs.items():
             workspace.write_file(ctx.project_id, relpath, content)
         ctx.state["tech_plan"] = docs.get("docs/TECHNICAL-PLAN.md", "")
+        # If the strategy pass named the product explicitly, that beats the name invented from
+        # the raw prompt at create time. Still capped at 15 chars, costs no extra tokens (it
+        # only reads the docs we already have), and a failure here must not touch the build.
+        try:
+            brand = naming.brand_from_docs(docs)
+            if brand and brand != title:
+                await store.set_project_title(ctx.project_id, brand)
+                ctx.emit({"type": "progress", "stage": "strategy",
+                          "detail": f"named the product {brand}"})
+                title = brand
+        except Exception as e:  # noqa: BLE001 — a rename is cosmetic
+            logger.info("brand rename skipped for %s: %s", ctx.project_id, e)
         await _commit(ctx, f"docs: strategy artifacts for {title}")
         return f"{len(docs)} strategy docs written"
     return step
