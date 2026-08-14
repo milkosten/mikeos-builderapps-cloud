@@ -71,6 +71,19 @@ services:
       # THE spend backstop. Pi has no step, turn or cost cap of its own, so the control
       # plane's LLM proxy stops answering once one beat has spent this much.
       ASSISTANT_BEAT_COST_CAP_USD: ${ASSISTANT_BEAT_COST_CAP_USD:-1.50}
+      # --- phase 33: assistants that message and WAKE each other ---------------------
+      # THE DAILY CEILING, per project. Mike's number, and a hard STOP rather than an alert:
+      # at the limit no further beat starts from any trigger — schedule, DM wake, or the
+      # owner's own button — and the owner is told once, in the thread they already read.
+      # It became necessary with messaging: a clock and a button are self-limiting, two
+      # assistants being conscientious at each other are not.
+      PROJECT_DAILY_USD: ${PROJECT_DAILY_USD:-10}
+      # How many replies deep one conversation may go before it is stopped, and how long a
+      # message stays "the thing you are replying to". The window is what stops a runaway
+      # evading the depth count by answering on a later beat — and what stops two colleagues
+      # who talk regularly accumulating depth for ever until they cannot reach each other.
+      ASSISTANT_MAX_CHAIN_DEPTH: ${ASSISTANT_MAX_CHAIN_DEPTH:-4}
+      ASSISTANT_CHAIN_WINDOW_MIN: ${ASSISTANT_CHAIN_WINDOW_MIN:-120}
     # Docker's default 10s SIGTERM->SIGKILL window is shorter than uvicorn's graceful
     # shutdown, so the app was being killed before its lifespan shutdown could run and
     # RELEASE ownership of in-flight runs. With room to shut down cleanly, an interrupted run
