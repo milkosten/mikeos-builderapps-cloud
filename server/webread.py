@@ -159,8 +159,14 @@ async def check_url(raw: str) -> str:
     for ip in ips:
         ok, why = _ip_ok(ip)
         if not ok:
-            raise Refused(f"`{host}` points at {why} — that is not a public website, so I "
-                          "won't fetch it.")
+            # `why` already names the address. When the URL WAS the address, saying "X points
+            # at X is a link-local address" reads like a bug; when it was a name, the
+            # indirection is the whole point and has to be shown.
+            if host == ip:
+                raise Refused(f"`{host}` is {why.split(' is ', 1)[1]} — not a public website, "
+                              "so I won't fetch it.")
+            raise Refused(f"`{host}` resolves to {why} — not a public website, so I won't "
+                          "fetch it.")
     return urlunparse(p)
 
 

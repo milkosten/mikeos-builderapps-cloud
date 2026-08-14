@@ -150,3 +150,11 @@ def test_blocked_targets(url):
 def test_public_targets_are_allowed(url):
     got = asyncio.run(webread.check_url(url))
     assert got.startswith("http")
+
+
+def test_refusal_wording_does_not_repeat_the_address():
+    """A literal IP names itself once; a NAME must show the indirection, because "evil.com
+    resolves to 127.0.0.1" is the whole reason the resolved-IP check exists."""
+    msg = _refuses("http://169.254.169.254/latest/meta-data/")
+    assert msg.count("169.254.169.254") == 1
+    assert "link-local" in msg and "points at" not in msg
