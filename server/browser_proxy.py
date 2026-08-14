@@ -226,6 +226,30 @@ async def _reap_expired() -> None:
             await close_session(sid)
 
 
+# A janitor, because "reap on the next open" only reaps when somebody shows up — and the
+# session that leaks is precisely the one after which nobody shows up. Started lazily on the
+# first session so it costs nothing on a control plane that never browses.
+_janitor: Optional[asyncio.Task] = None
+
+
+async def _janitor_loop() -> None:
+    while True:
+        await asyncio.sleep(max(60.0, SESSION_TTL_SEC / 4))
+        try:
+            await _reap_expired()
+        except Exception:  # noqa: BLE001 — a janitor that dies quietly is the leak again
+            logger.exception("browser session janitor pass failed")
+
+
+def _ensure_janitor() -> None:
+    global _janitor
+    if _janitor is None or _janitor.done():
+        try:
+            _janitor = asyncio.create_task(_janitor_loop())
+        except RuntimeError:                    # no running loop (tests) — nothing to janitor
+            pass
+
+
 def _own(sid: str, assistant: dict) -> dict:
     """A session id is a capability here, so it is checked against the ledger — an assistant
     may only drive a session IT opened, never one it guessed or read somewhere."""
@@ -279,6 +303,7 @@ async def open_session(body: OpenBody, x_assistant_token: str = Header(""),
                        x_beat_id: str = Header("")) -> dict:
     a, beat_id = await _caller(x_assistant_token, x_beat_id)
     _require_browser(a)
+    _ensure_janitor()
     await _reap_expired()
     if beat_id is not None:
         mine = [s for s in _sessions.values() if s.get("beat_id") == beat_id]

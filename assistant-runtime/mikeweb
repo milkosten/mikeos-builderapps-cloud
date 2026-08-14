@@ -105,6 +105,11 @@ def forget_session() -> None:
         pass
 
 
+# Set when THIS invocation opened the session (as opposed to reusing the sticky one). It is
+# what lets a failed first navigation hand the browser back instead of stranding it.
+_OPENED_HERE = [False]
+
+
 def session(explicit: str = "", create: bool = True) -> str:
     sid = (explicit or saved_session()).strip()
     if sid:
@@ -116,7 +121,25 @@ def session(explicit: str = "", create: bool = True) -> str:
     if not sid:
         die("the control plane opened no session")
     save_session(sid)
+    _OPENED_HERE[0] = True
     return sid
+
+
+def release_if_unused(sid: str) -> None:
+    """Hand back a session we opened and then never got to use.
+
+    A refused URL used to cost a real Chrome: `session()` opens one, the navigate comes back
+    403, and the process exits holding it. Inside a beat the end-of-beat close would collect
+    it, but the browser fleet is shared with the whole estate and 'someone will tidy up
+    later' is exactly how it ended up with eleven abandoned sessions.
+    """
+    if not _OPENED_HERE[0] or not sid:
+        return
+    try:
+        call("DELETE", f"{BASE}/session/{sid}", timeout=20, raise_on_error=True)
+    except Exception:  # noqa: BLE001 — best effort; the proxy reaps and the beat closes too
+        pass
+    forget_session()
 
 
 def do_goto(url: str, sid: str = "") -> dict:
@@ -131,6 +154,7 @@ def do_goto(url: str, sid: str = "") -> dict:
         # retry ONCE. Anything else (403 refused url, 429 over the cap) is a real answer:
         # retrying it just prints the same refusal twice and reads like a bug.
         if e.status != 404:
+            release_if_unused(sid)      # a refused url must not cost a Chrome
             die(e.detail)
         forget_session()
         sid = session("")
