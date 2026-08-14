@@ -238,7 +238,13 @@ async def deploy(shortid: str, workspace: Path, *, db_password: str, app_secret:
         raise
 
 
-async def _health_gate_internal(shortid: str, timeout_s: int = 180) -> bool:
+async def _health_gate_internal(
+    shortid: str,
+    timeout_s: int = int(os.environ.get("HEALTH_GATE_TIMEOUT_S", "360")),
+) -> bool:
+    # 180s was too tight on a box running 160+ containers: several builds were failed on
+    # "internal /health never went green" while the app went healthy a minute later — pure
+    # contention, not a broken app. A slow start is not a failure; a never-start is.
     """Poll the <id>-app container's own /health from inside via `docker exec` until green."""
     app = f"{shortid}-app"
     deadline = asyncio.get_event_loop().time() + timeout_s

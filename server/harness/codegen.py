@@ -46,7 +46,16 @@ NO_SAAS_RULE = (
     "7. Keep client and server response shapes consistent. When the frontend consumes one of your "
     "own JSON endpoints, unwrap the object before iterating: an endpoint returning {\"items\":[...]} "
     "must be read as `data.items`, never iterated directly — `data.forEach(...)` on an object throws "
-    "\"forEach is not a function\" and the list silently never renders."
+    "\"forEach is not a function\" and the list silently never renders.\n"
+    "8. MIGRATIONS — the scaffold ALREADY has a working, idempotent migration runner: `db/migrate.js` "
+    "applies every `migrations/*.sql` once, in filename order, tracking them in a `_migrations` table, "
+    "and `server.js` calls it on boot. DO NOT write your own migration runner and DO NOT create a "
+    "second tracking table (e.g. `schema_migrations`) — a hand-rolled one has already shipped broken "
+    "(`ON CONFLICT (filename)` with no UNIQUE constraint), which crash-loops the app at boot and fails "
+    "the whole build. To add schema, ONLY add a new numbered file like `migrations/002_feature.sql`. "
+    "Create each table exactly once across all migrations (never both `notes` and `public.notes`), "
+    "always `IF NOT EXISTS`, and never ALTER or re-shape the scaffold's existing `app_meta` table. Any "
+    "`ON CONFLICT (col)` you write REQUIRES a matching UNIQUE/PRIMARY KEY constraint on that column."
 )
 
 
