@@ -114,6 +114,21 @@ def normalize_compose(raw_yaml: str, shortid: str) -> str:
             svc["cpus"] = float(os.environ.get("PROJ_APP_CPUS", "1.0"))
             # ensure it builds from the workspace context
             svc.setdefault("build", ".")
+            # The app also joins the SHARED network, where generic names like "db" and
+            # "redis" are already claimed by unrelated stacks (e.g. deploy-db-1 is aliased
+            # "db"). Docker's DNS could then resolve "db" to ANOTHER TENANT'S Postgres —
+            # the app connects to the wrong server and dies with 28P01 auth-failed.
+            # Pin both datastores to their unambiguous per-project container names.
+            appenv = svc.get("environment") or {}
+            if isinstance(appenv, list):  # ["K=V", ...] form -> dict
+                appenv = dict(
+                    item.split("=", 1) for item in appenv if isinstance(item, str) and "=" in item
+                )
+            appenv["DATABASE_URL"] = (
+                f"postgresql://app:${{DB_PASSWORD}}@{shortid}-db:5432/app"
+            )
+            appenv["REDIS_URL"] = f"redis://{shortid}-redis:6379"
+            svc["environment"] = appenv
         elif name == "db":
             svc["networks"] = [proj_net]
             svc["mem_limit"] = _DB_MEM
