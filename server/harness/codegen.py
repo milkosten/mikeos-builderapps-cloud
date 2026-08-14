@@ -25,6 +25,7 @@ from typing import Any, Dict, List
 
 from server import gpu
 from server.harness import syntax
+from server.harness.backlog import MAX_FEATURES as _MAX_BACKLOG
 
 logger = logging.getLogger(__name__)
 
@@ -130,11 +131,17 @@ TECH_PLAN_ASK = (
     "keyword columns; explicit primary keys).\n"
     "## Routes — every HTTP route as a bullet `METHOD /path — what it does`.\n"
     "## Pages — every frontend page/view as a bullet `/path — what the user sees`.\n"
-    "## Build Backlog — an ORDERED numbered list of 6-14 concrete build tasks, each ONE small "
-    "feature (e.g. `1. Notes table migration + pool wiring`, `2. POST /api/notes create endpoint`, "
-    "`3. GET /api/notes list newest-first`, `4. Frontend: add-note form + list render`, "
-    "`5. DELETE /api/notes/:id + remove-from-list`). Each item must be independently buildable and "
-    "testable. Keep the app SMALL and correct; do not over-scope."
+    f"## Build Backlog — an ORDERED numbered list of AT MOST {_MAX_BACKLOG} concrete build "
+    "tasks, each ONE small feature (e.g. `1. Notes table migration + pool wiring`, "
+    "`2. POST /api/notes create endpoint`, `3. GET /api/notes list newest-first`, "
+    "`4. Frontend: add-note form + list render`, `5. DELETE /api/notes/:id + remove-from-list`). "
+    "Each item must be independently buildable and testable. Keep the app SMALL and correct; do "
+    "not over-scope.\n"
+    f"HARD RULE: the backlog IS the build — only these {_MAX_BACKLOG} tasks get built. So every "
+    "page you listed under `## Pages` must have its own backlog item, and every capability the "
+    "brief asks for must be reachable from the UI: an endpoint with no page is a feature the "
+    "user cannot use. If it does not all fit, cut scope in the Data Model and the Routes — "
+    "never in the Pages, and never leave the admin/editor screen for last."
 )
 
 

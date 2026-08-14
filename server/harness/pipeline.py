@@ -33,7 +33,9 @@ from server.harness.engine import Ctx, Step
 logger = logging.getLogger(__name__)
 
 # The build loop is bounded so it can never run away (designer lesson: hard-cap steps).
-_MAX_FEATURES = 12
+# ONE constant, shared with the TECHNICAL-PLAN prompt: while the prompt asked for "6-14 tasks"
+# and this said 12, items 13-14 were parsed and then dropped without a word.
+_MAX_FEATURES = backlog_mod.MAX_FEATURES
 
 
 # --------------------------------------------------------------------------
@@ -142,7 +144,9 @@ def _s_parse_backlog():
         tp = ctx.state.get("tech_plan") or (
             workspace.read_file_capped(ctx.project_id, "docs/TECHNICAL-PLAN.md") or "")
         ctx.state["tech_plan"] = tp
+        planned = backlog_mod.parse_backlog(tp, cap=0)      # what the plan actually promised
         items = backlog_mod.parse_backlog(tp, cap=_MAX_FEATURES)
+        folded = max(0, len(planned) - len(items))
         if not items:
             # never leave the loop empty — fall back to one holistic build task
             items = ["Implement the full app described in the brief and technical plan: "
@@ -150,7 +154,9 @@ def _s_parse_backlog():
         ctx.state["backlog"] = items
         ctx.state["feature_total"] = len(items)   # denominator of the honest "N of M" summary
         ctx.state["changes"] = []
-        return f"backlog: {len(items)} features -> {items}"
+        note = (f" ({len(planned)} planned; the last {folded + 1} folded into one step so "
+                f"nothing is dropped)" if folded else "")
+        return f"backlog: {len(items)} features{note} -> {items}"
     return step
 
 
