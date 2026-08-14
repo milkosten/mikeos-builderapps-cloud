@@ -226,7 +226,7 @@ async def qa_run(url: str, exercise: bool = True,
     """
     to = float(timeout if timeout is not None else max(_TIMEOUT, 60.0))
     sid = None
-    result = {"errors": [], "network": [], "screenshot": None, "ok": False}
+    result = {"errors": [], "network": [], "screenshot": None, "text": "", "ok": False}
     try:
         async with httpx.AsyncClient(timeout=to, verify=False, auth=_auth()) as client:
             r = await client.post(f"{CHROME_POOL_URL}/session")
@@ -254,6 +254,16 @@ async def qa_run(url: str, exercise: bool = True,
                                     json={"expression": "JSON.stringify(window.__net||[])"})
             result["errors"] = _parse_json_list((re_.json() or {}).get("value"))
             result["network"] = _parse_json_list((rn_.json() or {}).get("value"))
+            # WHAT THE PAGE ACTUALLY SAYS. Without this, a QA pass reports "no errors" and
+            # nothing else — which is how a beat ends with the agent writing "I'll quote what
+            # the browser showed me next beat", because it had nothing to quote. A clean
+            # console on a blank page is the failure this whole feature is about, and only
+            # the rendered text distinguishes the two.
+            try:
+                snap = await client.get(f"{CHROME_POOL_URL}/session/{sid}/snapshot")
+                result["text"] = str((snap.json() or {}).get("text") or "")
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 shot = await client.get(f"{CHROME_POOL_URL}/session/{sid}/screenshot")
                 b64 = (shot.json() or {}).get("imageB64")

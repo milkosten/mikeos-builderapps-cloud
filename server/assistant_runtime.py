@@ -691,11 +691,19 @@ async def act_run_qa(assistant: dict) -> dict:
         return {"ok": False, "detail": f"QA failed: {e}"[:400]}
     errors = (qa or {}).get("errors") or []
     network = (qa or {}).get("network") or []
+    text = str((qa or {}).get("text") or "")
     # never-trust: chrome-pool degrades to empty lists on its own failure, so `ok` matters
     return {"ok": True, "reached": bool((qa or {}).get("ok")), "url": url,
             "console_errors": [str(e)[:300] for e in errors[:10]],
             "failed_requests": [str(n)[:300] for n in network[:10]],
-            "clean": bool((qa or {}).get("ok")) and not errors and not network}
+            # The rendered page, so the assistant can QUOTE what a visitor sees instead of
+            # only reporting the absence of errors. An empty page with a clean console is
+            # still a broken page, and this is the only field that shows it.
+            "rendered_text": text[:4000],
+            "rendered_chars": len(text),
+            "blank": bool((qa or {}).get("ok")) and len(text.strip()) < 40,
+            "clean": bool((qa or {}).get("ok")) and not errors and not network
+            and len(text.strip()) >= 40}
 
 
 async def act_request_deploy(assistant: dict, request_text: str,
