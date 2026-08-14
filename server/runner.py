@@ -30,7 +30,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from server import store
+from server import store, usage
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +152,12 @@ async def _supervise(run_id: int, project_id: str,
     Cancellation (uvicorn shutting the container down) is deliberately NOT treated as a
     failure: the run is released so the next boot's sweep resumes it exactly where it stopped.
     """
+    # Stamp the token-accounting context on the RUN's own task, before any step runs. The
+    # engine refines it per step, but doing it here means an LLM call made outside a step
+    # (or before the first step stamps) is still attributed to this project/run instead of
+    # being silently dropped by the sink. contextvars only flow parent -> child, and this
+    # task is the parent of everything the run does.
+    usage.set_context(project_id, run_id, None)
     hb = asyncio.create_task(_heartbeat_loop(run_id))
     try:
         await body()

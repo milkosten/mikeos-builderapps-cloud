@@ -312,6 +312,10 @@ async def _openrouter_tools(messages: List[Dict[str, Any]], tools: List[Dict[str
         "tools": tools,
         "reasoning": {"enabled": False},
         "provider": {"sort": "throughput"},
+        # Same as the plain chat path: ask for the REAL cost + cached-token counts. The
+        # agentic codegen loop is where most of a build's tokens go, so without this the
+        # Usage tab priced the expensive half of every build from the estimate table.
+        "usage": {"include": True},
     }
     if tool_choice is not None:
         body["tool_choice"] = tool_choice
