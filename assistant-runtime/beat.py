@@ -620,6 +620,35 @@ def discard_changes() -> None:
     sh(["git", "clean", "-fd"])
 
 
+def uncommit_agent_commits() -> int:
+    """If the coding agent committed by itself, put its work back in the working tree.
+
+    Pi is told not to run git — but it HAS a bash tool, and a told-not-to is a request, not a
+    constraint. If it commits anyway, `git status` comes back clean and the gate would
+    conclude "the agent changed nothing", discard the beat and throw away real work that is
+    sitting right there in HEAD.
+
+    `reset --soft` moves the branch pointer back to the pushed HEAD and leaves the index and
+    working tree exactly as they are, so everything the agent did becomes ordinary
+    uncommitted changes and the ONE gate below sees all of it. It also means the commit that
+    finally lands is ours: attributed to the assistant, with a message we chose, gated like
+    any other. Returns how many commits were folded back.
+    """
+    rc, out = sh(["git", "rev-list", "--count", "origin/HEAD..HEAD"])
+    if rc != 0:
+        return 0
+    try:
+        ahead = int(out.strip() or "0")
+    except ValueError:
+        return 0
+    if ahead <= 0:
+        return 0
+    log(f"gate: the coding agent made {ahead} commit(s) of its own — folding them back "
+        f"into the working tree so they go through the same gate")
+    sh(["git", "reset", "--soft", "origin/HEAD"])
+    return ahead
+
+
 def gate_changes() -> dict:
     """Inspect what the coding agent actually did and decide whether it may be committed.
 
@@ -627,6 +656,7 @@ def gate_changes() -> dict:
     WHOLE beat's work rather than committing the acceptable part of it: a half-applied change
     is how you get an app that starts but is subtly wrong, which is worse than no change.
     """
+    uncommit_agent_commits()
     files = changed_files()
     if not files:
         return {"ok": False, "empty": True, "files": [],

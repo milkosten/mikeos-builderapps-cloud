@@ -104,6 +104,20 @@ def main() -> int:
         git(repo, "reset", "-q")
         git(repo, "checkout", "--", ".")
 
+        # The agent was TOLD not to commit, but it has a bash tool and "told not to" is a
+        # request. If it commits anyway, `git status` is clean and a naive gate would say
+        # "changed nothing" and throw the work away. It must be folded back instead.
+        git(repo, "branch", "-f", "origin/HEAD")          # stand in for the remote ref
+        with open(os.path.join(repo, "server.js"), "w") as f:
+            f.write("const a = 1;\nconst agent = true;\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "the agent committed by itself")
+        check("a self-committing agent's work is not lost",
+              beat.gate_changes().get("ok") and
+              beat.gate_changes().get("files") == ["server.js"],
+              "reset --soft puts it back in the working tree so the ONE gate sees it")
+        git(repo, "reset", "-q", "--hard", "origin/HEAD")
+
         # The file-count cap: a "change" that rewrites the world is a rewrite, not a change.
         beat.MAX_CHANGED_FILES = 3
         for i in range(5):
