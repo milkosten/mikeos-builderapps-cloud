@@ -54,6 +54,43 @@ def step_timeout(name: str) -> float:
     return _DEFAULT_STEP_TIMEOUT
 
 
+# ---- skippable vs critical steps (phase 28) --------------------------------
+# One failed feature used to kill a 23-step run and the user lost the WHOLE app. A feature is
+# now retried (pipeline side, with the error fed back into the agentic loop) and, if it still
+# fails, marked `skipped` so the build continues with the features that DO work.
+#
+# Only `build_NN` features are skippable. Everything else is load-bearing: you cannot skip the
+# repo, the checkout, the secrets, the skeleton deploy, the DATA LAYER or the final deploy and
+# still have an app — those stay fatal on purpose.
+CRITICAL_STEPS = frozenset({
+    "ensure_gitea_account", "create_repo", "checkout", "allocate_secrets",
+    "deploy_skeleton", "strategy_artifacts", "parse_backlog", "data_layer",
+    "final_deploy", "finalize",
+    # update pipeline
+    "update_context", "plan_and_apply", "deploy", "commit_push",
+})
+_FEATURE_RE = re.compile(r"^build_\d+")
+
+
+def is_skippable(name: str) -> bool:
+    """True only for a backlog FEATURE step. Anything critical stays fatal."""
+    return bool(_FEATURE_RE.match(name)) and name not in CRITICAL_STEPS
+
+
+class StepSkipped(Exception):
+    """A skippable step gave up after its retry. Carries the honest reason.
+
+    Raised by the step function itself once it has cleaned up after the failure (reverted the
+    broken partial work and put the last-good build back on the air), so the engine can record
+    `skipped` and move to the next feature knowing the app is still deployable.
+    """
+
+    def __init__(self, reason: str, label: str = ""):
+        super().__init__(reason)
+        self.reason = reason
+        self.label = label
+
+
 @dataclass
 class Ctx:
     project_id: str
@@ -102,14 +139,30 @@ def _public_state(state: dict) -> dict:
             if isinstance(v, (str, int, bool)) and not _SECRETISH.search(k)}
 
 
-async def _already_done(run_id: int, idx: int) -> bool:
+async def _prior_steps(run_id: int) -> dict[int, dict]:
+    """idx -> step row for everything this run has already recorded.
+
+    `done` AND `skipped` are both terminal: a resumed run must not re-run a feature that
+    already gave up (it would burn the whole budget again), and it must remember the skip so
+    the final summary stays honest.
+    """
     row = await store.get_run_with_steps(run_id)
     if not row:
-        return False
-    for s in row["steps"]:
-        if s["idx"] == idx and s["status"] == "done":
-            return True
-    return False
+        return {}
+    return {int(s["idx"]): dict(s) for s in row["steps"]}
+
+
+def run_summary(state: dict) -> str:
+    """The honest one-line outcome for a run. Never claims success when features were skipped."""
+    skipped = state.get("skipped") or []
+    total = int(state.get("feature_total") or 0)
+    if not skipped:
+        return (f"{total} of {total} features built" if total else "all steps completed")
+    names = "; ".join(f"{s.get('label') or s.get('step')} ({s.get('reason', '')[:120]})"
+                      for s in skipped)
+    built = max(total - len(skipped), 0)
+    return (f"{built} of {total} features built; {len(skipped)} skipped: {names}"
+            if total else f"{len(skipped)} step(s) skipped: {names}")
 
 
 async def run_partial(project_id: str, run_id: int, steps: list[Step],
@@ -126,15 +179,31 @@ async def run_partial(project_id: str, run_id: int, steps: list[Step],
     ctx = Ctx(project_id=project_id, run_id=run_id, emit=emit)
     if state:
         ctx.state = state
+    ctx.state.setdefault("skipped", [])
     if base_idx == 0:
         emit({"type": "run_start", "project_id": project_id, "run_id": run_id,
               "total_steps": total if total is not None else len(steps)})
 
+    prior = await _prior_steps(run_id)
+    # A resumed run inherits the skips it already recorded, so the final summary still counts
+    # them (they are not re-run and would otherwise vanish from the report).
+    known_skips = {s.get("step") for s in ctx.state["skipped"]}
+    for row in prior.values():
+        if row.get("status") == "skipped" and row.get("name") not in known_skips:
+            ctx.state["skipped"].append({"step": row.get("name"), "label": row.get("name"),
+                                         "reason": (row.get("log") or "")[:300]})
+
     for local, (name, fn) in enumerate(steps):
         idx = base_idx + local
-        if await _already_done(run_id, idx):
+        prev = prior.get(idx) or {}
+        if prev.get("status") == "done":
             ctx.log(f"skip done step {idx} {name}")
             emit({"type": "step_done", "idx": idx, "name": name, "skipped": True})
+            continue
+        if prev.get("status") == "skipped":
+            ctx.log(f"step {idx} {name} was already skipped — not retrying")
+            emit({"type": "step_skipped", "idx": idx, "name": name,
+                  "reason": (prev.get("log") or "")[:400]})
             continue
 
         await store.upsert_step(run_id, idx, name, "running")
@@ -163,30 +232,76 @@ async def run_partial(project_id: str, run_id: int, steps: list[Step],
             _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "running",
                                 {"step_name": name, "interrupted": True})
             raise
+        except StepSkipped as e:
+            # The step gave up but cleaned up after itself (see pipeline._s_feature): the
+            # workspace is back at the last good commit and the last-good build is on the air.
+            # Record it, tell the client honestly, and keep building the rest of the app.
+            await _record_skip(ctx, idx, name, e.reason, e.label or name)
+            continue
         except asyncio.TimeoutError:
             msg = (f"step timed out after {step_timeout(name):.0f}s "
                    f"(hung LLM/build call) — failing the step instead of wedging the run")
             logger.error("step %s: %s", name, msg)
+            if is_skippable(name):
+                await _record_skip(ctx, idx, name, msg, name)
+                continue
             await store.upsert_step(run_id, idx, name, "failed", msg)
             _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "failed",
                                 {"step_name": name, "error": msg})
             emit({"type": "error", "idx": idx, "name": name, "message": msg})
-            await store.finish_run(run_id, "failed", msg)
+            await store.finish_run(run_id, "failed", msg, run_summary(ctx.state))
             raise RuntimeError(f"{name}: {msg}")
         except Exception as e:  # noqa: BLE001
             logger.exception("step %s failed", name)
+            if is_skippable(name):
+                # A feature that failed WITHOUT cleaning up (an unexpected error rather than a
+                # give-up) is still not worth the whole app — skip it too, but only after
+                # putting the tree back to its last good state so the next feature builds on
+                # something that works.
+                await _safe_revert(ctx)
+                await _record_skip(ctx, idx, name, str(e)[:300], name)
+                continue
             await store.upsert_step(run_id, idx, name, "failed", str(e)[:8000])
             _write_current_work(project_id, run_id, [("", None)] * (idx + 1), idx, "failed",
                                 {"step_name": name, "error": str(e)[:500]})
             emit({"type": "error", "idx": idx, "name": name, "message": str(e)})
-            await store.finish_run(run_id, "failed", f"{name}: {e}")
+            await store.finish_run(run_id, "failed", f"{name}: {e}", run_summary(ctx.state))
             raise
 
     if finish:
-        await store.finish_run(run_id, "done")
+        summary = run_summary(ctx.state)
+        await store.finish_run(run_id, "done", "", summary)
         emit({"type": "done", "project_id": project_id, "run_id": run_id,
+              "summary": summary,
+              "skipped": [{"step": s.get("step"), "feature": s.get("label"),
+                           "reason": s.get("reason", "")[:300]}
+                          for s in (ctx.state.get("skipped") or [])],
               "state": _public_state(ctx.state)})
     return ctx.state
+
+
+async def _record_skip(ctx: Ctx, idx: int, name: str, reason: str, label: str) -> None:
+    """Persist + announce a skipped step. The run stays alive."""
+    logger.warning("step %s SKIPPED: %s", name, reason)
+    ctx.state.setdefault("skipped", []).append(
+        {"step": name, "label": label, "reason": reason[:300]})
+    await store.upsert_step(ctx.run_id, idx, name, "skipped", reason[:8000])
+    _write_current_work(ctx.project_id, ctx.run_id, [("", None)] * (idx + 1), idx, "skipped",
+                        {"step_name": name, "skipped_reason": reason[:500]})
+    ctx.emit({"type": "step_skipped", "idx": idx, "name": name, "reason": reason[:400]})
+    # Older clients only understand the create/update vocabulary — make sure the skip is
+    # visible there too rather than looking like a step that silently vanished.
+    ctx.emit({"type": "progress", "stage": "skipped",
+              "detail": f"{label}: skipped — {reason[:200]}"})
+
+
+async def _safe_revert(ctx: Ctx) -> None:
+    """Drop uncommitted (broken) work so the next step starts from the last good commit."""
+    try:
+        from server import workspace
+        await workspace.revert_uncommitted(ctx.project_id)
+    except Exception as e:  # noqa: BLE001
+        logger.info("revert after skip failed for %s: %s", ctx.project_id, e)
 
 
 async def run(project_id: str, run_id: int, steps: list[Step],

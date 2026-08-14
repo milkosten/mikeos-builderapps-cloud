@@ -142,6 +142,7 @@ def _s_parse_backlog():
             items = ["Implement the full app described in the brief and technical plan: "
                      "all routes, all pages, wired end-to-end."]
         ctx.state["backlog"] = items
+        ctx.state["feature_total"] = len(items)   # denominator of the honest "N of M" summary
         ctx.state["changes"] = []
         return f"backlog: {len(items)} features -> {items}"
     return step
@@ -174,50 +175,105 @@ def _s_data_layer(brief: str):
     return step
 
 
+async def _redeploy(ctx: Ctx) -> None:
+    """Rebuild + restart the app stack and run the health gate."""
+    await _load_secrets_into_state(ctx)
+    proj = await store.get_project(ctx.project_id)
+    await deployer.deploy(
+        ctx.project_id, workspace.path_for(ctx.project_id),
+        db_password=ctx.state["db_password"], app_secret=ctx.state["app_secret"],
+        title=(proj or {}).get("title", ""))
+
+
+async def _feature_attempt(ctx: Ctx, idx: int, feature: str, brief: str, *,
+                           attempt: int, prior_error: str = "") -> dict:
+    """One full attempt at a feature: agentic edit -> deploy+health-gate -> (repair -> deploy).
+
+    Returns {"wrote": [...], "res": <agent result>}. Raises if the app is still not healthy
+    after the in-attempt repair pass.
+    """
+    step_name = f"build_{idx+1:02d}" if attempt == 1 else f"build_{idx+1:02d}_retry"
+    extra = ""
+    mode = "feature"
+    task = feature
+    if prior_error:
+        mode = "fix"
+        task = (f"A previous attempt to build '{feature}' FAILED and its half-finished work is "
+                f"still in the tree. Inspect what is actually there, then finish the feature "
+                f"correctly — or, if the partial change is the problem, revert it and "
+                f"implement the feature differently.")
+        extra = (f"Previous attempt's failure:\n{prior_error[:2000]}\n\n"
+                 "Start by reading the files it touched and calling app_logs — the container's "
+                 "own output usually names the real cause. Do not guess.")
+    res = await agentic.run_agent(
+        project_id=ctx.project_id, run_id=ctx.run_id, step=step_name,
+        brief=brief, tech_plan=ctx.state.get("tech_plan", ""), task=task, extra=extra,
+        recent_changes=ctx.state.get("changes", []), mode=mode,
+        require_change=(attempt == 1), emit=ctx.emit)
+    wrote = list(res["changed"])
+    try:
+        await _redeploy(ctx)
+    except Exception as e:  # noqa: BLE001 — feed the error back once inside this attempt
+        logger.warning("feature %s build failed, one repair pass: %s", feature, e)
+        ctx.emit({"type": "progress", "stage": "build_feature",
+                  "detail": f"[{idx+1}] deploy failed — repair pass"})
+        fix = await agentic.run_agent(
+            project_id=ctx.project_id, run_id=ctx.run_id, step=f"{step_name}_fix",
+            brief=brief, tech_plan=ctx.state.get("tech_plan", ""),
+            task=f"The change just made for '{feature}' broke the build or the health "
+                 f"gate. Diagnose and fix it with the smallest possible change.",
+            extra=f"Deploy/health error:\n{str(e)[:2000]}\n"
+                  f"Files just changed: {', '.join(wrote) or '(none)'}\n"
+                  "Use app_logs to see what the container itself reported.",
+            recent_changes=ctx.state.get("changes", []), mode="fix",
+            require_change=False, emit=ctx.emit)
+        for path in fix["changed"]:
+            if path not in wrote:
+                wrote.append(path)
+        await _redeploy(ctx)
+    return {"wrote": wrote, "res": res}
+
+
 def _s_feature(idx: int, feature: str, brief: str):
-    """Build ONE backlog feature with the agentic loop (phase 26).
+    """Build ONE backlog feature with the agentic loop (phase 26), non-fatally (phase 28).
 
     The model navigates the repo with tools (list/grep/read/edit) instead of being handed a
     context block and asked to return whole files, so untouched code stays untouched and the
     per-feature cost stops scaling with file size. If the deploy/health-gate then fails, the
-    SAME loop gets one repair pass — and it can `app_logs` the container's own crash output,
+    SAME loop gets a repair pass — and it can `app_logs` the container's own crash output,
     which the whole-file path could never see.
+
+    **A feature that still will not build no longer kills the run.** It gets a second full
+    attempt with the first failure fed back in (the agent can read its own partial file and
+    tail the crash), and if that fails too the tree is reverted to the last good commit, the
+    last-good build is put back on the air, and the step is reported as `skipped` with a
+    reason. Losing one feature is a bad outcome; losing the other eleven is a catastrophic one.
     """
     async def step(ctx: Ctx):
         ctx.emit({"type": "progress", "stage": "build_feature",
                   "detail": f"[{idx+1}] {feature[:120]}"})
-        res = await agentic.run_agent(
-            project_id=ctx.project_id, run_id=ctx.run_id, step=f"build_{idx+1:02d}",
-            brief=brief, tech_plan=ctx.state.get("tech_plan", ""), task=feature,
-            recent_changes=ctx.state.get("changes", []), mode="feature", emit=ctx.emit)
-        wrote = list(res["changed"])
-        # rebuild + restart just the app, health-gate (deployer does the full compose)
-        await _load_secrets_into_state(ctx)
-        proj = await store.get_project(ctx.project_id)
         try:
-            await deployer.deploy(
-                ctx.project_id, workspace.path_for(ctx.project_id),
-                db_password=ctx.state["db_password"], app_secret=ctx.state["app_secret"],
-                title=(proj or {}).get("title", ""))
-        except Exception as e:  # noqa: BLE001 — feed the error back once, then continue
-            logger.warning("feature %s build failed, one repair pass: %s", feature, e)
-            fix = await agentic.run_agent(
-                project_id=ctx.project_id, run_id=ctx.run_id, step=f"build_{idx+1:02d}_fix",
-                brief=brief, tech_plan=ctx.state.get("tech_plan", ""),
-                task=f"The change just made for '{feature}' broke the build or the health "
-                     f"gate. Diagnose and fix it with the smallest possible change.",
-                extra=f"Deploy/health error:\n{str(e)[:2000]}\n"
-                      f"Files just changed: {', '.join(wrote) or '(none)'}\n"
-                      "Use app_logs to see what the container itself reported.",
-                recent_changes=ctx.state.get("changes", []), mode="fix",
-                require_change=False, emit=ctx.emit)
-            for path in fix["changed"]:
-                if path not in wrote:
-                    wrote.append(path)
-            await deployer.deploy(
-                ctx.project_id, workspace.path_for(ctx.project_id),
-                db_password=ctx.state["db_password"], app_secret=ctx.state["app_secret"],
-                title=(proj or {}).get("title", ""))
+            out = await _feature_attempt(ctx, idx, feature, brief, attempt=1)
+        except Exception as first:  # noqa: BLE001
+            logger.warning("feature '%s' attempt 1 failed: %s", feature, first)
+            ctx.emit({"type": "progress", "stage": "build_feature",
+                      "detail": f"[{idx+1}] failed — retrying once with the error fed back"})
+            try:
+                out = await _feature_attempt(ctx, idx, feature, brief, attempt=2,
+                                             prior_error=str(first))
+            except Exception as second:  # noqa: BLE001 — give up on THIS feature only
+                logger.warning("feature '%s' attempt 2 failed: %s", feature, second)
+                await workspace.revert_uncommitted(ctx.project_id)
+                restored = "reverted to last good commit"
+                try:
+                    await _redeploy(ctx)          # put the working app back on the air
+                except Exception as e3:  # noqa: BLE001
+                    restored = f"revert redeploy also failed: {str(e3)[:200]}"
+                    logger.error("could not restore %s after skipping a feature: %s",
+                                 ctx.project_id, e3)
+                reason = (f"failed twice ({str(second)[:220]}); {restored}")
+                raise engine.StepSkipped(reason, label=feature[:80])
+        wrote, res = out["wrote"], out["res"]
         ctx.state.setdefault("changes", []).append(f"{feature} ({', '.join(wrote)})")
         await _commit(ctx, f"feat: {feature[:70]}")
         return (f"built {feature[:60]} -> {wrote or 'no file changes'} "
@@ -263,8 +319,19 @@ def _s_qa(brief: str):
 
 def _s_finalize():
     async def step(ctx: Ctx):
+        # The project goes live even with skipped features — a 11-of-12 app is a real app —
+        # but the run carries the honest count, and the chat thread records it so the user
+        # sees what was NOT built without having to read the step list.
         await store.set_project_status(ctx.project_id, "live")
-        return "project live"
+        summary = engine.run_summary(ctx.state)
+        skipped = ctx.state.get("skipped") or []
+        if skipped:
+            await store.append_message(
+                ctx.project_id, "system",
+                "Some features could not be built and were skipped: " + summary,
+                {"skipped": [{"feature": s.get("label"), "reason": s.get("reason")}
+                             for s in skipped]})
+        return f"project live — {summary}"
     return step
 
 
@@ -391,6 +458,8 @@ async def run_create(project_id: str, run_id: int, user_id: str, email: Optional
                     raise RuntimeError(
                         "cannot resume: no backlog and no TECHNICAL-PLAN.md to derive one")
                 state["backlog"] = backlog_items
+
+            state["feature_total"] = len(backlog_items)
 
             # Assemble the remainder (data layer + features + deploy + QA + finalize) and run,
             # continuing the same run_id at the next idx.

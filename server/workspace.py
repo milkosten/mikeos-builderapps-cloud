@@ -95,6 +95,33 @@ async def commit_push(project_id: str, message: str,
     return True
 
 
+async def revert_uncommitted(project_id: str) -> bool:
+    """Throw away everything since the last commit (phase 28).
+
+    A feature step that fails twice leaves half-written, non-building code in the tree. If we
+    just skipped it, the NEXT feature would inherit the wreckage and fail too, and the final
+    deploy would ship it. Every good state is a commit (the pipeline commits per feature), so
+    `reset --hard HEAD` + `clean -fd` is exactly "put the app back the way it worked".
+    Returns True if anything was discarded. Never raises — it is a cleanup path.
+    """
+    dst = path_for(project_id)
+    if not (dst / ".git").is_dir():
+        return False
+    try:
+        rc, out = await _run(["git", "status", "--porcelain"], cwd=dst, timeout=60)
+        dirty = bool(rc == 0 and out.strip())
+        await _run(["git", "reset", "--hard", "HEAD"], cwd=dst, timeout=60)
+        # -fd, never -x: the deployer's generated docker-compose.normalized.yml and other
+        # ignored artifacts are not the agent's broken work.
+        await _run(["git", "clean", "-fd"], cwd=dst, timeout=60)
+        if dirty:
+            logger.info("reverted uncommitted work in %s", project_id)
+        return dirty
+    except Exception as e:  # noqa: BLE001
+        logger.warning("revert_uncommitted failed for %s: %s", project_id, e)
+        return False
+
+
 async def recent_commits(project_id: str, n: int = 8) -> list[str]:
     """Return the last N commit subjects (for the update context block). Best-effort."""
     dst = path_for(project_id)

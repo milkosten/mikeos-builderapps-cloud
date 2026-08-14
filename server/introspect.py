@@ -442,9 +442,14 @@ def backlog(project_id: str, steps: list[dict]) -> list[dict]:
             log = (st.get("log") or "")
             title = re.sub(r"^built\s+", "", log.split(" -> ")[0]).strip()
         status = (st or {}).get("status") or "pending"
-        if status not in ("done", "failed"):
+        # `skipped` is a first-class outcome (phase 28) — a feature that could not be built
+        # after a retry. Collapsing it to "pending" would let the UI imply it is still coming.
+        if status not in ("done", "failed", "skipped"):
             status = "pending"
-        items.append({"idx": n, "title": (title or f"feature {n}")[:300], "status": status})
+        item = {"idx": n, "title": (title or f"feature {n}")[:300], "status": status}
+        if status == "skipped":
+            item["reason"] = ((st or {}).get("log") or "")[:300]
+        items.append(item)
     return items
 
 

@@ -201,11 +201,14 @@ async def set_run_total(run_id: int, total_steps: int) -> None:
     )
 
 
-async def finish_run(run_id: int, status: str, error: str = "") -> None:
+async def finish_run(run_id: int, status: str, error: str = "", summary: str = "") -> None:
+    """Close a run. `summary` is the HONEST outcome line (phase 28): a run that finished with
+    skipped features is `done` but must never read as complete success, so the caller passes
+    e.g. "11 of 12 features built; 1 skipped: ...". Stored and echoed in the terminal SSE."""
     await pool().execute(
-        "UPDATE builderapps.pipeline_runs SET status=$2, finished_at=now(), error=$3 "
-        "WHERE id=$1",
-        run_id, status, (error or "")[:4000],
+        "UPDATE builderapps.pipeline_runs SET status=$2, finished_at=now(), error=$3, "
+        "summary=$4 WHERE id=$1",
+        run_id, status, (error or "")[:4000], (summary or "")[:4000],
     )
 
 
@@ -507,7 +510,7 @@ async def steps_for_latest_run(project_id: str) -> dict:
     died"; without them the UI could only ever show a spinner.
     """
     run = await pool().fetchrow(
-        "SELECT id,status,error,total_steps,heartbeat_at,finished_at "
+        "SELECT id,status,error,summary,total_steps,heartbeat_at,finished_at "
         "FROM builderapps.pipeline_runs WHERE project_id=$1 "
         "ORDER BY created_at DESC LIMIT 1", project_id,
     )
@@ -518,6 +521,7 @@ async def steps_for_latest_run(project_id: str) -> dict:
         "WHERE run_id=$1 ORDER BY idx", int(run["id"]),
     )
     return {"run_id": int(run["id"]), "status": run["status"],
-            "error": run["error"] or "", "total_steps": run["total_steps"],
+            "error": run["error"] or "", "summary": run["summary"] or "",
+            "total_steps": run["total_steps"],
             "heartbeat_at": run["heartbeat_at"], "finished_at": run["finished_at"],
             "steps": [dict(r) for r in rows]}
