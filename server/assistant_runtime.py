@@ -379,6 +379,13 @@ async def wake_tick() -> int:
     """
     if _shutting_down or not ENABLED:
         return 0
+    # A message the daily cap HELD is delivered as soon as the cap stops binding. The budget
+    # is a condition that expires; chain depth is a decision that does not. Conflating them
+    # left budget-held messages permanently undelivered while the UI promised otherwise.
+    try:
+        await M.release_budget_holds()
+    except Exception:  # noqa: BLE001 — never let this stop the wake pass itself
+        logger.debug("budget hold release failed", exc_info=True)
     try:
         woken = await M.wake_due()
     except Exception as e:  # noqa: BLE001

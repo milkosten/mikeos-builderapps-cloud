@@ -360,6 +360,46 @@ async def resweep_unread() -> int:
         return 0
 
 
+async def release_budget_holds() -> int:
+    """Deliver the messages the daily cap HELD, once the cap is no longer binding.
+
+    The two bounds are not the same kind of thing and were wrongly treated as one. Chain depth
+    is a DECISION — this conversation has gone far enough, and that message is meant never to
+    be delivered. The budget is a CONDITION, and it expires at midnight. Both were written to
+    the same `blocked` column and every reader filtered `blocked=''`, so a message held by the
+    budget was silently permanent: the UI told the owner it would be "read on the recipient's
+    next ordinary beat" and it never would have been. A lie in the interface and a lost
+    message underneath it.
+
+    So the hold is released here, on the scheduler's own loop, the moment the project can
+    afford a beat again — the flag is cleared and the recipient woken exactly as if the
+    message had just been sent.
+    """
+    from server import budget                      # local import: avoids a boot-time cycle
+    rows = await pool().fetch(
+        "SELECT DISTINCT project_id FROM builderapps.assistant_messages "
+        "WHERE blocked='budget' AND read_at IS NULL")
+    freed = 0
+    for r in rows:
+        pid = str(r["project_id"])
+        try:
+            if (await budget.status(pid)).stopped:
+                continue                            # still over: leave it held
+        except Exception:  # noqa: BLE001 — a costing hiccup must not release a hold early
+            continue
+        ids = await pool().fetch(
+            "UPDATE builderapps.assistant_messages SET blocked='' "
+            "WHERE project_id=$1 AND blocked='budget' AND read_at IS NULL "
+            "RETURNING to_assistant", pid)
+        for row in ids:
+            await mark_wake_pending(int(row["to_assistant"]))
+        freed += len(ids)
+        if ids:
+            logger.info("released %d budget-held message(s) on %s", len(ids), pid)
+            await publish_feed(pid)
+    return freed
+
+
 async def wake_due(limit: int = 20) -> list[dict]:
     """Assistants that have been messaged and are not currently beating.
 
