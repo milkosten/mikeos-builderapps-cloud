@@ -473,14 +473,18 @@ def _clean_questions(raw: Any) -> List[dict]:
         text = _norm_str(q.get("q") or q.get("question"))[:300]
         if not text:
             continue
+        # 140, not 80. The stepper shows ONE question at a time in an 800px measure, so an
+        # option has room to be a sentence — and at 80 the model's own wording was being cut
+        # mid-word ("…one postcode, one apartment b"), which reads as a rendering bug. The
+        # cap on `recommended` must match, or a recommendation stops matching its own option.
         opts, seen = [], set()
         for o in (q.get("options") or [])[:4]:
-            s = str(o).strip()[:80]
+            s = str(o).strip()[:140]
             if s and s.lower() not in seen:
                 seen.add(s.lower())
                 opts.append(s)
         out.append({"q": text, "options": opts,
-                    "recommended": _norm_str(q.get("recommended"))[:80],
+                    "recommended": _norm_str(q.get("recommended"))[:140],
                     "why": _norm_str(q.get("why"))[:200],
                     # SINGLE-SELECT UNLESS THE MODEL SAYS OTHERWISE. The stepper renders one
                     # choice per question by default; "pick as many as apply" is the model's
