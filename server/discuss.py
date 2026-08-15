@@ -76,6 +76,37 @@ async def alloc_id() -> str:
     raise RuntimeError("could not allocate a free discussion id after 20 tries")
 
 
+def _clean_sources(messages: Any) -> List[dict]:
+    """Drop provenance entries that record no fetch — applied ON READ, to every message.
+
+    Fixed at the source too (`_run_tools` no longer creates them), but filtering here as well
+    is the half that matters to the user *today*: rooms already on disk carry the junk, and a
+    row with two `{"url": "", "refused": true, "error": "no URL given"}` entries renders as
+    two alarming "refused" lines above a perfectly good reply, forever. Repairing history with
+    a migration would rewrite the transcript; filtering on read leaves the record intact and
+    simply stops showing something that was never true.
+
+    An entry with a REAL url stays, whatever its outcome — a genuine refusal is exactly the
+    provenance this room exists to show ("refused: 169.254.169.254 is a link-local address").
+    """
+    out = []
+    for m in (messages or []):
+        if not isinstance(m, dict):
+            continue
+        srcs = m.get("sources")
+        if isinstance(srcs, list):
+            kept = [s for s in srcs
+                    if isinstance(s, dict) and str(s.get("url") or "").strip()]
+            if len(kept) != len(srcs):
+                m = dict(m)
+                if kept:
+                    m["sources"] = kept
+                else:
+                    m.pop("sources", None)
+        out.append(m)
+    return out
+
+
 def _row(row) -> Optional[dict]:
     """asyncpg hands jsonb back as a string. Decode once, here, so no caller has to care."""
     if row is None:
@@ -90,6 +121,7 @@ def _row(row) -> Optional[dict]:
                 d[k] = [] if k == "messages" else {}
     if not isinstance(d.get("prior_art"), dict):
         d["prior_art"] = {}
+    d["messages"] = _clean_sources(d.get("messages"))
     d["cost_usd"] = float(d.get("cost_usd") or 0)
     return d
 
@@ -415,9 +447,12 @@ and it ends up rendered to the user as if it were the feature.
 * When they ask to see the vision / the plan / the brief, set `show` to "vision" (just the \
 vision) or "canvas" (the whole brief) AND write it out in `reply` as readable prose — they \
 asked to READ it, so an empty acknowledgement is a failure.
-* You can READ THE WEB. When the user points you at a page or a PDF ("look at this", "the \
-site does X", a pasted link they want you to study), call `read_web_page` and use what it \
-actually says. Judgement, not reflex: a link mentioned in passing, or one they are telling \
+* You can READ THE WEB — but only a URL somebody has actually written down. When the user \
+points you at a page or a PDF ("look at this", "the site does X", a pasted link they want you \
+to study), call `read_web_page` and use what it actually says. **If there is no URL in the \
+conversation, do not call the tool at all.** It is not a search engine and it cannot find \
+anything; calling it with an empty `url` opens nothing and tells you nothing. The opening \
+turn almost never needs it. Judgement, not reflex: a link mentioned in passing, or one they are telling \
 you they DISLIKE, does not need fetching unless its content would change the build. Rules \
 you may not break: only claim to have read something the tool actually returned; if it was \
 refused or failed, SAY SO plainly in `reply` and carry on without it; and when a fact came \
@@ -632,15 +667,24 @@ _TOOLS = [{
     "function": {
         "name": "read_web_page",
         "description": (
-            "Open a PUBLIC web page or PDF and read its text. Use it when the user points at "
+            "Open ONE SPECIFIC PUBLIC URL and read its text. Use it when the user points at "
             "something whose actual contents would change what gets built — a product they "
             "want this to resemble, a spec, a price list, a document they pasted. Do not use "
             "it for a link merely mentioned in passing. Returns the readable text (bounded); "
-            "internal MikeOS hosts, private networks and non-http schemes are refused."),
+            "internal MikeOS hosts, private networks and non-http schemes are refused.\n"
+            "THIS IS NOT A SEARCH TOOL AND IT CANNOT FIND PAGES. You must already have a "
+            "complete URL, written down in the conversation by the user. If there is no URL "
+            "in front of you, DO NOT CALL THIS TOOL — there is nothing for it to open, and a "
+            "call with an empty `url` does nothing at all. Most turns, including every "
+            "opening turn, need no call."),
         "parameters": {
             "type": "object",
             "properties": {
-                "url": {"type": "string", "description": "The full public URL to read."},
+                # `minLength` as well as `required`: a model that has decided to call a tool
+                # will happily satisfy `required` with "" — which is exactly what happened.
+                "url": {"type": "string", "minLength": 8,
+                        "description": "The COMPLETE public URL to open, starting http(s)://. "
+                                       "Never empty, never a guess, never a search term."},
                 "why": {"type": "string",
                         "description": "One short clause: what you expect it to settle."},
             },
@@ -679,6 +723,29 @@ async def _run_tools(reply: dict, convo: List[Dict[str, Any]], sources: List[dic
             except Exception:  # noqa: BLE001 — a mangled argument object is the model's bug
                 args = {}
         url = str((args or {}).get("url") or "").strip()
+        # A CALL WITH NO URL IS A MALFORMED CALL, NOT A FETCH.
+        #
+        # This is the bug it caused: on an OPENING TURN, with no link anywhere in the
+        # conversation, the model emitted two `read_web_page` calls with `url: ""`. Each was
+        # dutifully passed to `webread.read`, which correctly said "no URL given" and set
+        # `refused` — and the room then rendered two lines above the reply saying
+        # **"refused — no URL given"**. To the user that reads as *something was blocked*,
+        # which is alarming and false: nothing was blocked, nothing was even attempted.
+        #
+        # So the two halves are separated. `sources` is PROVENANCE — a record of a genuine
+        # fetch ATTEMPT against a real URL — and a real refusal ("169.254.169.254 is a
+        # link-local address") absolutely belongs there. A malformed call is not an attempt at
+        # anything; it gets an error handed back to the MODEL so it can correct itself, and
+        # leaves no trace in the transcript.
+        if not url:
+            logger.info("discuss: read_web_page called with no url — ignored")
+            convo.append(gpu.tool_result_message(
+                tc["id"], tc["name"],
+                "NOTHING HAPPENED — you called read_web_page with an empty `url`, so no page "
+                "was opened and nothing was fetched. This tool cannot search; it only opens a "
+                "URL you already have. If the conversation contains no URL, do not call it "
+                "again — just answer."))
+            continue
         if budget[0] <= 0:
             convo.append(gpu.tool_result_message(
                 tc["id"], tc["name"],

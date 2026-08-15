@@ -147,12 +147,16 @@ def _prior(it: dict) -> float:
         score -= 40
     if it.get("fork"):
         score -= 30
-    # KB. Enormous repos are pre-penalised for the same reason they are scored down later.
+    # Repo size in KB. Penalised only GENTLY here, and deliberately: this number is mostly
+    # checked-in ASSETS (a browser game with 400 MB of sprites is normal), whereas the thing
+    # the verdict cares about is how much CODE there is — which is measured after the clone.
+    # A hard pre-penalty on KB was keeping genuinely good candidates off the shortlist for
+    # having nice artwork.
     size = float(it.get("size") or 0)
-    if size > 400000:
-        score -= 60
-    elif size > 120000:
-        score -= 20
+    if size > 1500000:
+        score -= 40          # over ~1.5 GB the clone itself starts costing the whole minute
+    elif size > 600000:
+        score -= 10
     lic = ((it.get("license") or {}).get("spdx_id") or "").upper()
     if lic.startswith(("GPL", "AGPL", "LGPL")):
         score -= 25            # it will be rejected below; do not waste a clone slot on it
@@ -234,14 +238,25 @@ def licence_class(spdx: str) -> str:
 SKIP_DIRS = {".git", "node_modules", "dist", "build", "out", "vendor", "third_party",
              ".next", ".nuxt", "coverage", "__pycache__", ".venv", "venv", "target",
              "bower_components", ".yarn", "assets/vendor"}
+# The extension list is the MEASUREMENT, so a language missing from it does not merely go
+# uncounted — it makes a 30k-line Elm project report "245 lines, barely more than a demo",
+# which is a false statement in a proposal. The verdict would still be `reject` (wrong
+# runtime), but for a reason that is not true. Breadth here is cheap; a wrong number is not.
 CODE_EXT = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".css",
             ".scss", ".less", ".html", ".py", ".go", ".rs", ".rb", ".php", ".java",
-            ".cs", ".sql", ".sh", ".c", ".cc", ".cpp", ".h", ".hpp", ".ex", ".exs"}
+            ".cs", ".sql", ".sh", ".c", ".cc", ".cpp", ".h", ".hpp", ".ex", ".exs",
+            ".elm", ".kt", ".swift", ".dart", ".lua", ".gd", ".hs", ".clj", ".cljs",
+            ".scala", ".zig", ".nim", ".ml", ".fs", ".pl", ".r", ".jl", ".glsl",
+            ".frag", ".vert", ".wgsl", ".hlsl", ".m", ".mm"}
 LANG_BY_EXT = {".js": "JavaScript", ".jsx": "JavaScript", ".mjs": "JavaScript",
                ".cjs": "JavaScript", ".ts": "TypeScript", ".tsx": "TypeScript",
                ".py": "Python", ".go": "Go", ".rs": "Rust", ".rb": "Ruby",
                ".php": "PHP", ".java": "Java", ".cs": "C#", ".ex": "Elixir",
-               ".c": "C", ".cc": "C++", ".cpp": "C++"}
+               ".exs": "Elixir", ".c": "C", ".cc": "C++", ".cpp": "C++", ".h": "C",
+               ".elm": "Elm", ".kt": "Kotlin", ".swift": "Swift", ".dart": "Dart",
+               ".lua": "Lua", ".gd": "GDScript", ".hs": "Haskell", ".clj": "Clojure",
+               ".cljs": "Clojure", ".scala": "Scala", ".zig": "Zig", ".nim": "Nim",
+               ".vue": "JavaScript", ".svelte": "JavaScript"}
 
 
 def run(cmd, cwd=None, timeout=60.0):
@@ -317,6 +332,13 @@ def read_capped(path: str, cap: int = 400000) -> str:
 
 _LISTEN_RE = re.compile(
     r"\.listen\s*\(|createServer\s*\(|express\s*\(\s*\)|new\s+Koa\s*\(|Fastify\s*\(", re.I)
+# A framework's PRODUCTION start command is a server even though no file in the repo calls
+# `.listen()` — `next start` and friends do it inside node_modules. Without this a Next.js app
+# is measured as "nothing obvious to serve", which is both wrong and the difference between
+# `adopt-with-work` and `reject`.
+_FRAMEWORK_START_RE = re.compile(
+    r"\b(next\s+start|nuxt\s+start|nuxi\s+preview|remix-serve|astro\s+preview|"
+    r"node\s+build|vite\s+preview|nest\s+start|sails\s+lift|adonis\s+serve)\b", re.I)
 _DB_SIGNS = [
     (r"\bpg\b|postgres|postgresql", "postgres"),
     (r"mongoose|mongodb", "mongo"),
@@ -439,7 +461,9 @@ def inspect(repo_dir: str, meta: dict) -> dict:
         "has_dockerfile": has_docker,
         "has_compose": has_compose,
         "server_files": server_files[:4],
-        "has_server": bool(server_files) or bool(start and "node" in start),
+        "framework_server": bool(_FRAMEWORK_START_RE.search(start)),
+        "has_server": (bool(server_files) or bool(start and "node" in start)
+                       or bool(_FRAMEWORK_START_RE.search(start))),
         "static_roots": static_roots[:3],
         "static_only": (not server_files) and bool(static_roots),
         "build_step": bool(build),
@@ -482,6 +506,7 @@ def score(cand: dict) -> dict:
     ev = cand["evidence"]
     lic = cand["licence"]
     notes, points = [], 0
+    penalties: list = []          # (points_lost, the note) — what a `reject` is REALLY about
 
     # --- THE GATE -----------------------------------------------------------
     cls = licence_class(lic["spdx"])
@@ -510,6 +535,7 @@ def score(cand: dict) -> dict:
         points -= 25
         notes.append(f"stack: {lang} — a different runtime from our Node contract; the app "
                      "would have to be containerised differently")
+        penalties.append((-25, notes[-1]))
     else:
         notes.append(f"stack: {lang or 'unclear'}")
 
@@ -517,7 +543,8 @@ def score(cand: dict) -> dict:
     if ev.get("has_server"):
         points += 15
         notes.append("has its own server (" + (", ".join(ev.get("server_files") or [])
-                                               or "a start script") + ")")
+                                               or ("`" + (ev.get("scripts") or {}).get(
+                                                   "start", "a start script") + "`")) + ")")
     elif ev.get("static_only"):
         points += 10
         notes.append("static front-end (" + ", ".join(ev.get("static_roots") or ["/"])
@@ -525,15 +552,18 @@ def score(cand: dict) -> dict:
     else:
         points -= 20
         notes.append("nothing obvious to serve — no server file and no index.html")
+        penalties.append((-20, notes[-1]))
 
     # --- SIZE. Small and hackable beats big and impressive. ------------------
     loc = int(ev.get("loc") or 0)
     if loc == 0:
         points -= 20
         notes.append("no source found — nothing to build on")
+        penalties.append((-20, notes[-1]))
     elif loc < 400:
         points -= 10
         notes.append(f"~{loc:,} lines — barely more than a demo; little is actually reused")
+        penalties.append((-10, notes[-1]))
     elif loc <= 25000:
         points += 20
         notes.append(f"~{loc:,} lines across {ev.get('files')} files — small enough that we "
@@ -545,12 +575,14 @@ def score(cand: dict) -> dict:
         points -= 25
         notes.append(f"~{loc:,} lines — too big to reason about; adopting it would mean "
                      "neither we nor you could meaningfully change it")
+        penalties.append((-25, notes[-1]))
 
     # --- aliveness ----------------------------------------------------------
     last = str(ev.get("last_commit") or "")
     if cand.get("archived"):
         points -= 15
         notes.append("archived by its author — no upstream fixes are coming")
+        penalties.append((-15, notes[-1]))
     if last >= "2025":
         points += 15
         notes.append(f"last commit {last[:10]} — actively maintained")
@@ -560,6 +592,7 @@ def score(cand: dict) -> dict:
     elif last:
         points -= 10
         notes.append(f"last commit {last[:10]} — dormant for years")
+        penalties.append((-10, notes[-1]))
     if ev.get("commits_last_year"):
         notes.append(f"{ev['commits_last_year']} commits in the last year")
 
@@ -579,6 +612,7 @@ def score(cand: dict) -> dict:
     else:
         points -= 5
         notes.append("data layer: " + ", ".join(dl) + " — a migration decision")
+        penalties.append((-5, notes[-1]))
 
     inst = cand.get("install") or {}
     if inst.get("attempted"):
@@ -589,6 +623,7 @@ def score(cand: dict) -> dict:
         else:
             points -= 15
             notes.append("`npm install --ignore-scripts` FAILED — " + str(inst.get("detail")))
+            penalties.append((-15, notes[-1]))
 
     deps = int(ev.get("dependencies") or 0)
     notes.append(f"{deps} direct dependencies"
@@ -597,7 +632,13 @@ def score(cand: dict) -> dict:
     verdict = "adopt" if points >= 70 else ("adopt-with-work" if points >= 45 else "reject")
     why = ""
     if verdict == "reject":
-        why = "the evidence does not support starting from this: " + "; ".join(notes[-3:])
+        # THE REASON MUST BE THE REASON. Quoting the last three notes made a repo get rejected
+        # "because 146 commits in the last year", which is a fact in its favour — the sort of
+        # nonsense that makes a user stop believing any of the evidence. Quote what actually
+        # cost it the points.
+        worst = [n for _, n in sorted(penalties, key=lambda pn: pn[0])[:3]]
+        why = ("the evidence does not support starting from this: " + "; ".join(worst)
+               if worst else "nothing here scored well enough to be worth starting from")
     return {"verdict": verdict, "score": points, "blocking": "", "why": why, "notes": notes}
 
 
@@ -618,6 +659,8 @@ def headline(cand: dict) -> str:
         bits.append(f"~{int(ev['loc']):,} LOC")
     if ev.get("dependencies"):
         bits.append(f"{ev['dependencies']} deps")
+    if float(cand.get("repo_mb") or 0) > 300:
+        bits.append(f"{cand['repo_mb']:.0f} MB checkout")
     return ", ".join(b for b in bits if b)
 
 
@@ -639,6 +682,7 @@ def evaluate(item: dict, workdir: str) -> dict:
         "topics": (item.get("topics") or [])[:10],
         "pushed_at": item.get("pushed_at") or "",
         "default_branch": item.get("default_branch") or "main",
+        "repo_mb": round(float(item.get("size") or 0) / 1024, 1),
     }
     ok, out = clone(full, cand["default_branch"], dest)
     if not ok:
