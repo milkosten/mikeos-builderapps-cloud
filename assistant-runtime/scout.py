@@ -99,6 +99,34 @@ def gh(path: str, timeout: float = 25.0):
         return {"_error": str(e)[:200]}
 
 
+def repos_by_name(names):
+    """Fetch specific repositories the CONVERSATION named, rather than searching for them.
+
+    This is what makes the container available on every turn and not only on the opening one:
+    "go and look at github.com/foo/bar", "compare Cytopia with isocity", "does that repo have
+    a Dockerfile?" are all answered by cloning and measuring, exactly like the opening scout —
+    the same image, the same `--rm`, the same caps, the same absence of credentials.
+    """
+    out = []
+    for raw in names:
+        full = str(raw or "").strip().rstrip("/")
+        m = re.search(r"github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)", full)
+        if m:
+            full = m.group(1)
+        if full.endswith(".git"):
+            full = full[:-4]
+        if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", full):
+            log(f"not a repo name: {raw!r}")
+            continue
+        data = gh("/repos/" + full)
+        if data.get("_error"):
+            out.append({"full_name": full, "_lookup_error": data["_error"],
+                        "html_url": f"https://github.com/{full}"})
+            continue
+        out.append(data)
+    return out
+
+
 def search(queries):
     """Run the control plane's queries and merge the results.
 
@@ -110,16 +138,24 @@ def search(queries):
     429/403 degrades to "fewer results", never to a crash: a scout that finds nothing is a
     silent miss, which costs nothing.
     """
-    seen, out = {}, []
+    seen, out, log_rows = {}, [], []
     for i, q in enumerate(queries):
         if left() < 40:
             log("out of time before query %d" % (i + 1))
-            break
+            log_rows.append({"q": q, "results": None, "skipped": "ran out of time"})
+            continue
         qs = urllib.parse.urlencode({"q": q, "sort": "stars", "order": "desc",
                                      "per_page": "15"})
         data = gh(f"/search/repositories?{qs}")
         items = (data or {}).get("items") or []
+        err = (data or {}).get("_error") or ""
         log(f"query {i+1}/{len(queries)}: {q!r} -> {len(items)} results")
+        # The per-query result count is kept and returned, not just logged. It is the honest
+        # answer to "what did you actually do?" — a query that returned 1 result and a query
+        # that returned 15 are very different pieces of work, and the user can see which of
+        # their words narrowed the search to nothing.
+        log_rows.append({"q": q, "results": len(items), "error": err,
+                         "total": int((data or {}).get("total_count") or 0)})
         for it in items:
             full = it.get("full_name")
             if not full or full in seen:
@@ -128,7 +164,7 @@ def search(queries):
             out.append(it)
         if i < len(queries) - 1:
             time.sleep(6.5)          # 10 req/min unauthenticated; stay under it
-    return out
+    return out, log_rows
 
 
 def _prior(it: dict) -> float:
@@ -695,6 +731,12 @@ def evaluate(item: dict, workdir: str) -> dict:
         "default_branch": item.get("default_branch") or "main",
         "repo_mb": round(float(item.get("size") or 0) / 1024, 1),
     }
+    if item.get("_lookup_error"):
+        cand.update({"licence": {"spdx": "", "source": "not found"}, "evidence": {},
+                     "verdict": "reject", "score": 0, "blocking": "",
+                     "why": f"GitHub has no repository {full} ({item['_lookup_error']})",
+                     "notes": [], "headline": ""})
+        return cand
     ok, out = clone(full, cand["default_branch"], dest)
     if not ok:
         cand.update({"licence": {"spdx": "", "source": "clone failed"},
@@ -731,19 +773,33 @@ def main() -> int:
         queries = json.loads(os.environ.get("SCOUT_QUERIES") or "[]")
     except Exception:  # noqa: BLE001
         queries = []
+    try:
+        named = json.loads(os.environ.get("SCOUT_REPOS") or "[]")
+    except Exception:  # noqa: BLE001
+        named = []
     queries = [str(q)[:200] for q in queries if str(q).strip()][:5]
-    result = {"ok": False, "queries": queries, "candidates": [], "considered": 0,
-              "error": "", "seconds": 0.0}
-    if not queries:
-        result["error"] = "no queries"
+    named = [str(r)[:200] for r in named if str(r).strip()][:4]
+    result = {"ok": False, "queries": queries, "repos": named, "candidates": [],
+              "searches": [], "considered": 0, "error": "", "seconds": 0.0}
+    if not queries and not named:
+        result["error"] = "no queries and no repos"
         emit(result)
         return 0
 
     os.makedirs(WORK, exist_ok=True)
-    items = search(queries)
-    result["considered"] = len(items)
+    # NAMED REPOS FIRST, and they are never dropped by the shortlist. Somebody asked about
+    # these BY NAME; ranking them against search results and then discarding one would be a
+    # tool that ignores its instructions.
+    pinned = repos_by_name(named) if named else []
+    items, searches = ([], [])
+    if queries:
+        items, searches = search(queries)
+    result["searches"] = searches
+    result["considered"] = len(items) + len(pinned)
     items.sort(key=_prior, reverse=True)
-    short = items[:MAX_CANDIDATES]
+    pinned_names = {p.get("full_name") for p in pinned}
+    room = max(0, MAX_CANDIDATES - len(pinned))
+    short = pinned + [i for i in items if i.get("full_name") not in pinned_names][:room]
     log(f"shortlist: {[i.get('full_name') for i in short]}")
 
     with tempfile.TemporaryDirectory(dir=WORK) as td:

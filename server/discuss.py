@@ -452,7 +452,20 @@ points you at a page or a PDF ("look at this", "the site does X", a pasted link 
 to study), call `read_web_page` and use what it actually says. **If there is no URL in the \
 conversation, do not call the tool at all.** It is not a search engine and it cannot find \
 anything; calling it with an empty `url` opens nothing and tells you nothing. The opening \
-turn almost never needs it. Judgement, not reflex: a link mentioned in passing, or one they are telling \
+turn almost never needs it.
+* **When the question is "is there something we could BUILD ON?", use `inspect_open_source`, \
+never `read_web_page`.** It clones real repositories in a sandbox and measures them: the \
+licence out of the LICENSE file, the language, whether there is a server or only a front-end, \
+whether there is a Dockerfile, the size in lines, the dependency count, the last commit. A \
+company's product page tells you about the GENRE and nothing about code you could start from \
+— reading `ea.com/games/simcity` to decide what to build a city simulator on is a wasted \
+fetch, and this room has made exactly that mistake. Only a repository can answer it. Use it \
+when the user names a repo, asks you to compare two, asks something factual about one, or \
+wants alternatives. It takes 30-60 seconds, so use it when it decides something and say what \
+it found in plain terms.
+* **The licence is a hard gate on anything we would build on: MIT, Apache-2.0, BSD, ISC or \
+Unlicence only.** GPL/AGPL/LGPL would make the user's own app copyleft forever, so never \
+offer one as a starting point however good it looks — say plainly why it is out. Judgement, not reflex: a link mentioned in passing, or one they are telling \
 you they DISLIKE, does not need fetching unless its content would change the build. Rules \
 you may not break: only claim to have read something the tool actually returned; if it was \
 refused or failed, SAY SO plainly in `reply` and carry on without it; and when a fact came \
@@ -691,8 +704,72 @@ _TOOLS = [{
             "required": ["url"],
         },
     },
+}, {
+    # ---------------------------------------------------------------------------
+    # THE SANDBOX, AS A TOOL — available on EVERY turn, not only the opening one.
+    #
+    # Phase 35 gave the opening turn a container that clones and measures candidate
+    # repositories. This is the same container (same image, `--rm`, `--cap-drop ALL`, non-root,
+    # read-only rootfs, no Docker socket, no credential of any kind) exposed as something the
+    # model can reach at any point in the conversation.
+    #
+    # It exists because of a concrete failure: asked about prior art mid-conversation, the
+    # model's only tool was `read_web_page`, so it read `ea.com/games/simcity` — a commercial
+    # product page. That tells you about the GENRE. It tells you nothing about code you could
+    # build on, and there is no page anywhere that will: the licence is in a file, the stack is
+    # in `package.json`, the size is in the tree. You have to open the repository.
+    #
+    # ON DEMAND, NOT PER TURN. The conversation itself stays in the control plane — a text turn
+    # is ~$0.02 and instant, and paying container startup on every "yes, sounds good" would make
+    # the room sluggish for no capability at all. The capability wanted here is "it can clone and
+    # look at real repositories whenever it needs to", and a tool delivers exactly that.
+    # ---------------------------------------------------------------------------
+    "type": "function",
+    "function": {
+        "name": "inspect_open_source",
+        "description": (
+            "Clone and INSPECT real open-source projects in a sandbox, and get back facts you "
+            "cannot get any other way: the licence (read from the LICENSE file itself), the "
+            "language and whether it has its own server or is only a front-end, whether it "
+            "ships a Dockerfile, whether it needs a build step, what it stores data in, its "
+            "size in lines of code, its dependency count, and when it was last touched.\n"
+            "USE THIS, NOT `read_web_page`, whenever the question is 'could we build on "
+            "something that already exists?'. A product's marketing page tells you about the "
+            "genre; only the repository tells you about the code. Call it when the user names "
+            "a repo ('look at github.com/foo/bar'), asks you to compare two, asks something "
+            "factual about one ('does it have a Dockerfile?'), or asks you to look for "
+            "alternatives with different search terms.\n"
+            "Pass `repos` for projects named in the conversation, `queries` to search GitHub, "
+            "or both. It takes 30-60 seconds, so do not call it for something you already "
+            "know from an earlier call in this conversation."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repos": {
+                    "type": "array", "maxItems": 4,
+                    "items": {"type": "string"},
+                    "description": "Specific repositories to clone and measure, as "
+                                   "\"owner/name\" or a full github.com URL.",
+                },
+                "queries": {
+                    "type": "array", "maxItems": 4,
+                    "items": {"type": "string"},
+                    "description": "GitHub search queries. GitHub ANDs every word and matches "
+                                   "name/description/README, so keep them to two or three "
+                                   "plain words; qualifiers like stars:>50 or topic:x are "
+                                   "fine. Never words like \"open source\" or \"clone\".",
+                },
+                "why": {"type": "string",
+                        "description": "One short clause: what you expect this to settle."},
+            },
+        },
+    },
 }]
 MAX_TOOL_CALLS = 3          # per turn. A discussion is not a research project.
+# The sandbox is 30-60 seconds of real work, so it gets its own, much tighter budget than the
+# page reads. Two is enough to inspect a named repo and then compare it with an alternative;
+# more than that and a single turn becomes a research project the user is waiting through.
+MAX_SANDBOX_CALLS = 2
 
 
 def _tool_payload(res: dict) -> str:
@@ -710,8 +787,74 @@ def _tool_payload(res: dict) -> str:
     return head + (res.get("text") or "")
 
 
+def _sandbox_payload(doc: dict, repos: List[str], queries: List[str]) -> str:
+    """What the model is told the sandbox found. A compact, factual table — the model is being
+    handed MEASUREMENTS and must be able to quote them without embellishing."""
+    if not doc.get("ok") and not doc.get("candidates"):
+        return ("THE INSPECTION FAILED — you have NOT seen these projects. Say so plainly and "
+                f"carry on without them. Reason: {doc.get('error') or 'unknown'}")
+    lines = []
+    for row in (doc.get("searches") or []):
+        n = row.get("results")
+        lines.append(f"searched {row.get('q')!r} -> "
+                     + ("not run" if n is None else f"{n} results"))
+    for c in (doc.get("candidates") or []):
+        ev = c.get("evidence") or {}
+        lic = (c.get("licence") or {}).get("spdx") or "NO LICENCE FOUND"
+        lines.append(
+            f"\n{c.get('full_name')} — {c.get('verdict')} (score {c.get('score')})\n"
+            f"  licence: {lic} (from {(c.get('licence') or {}).get('source')})\n"
+            f"  {ev.get('primary_language') or '?'}, "
+            f"{'has its own server' if ev.get('has_server') else 'static front-end' if ev.get('static_only') else 'nothing obvious to serve'}"
+            f", {'Dockerfile present' if ev.get('has_dockerfile') else 'no Dockerfile'}"
+            f", {'needs a build step' if ev.get('build_step') else 'no build step'}\n"
+            f"  ~{ev.get('loc') or 0} lines, {ev.get('dependencies') or 0} direct deps, "
+            f"data: {', '.join(ev.get('data_layer') or ['none'])}\n"
+            f"  last commit {(ev.get('last_commit') or '?')[:10]}, "
+            f"{c.get('stars') or 0} stars"
+            + (f", {c.get('repo_mb')} MB checkout" if (c.get("repo_mb") or 0) > 300 else "")
+            + (f"\n  WHY: {c.get('why')}" if c.get("why") else ""))
+    head = ("Inspected in the sandbox"
+            + (f" (repos: {', '.join(repos)})" if repos else "")
+            + f" in {doc.get('seconds')}s:\n")
+    return head + "\n".join(lines) + (
+        "\n\nThese are measurements, not opinions. Quote them; do not embellish them, and do "
+        "not describe features you were not told about. A licence that is not MIT / Apache-2.0 "
+        "/ BSD / ISC / Unlicense is REJECTED and must not be offered as a starting point, "
+        "whatever else is good about it.")
+
+
+async def _run_sandbox(discussion_id: str, args: dict) -> tuple[str, dict]:
+    """One container. Returns (what to tell the model, the raw document)."""
+    from server import priorart                     # local import: avoid an import cycle
+    repos = [str(r)[:200] for r in (args.get("repos") or []) if str(r).strip()][:4]
+    queries = [str(q)[:200] for q in (args.get("queries") or []) if str(q).strip()][:4]
+    if not repos and not queries:
+        return ("NOTHING HAPPENED — you called inspect_open_source with neither `repos` nor "
+                "`queries`, so nothing was cloned and nothing was searched. Give it at least "
+                "one of the two, or answer without it.", {})
+    doc = await priorart.scout(queries, repos=repos, tag=(discussion_id or "chat"))
+    # The results join the room's cumulative RESEARCH, which is what the Research panel shows.
+    # A mid-conversation inspection is research too; keeping it out of the panel would mean the
+    # panel lies about what the room has looked at.
+    try:
+        pa = await priorart.load(discussion_id)
+        pa = priorart.merge_research(pa, doc, trigger="chat")
+        if not pa.get("status"):
+            # The classifier never ran (or said "no"), yet the user asked for prior art
+            # anyway. `researched` is terminal and renders no proposal card — the panel shows
+            # the findings and the conversation makes the offer, which is what was asked for.
+            pa["status"] = "researched"
+        await priorart.save(discussion_id, pa)
+    except Exception:  # noqa: BLE001 — the model still gets its answer if the write fails
+        logger.warning("could not record sandbox research for %s", discussion_id,
+                       exc_info=True)
+    return _sandbox_payload(doc, repos, queries), doc
+
+
 async def _run_tools(reply: dict, convo: List[Dict[str, Any]], sources: List[dict],
-                     budget: List[int]) -> None:
+                     budget: List[int], discussion_id: str = "",
+                     sandbox_budget: Optional[List[int]] = None) -> None:
     """Execute one round of tool calls, appending the results to `convo` and the provenance
     to `sources`. `budget` is a one-element list so the cap survives across rounds."""
     convo.append(gpu.assistant_tool_message(reply))
@@ -722,6 +865,19 @@ async def _run_tools(reply: dict, convo: List[Dict[str, Any]], sources: List[dic
                 args = json.loads(args or "{}")
             except Exception:  # noqa: BLE001 — a mangled argument object is the model's bug
                 args = {}
+        if str(tc.get("name") or "") == "inspect_open_source":
+            if sandbox_budget is not None and sandbox_budget[0] <= 0:
+                convo.append(gpu.tool_result_message(
+                    tc["id"], tc["name"],
+                    "REFUSED — you have already used the sandbox as many times as one turn "
+                    "allows. Answer with what you have."))
+                continue
+            if sandbox_budget is not None:
+                sandbox_budget[0] -= 1
+            payload, _doc = await _run_sandbox(discussion_id, args or {})
+            convo.append(gpu.tool_result_message(tc["id"], tc["name"], payload))
+            continue
+
         url = str((args or {}).get("url") or "").strip()
         # A CALL WITH NO URL IS A MALFORMED CALL, NOT A FETCH.
         #
@@ -819,13 +975,16 @@ async def turn(disc: dict, user_text: str = "", answers: Optional[List[dict]] = 
     with usage.capture() as recs:
         raw = ""
         budget = [MAX_TOOL_CALLS]
+        sandbox_budget = [MAX_SANDBOX_CALLS]
         for _round in range(MAX_TOOL_CALLS + 1):
             reply = await gpu.chat_tools(convo, _TOOLS, temperature=0.55, num_predict=2600,
-                                         timeout=180, max_retries=3)
+                                         timeout=300, max_retries=3)
             raw = reply.get("content") or ""
             if not reply.get("tool_calls"):
                 break
-            await _run_tools(reply, convo, sources, budget)
+            await _run_tools(reply, convo, sources, budget,
+                             discussion_id=str(disc.get("id") or ""),
+                             sandbox_budget=sandbox_budget)
         # Tool-calling and strict JSON output do not always co-operate: a model that has just
         # been handed a page sometimes answers in prose. One forced JSON pass fixes it, and it
         # only costs anything on the turns that actually need it.

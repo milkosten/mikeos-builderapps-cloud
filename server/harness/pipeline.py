@@ -793,15 +793,25 @@ async def _page_is_real(project_id: str) -> dict:
     mode the adapter is ours, so a green health check proves almost nothing about the app we
     just imported. This is the check that does."""
     import httpx
-    url = f"https://{project_id}.{deployer.SITES_BASE}/"
-    out = {"url": url, "status": 0, "bytes": 0, "ok": False, "error": ""}
+    base = f"https://{project_id}.{deployer.SITES_BASE}"
+    out = {"url": base + "/", "status": 0, "bytes": 0, "ok": False, "error": "",
+           "app_note": ""}
     try:
         async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as c:
-            r = await c.get(url)
-        out["status"] = r.status_code
-        body = r.content or b""
-        out["bytes"] = len(body)
-        out["ok"] = r.status_code < 400 and len(body) >= 200
+            r = await c.get(base + "/")
+            out["status"] = r.status_code
+            body = r.content or b""
+            out["bytes"] = len(body)
+            out["ok"] = r.status_code < 400 and len(body) >= 200
+            # `/health`'s `app` field is the adapter telling us how the upstream is REALLY
+            # running — e.g. "its own server did not start; serving its static files instead".
+            # A green gate plus a degraded upstream is a thing the owner must be told, not a
+            # detail to leave in a container log nobody opens.
+            try:
+                h = await c.get(base + "/health")
+                out["app_note"] = str((h.json() or {}).get("app") or "")[:400]
+            except Exception:  # noqa: BLE001
+                pass
     except Exception as e:  # noqa: BLE001
         out["error"] = str(e)[:200]
     return out
@@ -850,19 +860,42 @@ def _s_upstream_green():
         except Exception as e:  # noqa: BLE001
             logger.info("adopt %s: browser check skipped (%s)", ctx.project_id, e)
 
+        # THE UPSTREAM RAN, BUT NOT AS ITS AUTHOR INTENDED. Filed as a real bug on the board
+        # rather than buried in a step log: it is the single most useful thing an owner (or the
+        # next agent) could know about an adopted app, and it is exactly the kind of fact that
+        # otherwise gets discovered three features later.
+        if page.get("app_note"):
+            await W.upsert_by_ext_key(
+                ctx.project_id, "upstream_degraded", _WS_ACTOR, kind="bug",
+                title="The adopted project's own server did not start",
+                body_md=(f"The platform adapter reports:\n\n> {page['app_note']}\n\n"
+                         "The app IS serving and its health gate is green, but it is not "
+                         "running the way the original project intended. The usual cause is "
+                         "that the upstream server assumes its author's own machine — a "
+                         "hardcoded TLS certificate path, a local database, an environment "
+                         "variable only they had. Fixing it means reading the upstream's "
+                         "entry point (`git show` it at the imported commit in NOTICE) and "
+                         "making that assumption optional.\n\n"
+                         "Nothing else is blocked by this."),
+                status="open")
+            ctx.emit({"type": "progress", "stage": "deploy",
+                      "detail": "the upstream's own server did not start — " + page["app_note"]})
+
         await W.upsert_by_ext_key(
             ctx.project_id, "upstream_green", _WS_ACTOR, kind="testcase",
             title="The unmodified upstream deploys and serves a page",
             body_md=(f"Deployed the imported project with no feature work on top.\n\n"
                      f"- `/health`: {res['public_health']}\n"
                      f"- `GET /`: HTTP {page['status']}, {page['bytes']} bytes\n"
-                     f"{seen}\n\n"
+                     + (f"- upstream: {page['app_note']}\n" if page.get("app_note") else "")
+                     + f"{seen}\n\n"
                      "This ran BEFORE the backlog, on purpose: if the adopted project cannot "
                      "boot here, that is a two-minute failure rather than a twelve-feature "
                      "mystery."),
             status="done")
         return (f"UPSTREAM GREEN — health {res['public_health']}, "
-                f"GET / -> HTTP {page['status']} ({page['bytes']} bytes){seen}")
+                f"GET / -> HTTP {page['status']} ({page['bytes']} bytes){seen}"
+                + (f" | NOTE: {page['app_note']}" if page.get("app_note") else ""))
     return step
 
 

@@ -283,11 +283,20 @@ async def save_answer_draft(discussion_id: str, body: DraftBody, request: Reques
 # phase 35 — the prior-art proposal
 # ---------------------------------------------------------------------------
 class PriorArtBody(BaseModel):
-    """`accept` or `decline`. Nothing else: the user is not choosing between five repos, they
-    are answering one yes/no about one candidate the scout already argued for with evidence.
-    A repo picker would be a worse product AND a much larger attack surface — the URL that
-    gets cloned into someone's account would then come from the browser."""
+    """`accept` or `decline`, optionally naming WHICH candidate.
+
+    `repo` exists because the Research panel now shows the whole shortlist: once the user can
+    see that we also looked at three other projects, "I'd rather start from that one" is an
+    obvious and reasonable thing to want, and making them re-litigate it in prose would be
+    silly.
+
+    It is a NAME, resolved SERVER-SIDE against the candidates this discussion's own scout
+    measured — never a URL. The value decides what gets cloned onto the box; a browser-supplied
+    repository would turn this into a clone-anything endpoint, and a candidate the scout never
+    saw would have no licence check behind it.
+    """
     action: str = Field(..., pattern="^(accept|decline)$")
+    repo: Optional[str] = Field(None, max_length=200)
 
 
 @router.get("/api/discussions/{discussion_id}/prior_art")
@@ -314,6 +323,27 @@ async def decide_prior_art(discussion_id: str, body: PriorArtBody, request: Requ
         raise HTTPException(status_code=409,
                             detail="there is no prior-art proposal on this discussion")
     cand = pa.get("candidate") or {}
+    if body.repo and body.action == "accept":
+        wanted = body.repo.strip()
+        chosen = next((c for c in (pa.get("candidates") or [])
+                       if c.get("full_name") == wanted), None)
+        if not chosen:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{wanted!r} is not one of the projects scouted for this discussion")
+        # THE LICENCE GATE APPLIES TO THE USER'S CHOICE TOO. The panel does not offer a
+        # rejected candidate, but the endpoint must not depend on the UI for that: a `reject`
+        # is a `reject` whoever asked for it, and the copyleft case is precisely the one where
+        # somebody might click past the warning.
+        if chosen.get("verdict") not in ("adopt", "adopt-with-work"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"{wanted} was rejected and cannot be adopted: "
+                       + (chosen.get("why") or "it did not pass the checks"))
+        cand = chosen
+        pa["pick"] = wanted
+        pa["candidate"] = chosen
+        pa["chosen_by_user"] = True
     accepted = body.action == "accept"
     pa["status"] = "accepted" if accepted else "declined"
     pa["decision"] = body.action

@@ -214,7 +214,8 @@ async def _docker(cmd: List[str], timeout: float) -> tuple[int, str]:
     return proc.returncode, (out or b"").decode("utf-8", "replace")
 
 
-async def scout(queries: List[str], *, tag: str = "") -> dict:
+async def scout(queries: List[str], *, repos: Optional[List[str]] = None,
+                tag: str = "") -> dict:
     """Run ONE scout container to completion and return its document.
 
     Everything the safety story rests on is in the argument list below, and none of it is
@@ -239,7 +240,11 @@ async def scout(queries: List[str], *, tag: str = "") -> dict:
         "-e", "HOME=/tmp",
         "-e", "GIT_TERMINAL_PROMPT=0",
         "-e", "npm_config_cache=/tmp/.npm",
-        "-e", f"SCOUT_QUERIES={json.dumps(queries)}",
+        "-e", f"SCOUT_QUERIES={json.dumps(queries or [])}",
+        # Repos the CONVERSATION named. This is the whole of what makes the sandbox a tool the
+        # model can reach on any turn rather than a one-shot on the opening one — same image,
+        # same `--rm`, same caps, same absence of credentials, different instruction.
+        "-e", f"SCOUT_REPOS={json.dumps(repos or [])}",
         "-e", f"SCOUT_DEADLINE_SEC={SCOUT_DEADLINE_SEC}",
         IMAGE, "/app/scout.py",
     ]
@@ -418,6 +423,74 @@ async def propose(seed: str, canvas_hint: str, cand: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# the research record — everything the room has ever looked at
+# ---------------------------------------------------------------------------
+def merge_research(pa: dict, doc: dict, *, trigger: str = "chat") -> dict:
+    """Fold one scout run's document into the discussion's cumulative research.
+
+    Cumulative on purpose. The opening scout and every mid-conversation inspection write into
+    the SAME `searches` and `candidates` lists, so the Research panel is a record of what this
+    room has actually done rather than a snapshot of the last thing it did — ask it to look at
+    two more repos and the four you already saw do not vanish.
+
+    Deduped by repo name, LAST WRITE WINS: a repo inspected again (perhaps because the user
+    asked a follow-up about it) should show the newer measurement, not the older one.
+    """
+    pa = dict(pa or {})
+    searches = list(pa.get("searches") or [])
+    have_q = {s.get("q") for s in searches}
+    for row in (doc.get("searches") or []):
+        q = row.get("q")
+        if q in have_q:
+            searches = [row if s.get("q") == q else s for s in searches]
+        else:
+            searches.append(row)
+            have_q.add(q)
+    # Queries the container was ASKED to run but has not reported on yet still belong in the
+    # list — see `note_planned_searches`; this keeps them if the run died before reaching them.
+    for q in (doc.get("queries") or []):
+        if q not in have_q:
+            searches.append({"q": q, "results": None})
+            have_q.add(q)
+
+    by_name = {c.get("full_name"): c for c in (pa.get("candidates") or [])}
+    for c in gate(doc.get("candidates") or []):
+        c = slim(c)
+        c["trigger"] = trigger
+        by_name[c.get("full_name")] = c
+    order = {"adopt": 0, "adopt-with-work": 1, "reject": 2}
+    pa["searches"] = searches[-30:]
+    pa["candidates"] = sorted(by_name.values(),
+                              key=lambda c: (order.get(c.get("verdict"), 3),
+                                             -int(c.get("score") or 0)))[:24]
+    pa["considered"] = int(pa.get("considered") or 0) + int(doc.get("considered") or 0)
+    # Container time, accumulated across every run this room has done. Kept SEPARATE from
+    # `seconds` (the opening scout's wall clock, which the proposal quotes) so a later
+    # inspection cannot silently inflate the number the user was shown for the first scout.
+    pa["research_seconds"] = round(float(pa.get("research_seconds") or 0)
+                                   + float(doc.get("seconds") or 0), 1)
+    return pa
+
+
+def note_planned_searches(pa: dict, queries: List[str]) -> dict:
+    """Put the queries on the board the MOMENT they are decided, with no result count yet.
+
+    The scout takes ~50 seconds and, until this, the UI had nothing to show for any of it. It
+    is not a fake progress bar: these are the real queries, written down before they run, and
+    each one's `results` fills in when the container reports. The user watches the actual work.
+    """
+    pa = dict(pa or {})
+    searches = list(pa.get("searches") or [])
+    have = {s.get("q") for s in searches}
+    for q in queries or []:
+        if q not in have:
+            searches.append({"q": q, "results": None})
+            have.add(q)
+    pa["searches"] = searches[-30:]
+    return pa
+
+
+# ---------------------------------------------------------------------------
 # storage — one jsonb column on the discussion
 # ---------------------------------------------------------------------------
 async def save(discussion_id: str, prior_art: dict) -> None:
@@ -455,12 +528,54 @@ def summary(pa: dict) -> dict:
              "verdict": c.get("verdict"), "headline": c.get("headline"),
              "licence": (c.get("licence") or {}).get("spdx") or "",
              "blocking": c.get("blocking") or "", "why": c.get("why") or ""}
-            for c in cands if c.get("full_name") != (pa.get("pick") or "")][:6],
+            for c in cands if c.get("full_name") != (pa.get("pick") or "")][:8],
+        # THE RESEARCH PANEL'S DATA. Every query with its result count, and every candidate as
+        # a card with the evidence the verdict was actually built from — the shortlist used to
+        # exist only in a container's stderr, so the user saw one option and had to take it on
+        # trust that it was the best of several.
+        "searches": pa.get("searches") or [],
+        "research": [_card(c) for c in cands],
+        "phase": pa.get("phase") or "",
         "cost_usd": round(float(pa.get("cost_usd") or 0), 4),
         "seconds": pa.get("seconds") or 0,
+        "research_seconds": pa.get("research_seconds") or 0,
         "considered": pa.get("considered") or 0,
         "decided_at": pa.get("decided_at") or 0,
         "error": pa.get("error") or "",
+    }
+
+
+def _card(c: dict) -> dict:
+    """One candidate, as the Research panel shows it. Bounded on purpose: the panel repaints
+    on a 6-second poll, and shipping every candidate's full evidence blob on each one would
+    make the most-polled endpoint in the room the heaviest."""
+    ev = c.get("evidence") or {}
+    return {
+        "full_name": c.get("full_name") or "",
+        "url": c.get("url") or "",
+        "description": (c.get("description") or "")[:200],
+        "verdict": c.get("verdict") or "",
+        "score": int(c.get("score") or 0),
+        "blocking": c.get("blocking") or "",
+        "why": c.get("why") or "",
+        "headline": c.get("headline") or "",
+        "licence": (c.get("licence") or {}).get("spdx") or "",
+        "licence_source": (c.get("licence") or {}).get("source") or "",
+        "stars": int(c.get("stars") or 0),
+        "archived": bool(c.get("archived")),
+        "last_commit": (ev.get("last_commit") or "")[:10],
+        "loc": int(ev.get("loc") or 0),
+        "language": ev.get("primary_language") or "",
+        "dependencies": int(ev.get("dependencies") or 0),
+        "has_dockerfile": bool(ev.get("has_dockerfile")),
+        "has_server": bool(ev.get("has_server")),
+        "static_only": bool(ev.get("static_only")),
+        "build_step": bool(ev.get("build_step")),
+        "data_layer": ev.get("data_layer") or [],
+        "repo_mb": c.get("repo_mb") or 0,
+        "install": (c.get("install") or {}).get("detail") or "",
+        "notes": (c.get("notes") or [])[:8],
+        "trigger": c.get("trigger") or "opening",
     }
 
 
@@ -503,13 +618,21 @@ async def run_for_discussion(discussion_id: str, seed: str, canvas_hint: str = "
             return pa
 
         pa["status"] = "scouting"
+        pa["phase"] = f"searching GitHub — {len(cls['queries'])} queries, then cloning the "
+        pa["phase"] += "best few to look inside them"
+        pa = note_planned_searches(pa, cls["queries"])
         await save(discussion_id, pa)
         doc = await scout(cls["queries"], tag=discussion_id)
-        pa["considered"] = int(doc.get("considered") or 0)
-        cands = gate(doc.get("candidates") or [])
-        pa["candidates"] = [slim(c) for c in cands]
+        # Two views of the same run, and the split matters. `merge_research` stores the SLIM
+        # cards the panel renders; the pick for the proposal is taken from the RAW document,
+        # which still carries each candidate's README — the proposal writer is only allowed to
+        # say what the evidence says, so stripping its evidence to save bytes on a poll would
+        # quietly make the offer vaguer.
+        raw_cands = gate(doc.get("candidates") or [])
+        pa = merge_research(pa, doc, trigger="opening")
+        pa["phase"] = ""
         pa["error"] = str(doc.get("error") or "")
-        pick = best(cands)
+        pick = best(raw_cands)
         if not pick:
             # Nothing good enough. Also a success — and deliberately SILENT: proposing a dead
             # 2016 repo is worse than proposing nothing.
@@ -517,7 +640,7 @@ async def run_for_discussion(discussion_id: str, seed: str, canvas_hint: str = "
             pa["seconds"] = round(time.monotonic() - t0, 1)
             await save(discussion_id, pa)
             logger.info("prior-art %s: %d candidates, none worth proposing",
-                        discussion_id, len(cands))
+                        discussion_id, len(raw_cands))
             return pa
 
         prop = await propose(seed, canvas_hint, pick)

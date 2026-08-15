@@ -211,20 +211,27 @@ def survey(project_id: str) -> dict:
                                r"next\s+dev|nuxt\s+dev|react-scripts\s+start)\b", start))
     mode = "proxy" if (server_entry or (start and not dev_start)) else "static"
 
+    # ALWAYS computed, in BOTH modes. In `static` mode this is where the app is served from;
+    # in `proxy` mode it is the FALLBACK — see `startUpstream` in the adapter. The first repo
+    # this platform ever adopted needed it: SomCity's `server.js` opens a hardcoded TLS key
+    # (`cert/onekilobit.eu-key.pem`) belonging to its author's own domain, which is not in the
+    # repository, so the process dies on line 11 in anybody else's hands. Its `public/` folder
+    # is nevertheless the entire game. "The author's server assumes their machine" is going to
+    # be one of the most common ways an adopted app fails to boot, and refusing to serve a
+    # perfectly good front-end because of it would be the wrong answer.
     static_roots = []
-    if mode == "static":
-        if has_build:
-            # The build has not run yet, so this is the ORDER TO PROBE at runtime, not a
-            # claim about what exists. `platform/server.cjs` picks the first that is really
-            # there when the container starts.
-            static_roots = ["dist", "build", "out", "public", "."]
-        else:
-            for d in _STATIC_CANDIDATES:
-                p = root if d == "." else root / d
-                if (p / "index.html").is_file():
-                    static_roots.append(d)
-            if not static_roots:
-                static_roots = ["public", "dist", "."]
+    if has_build:
+        # The build has not run yet, so this is the ORDER TO PROBE at runtime, not a claim
+        # about what exists. `platform/server.cjs` picks the first that is really there when
+        # the container starts.
+        static_roots = ["dist", "build", "out", "public", "."]
+    else:
+        for d in _STATIC_CANDIDATES:
+            p = root if d == "." else root / d
+            if (p / "index.html").is_file():
+                static_roots.append(d)
+        if not static_roots:
+            static_roots = ["public", "dist", "."]
 
     node_engine = str(((pkg.get("engines") or {}).get("node") or "")).strip()
     node_major = "22"
@@ -393,12 +400,18 @@ app.use((_req, res, next) => {{
 // deployment gate would pass a blank page.
 let upstreamUp = MODE !== "proxy";
 let upstreamNote = "";
+let servingStatic = MODE === "static";
 app.get("/health", async (_req, res) => {{
   const out = {{ status: "ok", db: "down", redis: "down" }};
   try {{ await pool.query("SELECT 1"); out.db = "ok"; }} catch {{ out.status = "degraded"; }}
   try {{ const r = await getRedis(); await r.ping(); out.redis = "ok"; }}
   catch {{ out.status = "degraded"; }}
-  if (!upstreamUp) {{ out.status = "degraded"; out.app = upstreamNote || "upstream not running"; }}
+  // The upstream's own state is reported in `app`, NEVER by failing the platform's health.
+  // Two different questions: "is this service usable?" (what the deploy gate asks) and "is it
+  // running the way its author intended?" (what a human wants to know). Conflating them would
+  // either fail a working app or hide a real degradation.
+  if (upstreamNote) out.app = upstreamNote;
+  if (!upstreamUp && !servingStatic) {{ out.status = "degraded"; }}
   res.status(out.status === "ok" ? 200 : 503).json(out);
 }});
 
@@ -413,8 +426,10 @@ function pickStaticRoot() {{
   return null;
 }}
 
-function serveStatic() {{
+function serveStatic(reason) {{
   const root = pickStaticRoot();
+  if (root) servingStatic = true;
+  if (reason) console.error("[adapter] " + reason);
   if (!root) {{
     upstreamUp = false;
     upstreamNote = "no index.html found in " + JSON.stringify({roots});
@@ -499,12 +514,26 @@ async function main() {{
   if (MODE === "proxy") {{
     startUpstream();
     const ok = await waitForUpstream(60000);
-    if (!ok) {{
+    if (ok) {{
+      proxyAll();
+    }} else {{
+      // THE UPSTREAM'S OWN SERVER WOULD NOT START. Very often that is because it assumes its
+      // author's machine — a hardcoded TLS certificate path, a local database, an env var
+      // only they had. If the project also ships a front-end we can serve, serve it: a
+      // playable game beats a 502, and the reason is recorded loudly rather than hidden.
       upstreamUp = false;
-      upstreamNote = "the app did not start listening on :" + UPSTREAM_PORT + " within 60s";
-      console.error("[adapter] " + upstreamNote);
+      upstreamNote = "its own server did not start listening on :" + UPSTREAM_PORT
+        + " within 60s (see the container logs for its error)";
+      const root = pickStaticRoot();
+      if (root) {{
+        upstreamNote += " — serving its static files from "
+          + root.replace(ROOT + "/", "") + " instead";
+        serveStatic("upstream server failed to start; falling back to static");
+      }} else {{
+        console.error("[adapter] " + upstreamNote);
+        proxyAll();
+      }}
     }}
-    proxyAll();
   }} else {{
     serveStatic();
   }}
