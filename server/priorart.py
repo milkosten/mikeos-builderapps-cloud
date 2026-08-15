@@ -103,20 +103,32 @@ If it is genuinely borderline, answer `false`. A silent miss costs nothing; a co
 suggestion costs trust.
 
 When (and only when) you answer `true`, also write 2-4 GITHUB SEARCH QUERIES that would find \
-existing open-source projects of that kind. Write them the way an experienced developer \
-searches GitHub, not as an English sentence:
-  * two or three plain keywords, the words a repo would actually use in its own description;
-  * qualifiers where they help: `stars:>50`, `language:JavaScript`, `language:TypeScript`, \
-`pushed:>2023-01-01`, `topic:<topic>`;
-  * do NOT include the user's own product name, their city, their language or any other \
-detail personal to them — those words appear in no repository on earth;
-  * vary them: one narrow, one broad, so a miss on the narrow one is not a miss overall.
+existing open-source projects of that kind.
+
+**GitHub's search ANDs every word you give it**, and it matches a repository's NAME, its \
+one-line DESCRIPTION and its README — not what the project is really about. So each extra \
+word is another way to miss the best repo in the world. Write them the way an experienced \
+developer searches GitHub:
+  * **Your FIRST query must be the broadest one: TWO OR THREE WORDS, no qualifiers at all.** \
+Just the plain noun phrase for the thing, in the words its own author would have used in a \
+one-line description. This is the query that finds the well-known project, and it is the one \
+that most often gets ruined by helpfulness.
+  * Then 1-3 NARROWER ones, which may add qualifiers where they genuinely help: `stars:>50`, \
+`language:JavaScript`, `language:TypeScript`, `pushed:>2023-01-01`, `topic:<topic>`.
+  * NEVER use filler that no repository description contains: "open source" (every repo on \
+GitHub is), "clone", "project", "app", "web", "online", "best", "modern".
+  * Be careful with `language:` — it matches the repo's ONE dominant language, so \
+`language:JavaScript` silently excludes every TypeScript project. Put it on at most one query.
+  * Do NOT include the user's own product name, their city, their language or any other \
+detail personal to them — those words appear in no repository on earth.
+  * Use SYNONYMS across the set rather than repeating one phrasing with different \
+qualifiers: "city builder", "city simulation" and "citybuilder" find different repositories.
 
 Reply with ONE JSON object and nothing else:
 
 {"scout": true, "category": "isometric city-building simulation game",
  "reason": "one sentence, plain, on why the pipeline could or could not do this from zero",
- "queries": ["isometric city builder game stars:>50", "city simulation game javascript", "topic:citybuilder"]}"""
+ "queries": ["city building simulation", "isometric city builder stars:>50", "topic:citybuilder", "city simulation game language:TypeScript"]}"""
 
 
 _CLASSIFY_SCHEMA = {
