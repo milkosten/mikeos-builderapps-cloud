@@ -334,9 +334,12 @@ question that is already settled on the canvas.
 * Give each question 2-4 concrete options as `options`, with your RECOMMENDATION named in \
 `recommended` and the reason in one short clause. Options are a shortcut, not a cage: the \
 user may always answer in their own words, may pick none of them, and may say "you decide" \
-— in which case take your own recommendation, say so plainly, and move on. Set `"multi": \
-true` on a question where several options can honestly be true at once; leave it out when \
-exactly one answer is wanted.
+— in which case take your own recommendation, say so plainly, and move on. \
+**DEFAULT TO `"multi": true`.** Most real questions here have several honest answers at once \
+(who it is for, which features matter, what to leave out), and forcing one choice makes the \
+user throw away information you need. Only set `"multi": false` for a genuinely EXCLUSIVE \
+choice — one where picking two would contradict itself (e.g. "self-hosted accounts OR no \
+accounts at all"). If you are unsure, use true.
 * THE ANSWERS COME BACK AS ONE COMPLETE SET, question by question. The user works through \
 your questions in a stepper and submits them together, so what you receive is ALL of it — \
 there is no second instalment coming. Any question marked NOT ANSWERED / SKIPPED is exactly \
@@ -374,7 +377,7 @@ Reply with ONE JSON object and nothing else:
 {
   "reply": "your message, markdown",
   "questions": [{"q": "the question", "options": ["...","..."], "recommended": "...", \
-"why": "why this changes the build", "multi": false}],
+"why": "why this changes the build", "multi": true}],
   "canvas": {"name": "...", "vision": "...", "audience": "...",
              "features": ["..."], "stack": "...", "out_of_scope": ["..."]},
   "decided": ["audience"],
@@ -486,10 +489,10 @@ def _clean_questions(raw: Any) -> List[dict]:
         out.append({"q": text, "options": opts,
                     "recommended": _norm_str(q.get("recommended"))[:140],
                     "why": _norm_str(q.get("why"))[:200],
-                    # SINGLE-SELECT UNLESS THE MODEL SAYS OTHERWISE. The stepper renders one
-                    # choice per question by default; "pick as many as apply" is the model's
-                    # claim to make explicitly, not the UI's to guess from the wording.
-                    "multi": bool(q.get("multi"))})
+                    # MULTI-SELECT UNLESS THE MODEL SAYS OTHERWISE. Most questions here have
+                    # several honest answers at once (audience, which features matter, what to
+                    # leave out); forcing one choice throws away information we asked for.
+                    "multi": bool(q.get("multi", True))})
     return out
 
 
