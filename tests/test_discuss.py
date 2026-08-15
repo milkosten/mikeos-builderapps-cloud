@@ -112,6 +112,75 @@ def test_show_detection(text, expected):
 
 
 # ---------------------------------------------------------------------------
+# the answer set — one submit, every question accounted for
+#
+# THE BUG THIS GUARDS. Clicking one chip used to post that option as a whole user turn. The
+# model saw four questions asked and one line back, completed the pattern by inventing the
+# other three answers, and listed their fields in `decided` — which under merge_canvas means
+# AGREED, i.e. changeable only by an explicit revision. One click froze three decisions the
+# user never made. The stepper submits the set at once, and the set names its own gaps.
+# ---------------------------------------------------------------------------
+def test_an_empty_answer_is_a_skip_not_an_answer():
+    a = discuss.clean_answers([{"q": "Who is it for?", "answer": "   "}])
+    assert a[0]["skipped"] is True
+    # ... and an explicit skip stays a skip.
+    b = discuss.clean_answers([{"q": "Who?", "answer": "a team", "skipped": True}])
+    assert b[0]["skipped"] is True
+
+
+def test_a_question_with_no_text_is_dropped_and_the_set_is_bounded():
+    a = discuss.clean_answers([{"q": "", "answer": "x"}, {"q": "real?", "answer": "yes"}])
+    assert [x["q"] for x in a] == ["real?"]
+    assert len(discuss.clean_answers([{"q": f"q{i}", "answer": "a"} for i in range(20)])) <= 8
+
+
+def test_the_transcript_shows_the_skip_rather_than_hiding_it():
+    text = discuss.answers_text(discuss.clean_answers([
+        {"q": "Who is it for?", "answer": "a team"},
+        {"q": "Does it need logins?", "answer": "", "skipped": True},
+    ]))
+    assert "Who is it for?" in text and "a team" in text
+    # the thread is a RECORD: an unanswered question is not silently absent from it
+    assert "Does it need logins?" in text and "skipped" in text
+
+
+def test_the_model_is_told_which_questions_have_no_answer():
+    p = discuss._answers_prompt(discuss.clean_answers([
+        {"q": "Who is it for?", "answer": "a team"},
+        {"q": "Does it need logins?", "answer": ""},
+        {"q": "What would make it a failure?", "answer": "", "skipped": True},
+    ]))
+    assert "COMPLETE ANSWER SET" in p
+    assert p.count("NOT ANSWERED") == 3          # two markers + the closing instruction
+    assert "Do NOT invent" in p and "`decided`" in p
+    assert "ANSWER: a team" in p
+
+
+def test_a_full_set_is_not_hedged_with_a_skip_warning():
+    p = discuss._answers_prompt(discuss.clean_answers([
+        {"q": "Who is it for?", "answer": "a team"},
+        {"q": "Logins?", "answer": "yes"},
+    ]))
+    assert "NOT ANSWERED" not in p
+    assert "Every question was answered" in p
+
+
+def test_questions_are_single_select_unless_the_model_says_multi():
+    qs = discuss._clean_questions([
+        {"q": "Who is it for?", "options": ["me", "a team"]},
+        {"q": "Which of these matter?", "options": ["a", "b"], "multi": True},
+    ])
+    assert qs[0]["multi"] is False and qs[1]["multi"] is True
+
+
+def test_the_system_prompt_forbids_inventing_a_skipped_answer():
+    """The rule lives in the prompt, so the prompt is where it can be deleted by accident."""
+    s = discuss._SYSTEM
+    assert "COMPLETE SET" in s
+    assert "SKIPPED" in s and "invent" in s
+
+
+# ---------------------------------------------------------------------------
 # the SSRF guard
 # ---------------------------------------------------------------------------
 def _refuses(url) -> str:

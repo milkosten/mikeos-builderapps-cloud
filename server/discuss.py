@@ -57,6 +57,7 @@ FIELD_LABELS = {
 
 MAX_MESSAGES = 200          # a room, not an archive; the oldest turns fall out of the prompt
 MAX_TEXT = 8000             # per message, on the way in
+MAX_DRAFT = 24000           # the half-filled questionnaire, as JSON, on the way in
 _ALPHABET = "abcdefghijkmnopqrstuvwxyz23456789"
 
 
@@ -80,7 +81,7 @@ def _row(row) -> Optional[dict]:
     if row is None:
         return None
     d = dict(row)
-    for k in ("messages", "canvas"):
+    for k in ("messages", "canvas", "draft_answers"):
         v = d.get(k)
         if isinstance(v, str):
             try:
@@ -136,6 +137,27 @@ async def save(discussion_id: str, *, messages: List[dict], canvas: dict,
         discussion_id, json.dumps(messages[-MAX_MESSAGES:]), json.dumps(canvas),
         (title or "")[:120], cost_delta, turn_delta)
     return _row(row)
+
+
+async def save_draft_answers(discussion_id: str, draft: dict) -> None:
+    """Persist the HALF-FILLED questionnaire.
+
+    This is a scratchpad, not a turn: it never touches `messages`, `canvas`, `turns` or
+    `updated_at`, and it never reaches the model. It exists because the rest of this room
+    restores from the server and a questionnaire three answers deep should not be the one
+    thing a reload throws away. `updated_at` is deliberately left alone — typing an answer is
+    not activity that should reorder the Apps list.
+
+    The size cap is enforced by REJECTING an oversized draft in the router, never by
+    truncating the JSON here — half a JSON document does not cast to jsonb, and a scratchpad
+    write must not be able to 500 the room.
+    """
+    body = json.dumps(draft or {})
+    if len(body) > MAX_DRAFT:
+        raise ValueError("draft too large")
+    await pool().execute(
+        "UPDATE builderapps.discussions SET draft_answers=$2::jsonb WHERE id=$1",
+        discussion_id, body)
 
 
 async def link_project(discussion_id: str, project_id: str) -> None:
@@ -312,13 +334,27 @@ question that is already settled on the canvas.
 * Give each question 2-4 concrete options as `options`, with your RECOMMENDATION named in \
 `recommended` and the reason in one short clause. Options are a shortcut, not a cage: the \
 user may always answer in their own words, may pick none of them, and may say "you decide" \
-— in which case take your own recommendation, say so plainly, and move on.
+— in which case take your own recommendation, say so plainly, and move on. Set `"multi": \
+true` on a question where several options can honestly be true at once; leave it out when \
+exactly one answer is wanted.
+* THE ANSWERS COME BACK AS ONE COMPLETE SET, question by question. The user works through \
+your questions in a stepper and submits them together, so what you receive is ALL of it — \
+there is no second instalment coming. Any question marked NOT ANSWERED / SKIPPED is exactly \
+that: **the user did not answer it, and you do not know the answer.** You may not invent, \
+infer or quietly assume one, you may not write it into the canvas, and you may NEVER list \
+its field in `decided`. Say plainly which questions are still open, then either ask them \
+again (rephrased, with better options) or state the assumption you intend to proceed on and \
+label it as YOUR assumption. A skipped question turned into an agreed decision is the worst \
+thing you can do in this room: agreed cells are locked, so a guess becomes permanent.
 * Talk like a person: short paragraphs, plain words, no bullet-point avalanche, no \
 corporate filler, no emoji. Markdown is fine (bold, lists, `##` headings).
 * As things get settled, update the canvas. List a field in `decided` ONLY when the user has \
 actually settled it in their own words or by picking an option — not when you merely \
-proposed it. To CHANGE something already settled, use `revisions` with a reason; never \
-overwrite an agreed decision silently.
+proposed it, and never on the strength of a question they skipped. To CHANGE something \
+already settled, use `revisions` with a reason; never overwrite an agreed decision silently. \
+A revision's `to` is the COMPLETE NEW VALUE of that field (for a list, the whole new list), \
+never a description of what you changed — "removed the demand graphs" is a note, not a value, \
+and it ends up rendered to the user as if it were the feature.
 * When they ask to see the vision / the plan / the brief, set `show` to "vision" (just the \
 vision) or "canvas" (the whole brief) AND write it out in `reply` as readable prose — they \
 asked to READ it, so an empty acknowledgement is a failure.
@@ -338,7 +374,7 @@ Reply with ONE JSON object and nothing else:
 {
   "reply": "your message, markdown",
   "questions": [{"q": "the question", "options": ["...","..."], "recommended": "...", \
-"why": "why this changes the build"}],
+"why": "why this changes the build", "multi": false}],
   "canvas": {"name": "...", "vision": "...", "audience": "...",
              "features": ["..."], "stack": "...", "out_of_scope": ["..."]},
   "decided": ["audience"],
@@ -445,8 +481,79 @@ def _clean_questions(raw: Any) -> List[dict]:
                 opts.append(s)
         out.append({"q": text, "options": opts,
                     "recommended": _norm_str(q.get("recommended"))[:80],
-                    "why": _norm_str(q.get("why"))[:200]})
+                    "why": _norm_str(q.get("why"))[:200],
+                    # SINGLE-SELECT UNLESS THE MODEL SAYS OTHERWISE. The stepper renders one
+                    # choice per question by default; "pick as many as apply" is the model's
+                    # claim to make explicitly, not the UI's to guess from the wording.
+                    "multi": bool(q.get("multi"))})
     return out
+
+
+# ---------------------------------------------------------------------------
+# the answer set
+# ---------------------------------------------------------------------------
+# The questionnaire is answered as ONE SET and arrives as one user turn. Everything below
+# exists because of the bug this replaced: a single chip click was posted as a whole user
+# message, the model saw four questions asked and one paragraph back, and it completed the
+# pattern — inventing the other three answers and marking them DECIDED, which under the
+# canvas rules locks them for good. An answer set is explicit about every question,
+# including the ones with no answer, so "unanswered" is a fact the model is told rather than
+# a gap it fills in.
+def clean_answers(raw: Any) -> List[dict]:
+    out: List[dict] = []
+    for a in (raw or [])[:8]:
+        if not isinstance(a, dict):
+            continue
+        q = _norm_str(a.get("q"))[:300]
+        if not q:
+            continue
+        ans = _norm_str(a.get("answer"))[:1200]
+        # AN EMPTY ANSWER IS A SKIP. There is no third state: an empty string posted as if it
+        # were an answer is exactly the "silently treated as answered" failure, one level down.
+        out.append({"q": q, "answer": ans, "skipped": bool(a.get("skipped")) or not ans})
+    return out
+
+
+def answers_text(answers: List[dict]) -> str:
+    """The user's turn as it is STORED AND SHOWN — the readable record of what was asked and
+    what was chosen. The thread has to stay a truthful transcript, so a skipped question
+    appears here as a skipped question rather than quietly vanishing."""
+    lines = ["Answers to your questions:"]
+    for i, a in enumerate(answers or [], 1):
+        lines.append(f"\n{i}. {a.get('q') or ''}")
+        if a.get("skipped") or not (a.get("answer") or "").strip():
+            lines.append("   (skipped — no answer)")
+        else:
+            lines.append("   " + str(a["answer"]).strip())
+    return "\n".join(lines)
+
+
+def _answers_prompt(answers: List[dict]) -> str:
+    """The same set, framed for the model, with the rule attached to the data it applies to.
+    The rule is repeated here and not only in the system prompt on purpose: it is the last
+    thing the model reads before it answers, and it is the one it used to break."""
+    lines = ["The user worked through your questions and submitted them together. THIS IS "
+             "THE COMPLETE ANSWER SET — nothing else is coming.\n"]
+    skipped = []
+    for i, a in enumerate(answers or [], 1):
+        lines.append(f"{i}. Q: {a.get('q') or ''}")
+        if a.get("skipped") or not (a.get("answer") or "").strip():
+            lines.append("   NOT ANSWERED — the user skipped this question.")
+            skipped.append(str(a.get("q") or ""))
+        else:
+            lines.append(f"   ANSWER: {str(a['answer']).strip()}")
+    lines.append("")
+    if skipped:
+        lines.append(
+            f"{len(skipped)} question(s) were NOT ANSWERED. You do not know those answers. "
+            "Do NOT invent, infer or assume them, do NOT write them into the canvas, and do "
+            "NOT put their fields in `decided`. Name them in your reply as still open, and "
+            "either ask them again or say plainly what you will assume and that it is your "
+            "assumption, not their decision.")
+    else:
+        lines.append("Every question was answered — treat these, and only these, as the "
+                     "user's decisions.")
+    return "\n".join(lines)
 
 
 # The one tool the room has. Described in terms of the DECISION to use it, not the mechanics
@@ -528,16 +635,22 @@ _JSON_NUDGE = ("Now give your answer as the single JSON object described in your
                "instructions — no prose outside it.")
 
 
-async def turn(disc: dict, user_text: str = "") -> dict:
+async def turn(disc: dict, user_text: str = "", answers: Optional[List[dict]] = None) -> dict:
     """One exchange. Returns {reply, questions, canvas, show, ready, sources, cost_usd}.
 
-    `user_text` empty = the OPENING turn (react to the seed). The cost is captured across the
-    WHOLE turn — tool rounds included — rather than inferred, because "a discussion is cheap"
-    is a claim this phase makes and a claim has to be measurable.
+    No assistant turn yet = the OPENING turn (react to the seed). Note that `messages` is NOT
+    empty by then: the user's own sentence is the first message in the thread (it is what
+    they asked for, and a room whose first bubble is an answer to an invisible question is
+    unreadable on reload) — so "opening" is the absence of a REPLY, not the absence of
+    messages.
+
+    The cost is captured across the WHOLE turn — tool rounds included — rather than inferred,
+    because "a discussion is cheap" is a claim this phase makes and a claim has to be
+    measurable.
     """
     canvas = disc.get("canvas") or {}
     messages = list(disc.get("messages") or [])
-    opening = not messages
+    opening = not any(m.get("role") == "assistant" for m in messages)
 
     convo: List[Dict[str, Any]] = [{"role": "system", "content": _SYSTEM}]
     if opening:
@@ -553,8 +666,19 @@ async def turn(disc: dict, user_text: str = "") -> dict:
             f"Original one-line idea: \"{disc.get('seed') or ''}\"\n\n"
             f"The canvas as it stands:\n{_render_canvas(canvas)}\n\n"
             "What follows is the conversation so far. Continue it."})
-        convo.extend(_render_thread(messages))
-        convo.append({"role": "user", "content": user_text or "(continue)"})
+        # The turn being answered is ALREADY the last message in `messages` (it is written
+        # before the model is called, so a model failure cannot lose it). Render the history
+        # WITHOUT it and then append it in its framed form, or the model reads the user's
+        # words twice — once bare, once with the rules attached — and the bare copy wins.
+        tail = messages[-1] if messages and messages[-1].get("role") == "user" else None
+        convo.extend(_render_thread(messages[:-1] if tail else messages))
+        if answers is None and tail:
+            answers = tail.get("answers")
+        if answers:
+            convo.append({"role": "user", "content": _answers_prompt(answers)})
+        else:
+            convo.append({"role": "user",
+                          "content": user_text or (tail or {}).get("text") or "(continue)"})
 
     sources: List[dict] = []
     with usage.capture() as recs:
