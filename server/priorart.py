@@ -102,7 +102,7 @@ them.
 If it is genuinely borderline, answer `false`. A silent miss costs nothing; a confident bad \
 suggestion costs trust.
 
-When (and only when) you answer `true`, also write 2-4 GITHUB SEARCH QUERIES that would find \
+When (and only when) you answer `true`, also write 3-5 GITHUB SEARCH QUERIES that would find \
 existing open-source projects of that kind.
 
 **GitHub's search ANDs every word you give it**, and it matches a repository's NAME, its \
@@ -184,7 +184,7 @@ async def classify(seed: str, canvas_hint: str = "") -> dict:
     out["category"] = str(data.get("category") or "")[:200]
     out["reason"] = str(data.get("reason") or "")[:400]
     qs, seen = [], set()
-    for q in (data.get("queries") or [])[:4]:
+    for q in (data.get("queries") or [])[:5]:
         s = re.sub(r"\s+", " ", str(q)).strip()[:180]
         if s and s.lower() not in seen:
             seen.add(s.lower())

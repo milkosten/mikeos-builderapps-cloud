@@ -52,7 +52,7 @@ import urllib.request
 GITHUB_API = "https://api.github.com"
 UA = "builderapps-prior-art-scout"
 
-MAX_CANDIDATES = int(os.environ.get("SCOUT_MAX_CANDIDATES", "5"))
+MAX_CANDIDATES = int(os.environ.get("SCOUT_MAX_CANDIDATES", "6"))
 DEADLINE_SEC = float(os.environ.get("SCOUT_DEADLINE_SEC", "210"))
 CLONE_TIMEOUT = float(os.environ.get("SCOUT_CLONE_TIMEOUT", "90"))
 NPM_TIMEOUT = float(os.environ.get("SCOUT_NPM_TIMEOUT", "100"))
@@ -116,7 +116,7 @@ def search(queries):
             log("out of time before query %d" % (i + 1))
             break
         qs = urllib.parse.urlencode({"q": q, "sort": "stars", "order": "desc",
-                                     "per_page": "10"})
+                                     "per_page": "15"})
         data = gh(f"/search/repositories?{qs}")
         items = (data or {}).get("items") or []
         log(f"query {i+1}/{len(queries)}: {q!r} -> {len(items)} results")
@@ -157,6 +157,17 @@ def _prior(it: dict) -> float:
         score -= 40          # over ~1.5 GB the clone itself starts costing the whole minute
     elif size > 600000:
         score -= 10
+    # THE PRIOR THAT MATTERS MOST HERE, and it is not stars: the runtime. This platform runs
+    # Node, so a JS/TS repo is the only kind that can drop in — and without this the shortlist
+    # is chosen almost entirely by popularity, which on any "game" search means five C++ and
+    # Rust engines we will reject after paying to clone all five.
+    lang = str(it.get("language") or "")
+    if lang in ("JavaScript", "TypeScript"):
+        score += 30
+    elif lang in ("HTML", "CSS", "Svelte", "Vue"):
+        score += 15           # a front-end we can put our own server in front of
+    elif lang:
+        score -= 15
     lic = ((it.get("license") or {}).get("spdx_id") or "").upper()
     if lic.startswith(("GPL", "AGPL", "LGPL")):
         score -= 25            # it will be rejected below; do not waste a clone slot on it
@@ -720,7 +731,7 @@ def main() -> int:
         queries = json.loads(os.environ.get("SCOUT_QUERIES") or "[]")
     except Exception:  # noqa: BLE001
         queries = []
-    queries = [str(q)[:200] for q in queries if str(q).strip()][:4]
+    queries = [str(q)[:200] for q in queries if str(q).strip()][:5]
     result = {"ok": False, "queries": queries, "candidates": [], "considered": 0,
               "error": "", "seconds": 0.0}
     if not queries:
