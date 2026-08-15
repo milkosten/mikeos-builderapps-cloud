@@ -40,6 +40,12 @@ The upstream `LICENSE` is preserved untouched, a `NOTICE` names the source repo 
 commit, a workspace `doc` item records it on the project's board, and `projects.adopted`
 records it in the platform's own database. A NOTICE file can be deleted by the next agent
 that tidies the repo; a column cannot.
+
+When the upstream ships NO LICENSE file — common, and true of the first repo this platform
+ever adopted — the NOTICE says exactly that and names where the licence WAS declared
+(`package.json`). We never write a LICENSE file on an author's behalf: granting a licence is
+their act, and a file we invented would be the most dangerous kind of provenance, the kind
+that looks authoritative.
 """
 from __future__ import annotations
 
@@ -209,7 +215,7 @@ def survey(project_id: str) -> dict:
     if mode == "static":
         if has_build:
             # The build has not run yet, so this is the ORDER TO PROBE at runtime, not a
-            # claim about what exists. `platform/server.js` picks the first that is really
+            # claim about what exists. `platform/server.cjs` picks the first that is really
             # there when the container starts.
             static_roots = ["dist", "build", "out", "public", "."]
         else:
@@ -238,8 +244,8 @@ def survey(project_id: str) -> dict:
         "server_entry": server_entry,
         "static_roots": static_roots,
         "node_major": node_major,
-        "migrate_path": ("platform/migrate.js" if (root / "db" / "migrate.js").is_file()
-                         else "db/migrate.js"),
+        # ALWAYS inside platform/, and always `.cjs` — see the note above `_PLATFORM_PKG`.
+        "migrate_path": "platform/migrate.cjs",
         "had_dockerfile": (root / "Dockerfile").is_file(),
         "had_compose": any((root / n).is_file() for n in
                            ("docker-compose.yml", "docker-compose.yaml", "compose.yml")),
@@ -247,12 +253,23 @@ def survey(project_id: str) -> dict:
 
 
 # ---- the shim ------------------------------------------------------------
+# NOTE THE `.cjs` EXTENSIONS EVERYWHERE BELOW, AND DO NOT "TIDY" THEM AWAY.
+#
+# The adapter is CommonJS. Node decides a `.js` file's module system from the NEAREST
+# package.json, and an adopted repo's own package.json is not ours to edit — SomCity's says
+# `"type": "module"`, which made `db/migrate.js` load as ESM inside a CJS `require()` and the
+# very first adopted app died on boot with `loadESMFromCJS`. A `"type": "commonjs"` in
+# `platform/package.json` fixes the adapter's own directory and nothing else, so any file we
+# write OUTSIDE it is still governed by the upstream's declaration.
+#
+# `.cjs` is unambiguous no matter what any package.json says, anywhere in the tree. It is the
+# one thing here that cannot be broken by the next repository we adopt.
 _PLATFORM_PKG = """{
   "name": "builderapps-platform-adapter",
   "private": true,
   "description": "The hosting platform's adapter. It wraps the adopted upstream app; it is not part of it.",
   "type": "commonjs",
-  "main": "server.js",
+  "main": "server.cjs",
   "dependencies": {
     "express": "^4.19.2",
     "pg": "^8.12.0",
@@ -308,8 +325,7 @@ def _platform_server_js(sv: dict) -> str:
     mode = sv.get("mode")
     start_cmd = json.dumps(sv.get("start_script") or "")
     entry = json.dumps(sv.get("server_entry") or "")
-    migrate_req = ("../db/migrate" if sv.get("migrate_path") == "db/migrate.js"
-                   else "./migrate")
+    migrate_req = "./migrate.cjs"
     return f'''// ---------------------------------------------------------------------------
 // THE PLATFORM ADAPTER — builderapps.
 //
@@ -550,7 +566,7 @@ def _dockerfile(sv: dict) -> str:
         "",
         '# The ADAPTER is the entrypoint, never the upstream app: /health, the CSP and the',
         '# migrations are the platform\'s and must exist even if the app underneath is down.',
-        'CMD ["node", "platform/server.js"]',
+        'CMD ["node", "platform/server.cjs"]',
         "",
     ]
     return "\n".join(lines)
@@ -614,8 +630,22 @@ volumes:
 """
 
 
-def _notice(cand: dict, imp: dict, project_id: str, title: str) -> str:
+def _notice(cand: dict, imp: dict, project_id: str, title: str,
+            licence_file: str = "") -> str:
     lic = (cand.get("licence") or {}).get("spdx") or "see LICENSE"
+    # TELL THE TRUTH ABOUT WHERE THE LICENCE LIVES. Plenty of real projects declare their
+    # licence only in `package.json` and ship no LICENSE file (SomCity, the first repo this
+    # platform ever adopted, is one). We must not write one on their behalf — granting a
+    # licence is the author's act, not ours — and we must not claim to have preserved a file
+    # that never existed.
+    where = (f"The upstream `{licence_file}` file is preserved unmodified in this repository "
+             f"and continues to apply to the upstream code."
+             if licence_file else
+             "The upstream project ships NO LICENSE FILE. Its licence is declared in "
+             f"`package.json` as `{lic}`, which is where this was read from. We have "
+             "deliberately NOT written a LICENSE file on the author's behalf — granting a "
+             "licence is theirs to do, not ours. If this app matters commercially, ask the "
+             "upstream author to add one.")
     return f"""NOTICE
 ======
 
@@ -633,10 +663,11 @@ begins with the original author's first commit, not ours.
   Licence          : {lic} (as found in {(cand.get('licence') or {}).get('source') or 'the repository'})
   Imported into    : builderapps project {project_id} ("{title}")
 
-The upstream LICENSE file is preserved unmodified in this repository and continues to apply
-to the upstream code. That licence is permissive ({lic}); it was checked before this project
-was adopted, and a copyleft licence (GPL/AGPL/LGPL) would have been refused, because adopting
-one would have imposed it on this application too.
+{where}
+
+That licence is permissive ({lic}); it was checked before this project was adopted, and a
+copyleft licence (GPL/AGPL/LGPL) would have been refused, because adopting one would have
+imposed it on this application too.
 
 WHAT WE CHANGED
 ---------------
@@ -644,12 +675,12 @@ The upstream source is deliberately UNMODIFIED by the adoption itself. Everythin
 platform requires was added alongside it, so that `git diff` against the upstream commit above
 shows the platform adapter and nothing else:
 
-  platform/server.js    the hosting adapter — GET /health, port 3000, the preview CSP, and
+  platform/server.cjs   the hosting adapter — GET /health, port 3000, the preview CSP, and
                         it starts or serves the upstream app without editing it
+  platform/migrate.cjs  the shared migration runner (migrations/*.sql, applied on boot)
   platform/package.json the adapter's own dependencies, kept out of the upstream's tree
   Dockerfile            builds the upstream as its author intended, then runs the adapter
   docker-compose.yml    the platform's three-service stack (app/db/redis)
-  {('db/migrate.js       ' if True else '')}the shared migration runner
 
 Anything committed AFTER the "chore: fit the platform contract" commit is work this platform
 did on the owner's behalf.
@@ -680,11 +711,15 @@ async def fit_contract(project_id: str, cand: dict, imp: dict, title: str) -> di
                                  (root / name).read_text("utf-8", "replace")[:200000])
 
     workspace.write_file(project_id, "platform/package.json", _PLATFORM_PKG)
-    workspace.write_file(project_id, "platform/server.js", _platform_server_js(sv))
+    workspace.write_file(project_id, "platform/server.cjs", _platform_server_js(sv))
     workspace.write_file(project_id, sv["migrate_path"], _MIGRATE_JS)
     workspace.write_file(project_id, "Dockerfile", _dockerfile(sv))
     workspace.write_file(project_id, "docker-compose.yml", _COMPOSE)
-    workspace.write_file(project_id, "NOTICE", _notice(cand, imp, project_id, title))
+    licence_file = next((n for n in sorted(os.listdir(root))
+                         if re.match(r"^(LICEN[CS]E|COPYING|UNLICEN[CS]E)(\.[A-Za-z]+)?$",
+                                     n, re.I)), "")
+    workspace.write_file(project_id, "NOTICE",
+                         _notice(cand, imp, project_id, title, licence_file))
     (root / "migrations").mkdir(parents=True, exist_ok=True)
     workspace.write_file(project_id, "migrations/.keep",
                          "-- migrations/*.sql are applied on boot by the platform adapter.\n")
@@ -700,9 +735,6 @@ async def fit_contract(project_id: str, cand: dict, imp: dict, title: str) -> di
                 "\n\n# builderapps: the platform adapter must reach the image.\n"
                 "!platform\n!platform/**\n!migrations\n!migrations/**\n!NOTICE\n"))
 
-    licence_file = next((n for n in os.listdir(root)
-                         if re.match(r"^(LICEN[CS]E|COPYING|UNLICEN[CS]E)(\.[A-Za-z]+)?$",
-                                     n, re.I)), "")
     sv["licence_file"] = licence_file
     sv["licence_preserved"] = bool(licence_file)
     return sv
