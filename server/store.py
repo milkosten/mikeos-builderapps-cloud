@@ -131,7 +131,18 @@ async def get_project(project_id: str, user_id: Optional[str] = None) -> Optiona
         row = await pool().fetchrow(
             "SELECT * FROM builderapps.projects WHERE id=$1", project_id
         )
-    return dict(row) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    # asyncpg hands jsonb back as a STRING. Decode here, once, so no caller — and in
+    # particular no browser — receives `"adopted": "{\"repo\": ...}"` and has to guess that
+    # the value it was given is itself JSON.
+    if isinstance(d.get("adopted"), str):
+        try:
+            d["adopted"] = json.loads(d["adopted"])
+        except Exception:  # noqa: BLE001 — a corrupt cell must not 500 the project page
+            d["adopted"] = None
+    return d
 
 
 async def list_projects(user_id: str) -> list[dict]:

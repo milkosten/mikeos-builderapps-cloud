@@ -105,6 +105,17 @@ services:
       # the assistant-runtime image's build context, so the control plane can build it on
       # first use instead of needing a manual step on the host. Read-only: it is source.
       - /opt/mikeos-builderapps-cloud/assistant-runtime:/opt/mikeos-builderapps-cloud/assistant-runtime:ro
+      # phase 35: the per-discussion clone cache the prior-art scout re-uses across turns.
+      # SAME path both sides, for the same reason as the assistant workspaces above — the
+      # control plane creates the dir and then bind-mounts it into the scout container by
+      # HOST path. On /data (the 117 TB array) because these are other people's repositories:
+      # bulk, not latency-sensitive, and the NVMe root is the tier that is actually scarce.
+      - /data/builderapps/discuss:/data/builderapps/discuss
+      # phase 35: the Anthropic subscription OAuth token. READ-ONLY, and it goes exactly this
+      # far — the control plane reads it and talks to api.anthropic.com itself. It is never
+      # put in an image, never passed in a `docker run --env`, and never reaches the scout
+      # container, which is the one holding a stranger's source tree.
+      - /opt/builderapps/.anthropic-key:/opt/builderapps/.anthropic-key:ro
     networks: [deploy_default]
     mem_limit: 1g
     cpus: 2

@@ -37,6 +37,7 @@ outcome, not the best: it looks impressive in a proposal and then neither the co
 nor the build pipeline can meaningfully change it. Small and hackable wins.
 """
 import concurrent.futures
+import contextlib
 import json
 import os
 import re
@@ -57,7 +58,13 @@ DEADLINE_SEC = float(os.environ.get("SCOUT_DEADLINE_SEC", "210"))
 CLONE_TIMEOUT = float(os.environ.get("SCOUT_CLONE_TIMEOUT", "90"))
 NPM_TIMEOUT = float(os.environ.get("SCOUT_NPM_TIMEOUT", "100"))
 VERIFY_INSTALL = os.environ.get("SCOUT_NPM", "1") not in ("0", "no", "false")
+# WHERE THE CLONES LIVE. `/tmp/scout` is a tmpfs and dies with the container; when the
+# control plane mounts a per-discussion volume at /work, clones SURVIVE between calls and a
+# follow-up question ("what's in its package.json scripts?") re-uses the checkout instead of
+# re-cloning 800 MB to answer it. That persistence is the real "more context" win — not where
+# the model runs.
 WORK = os.environ.get("SCOUT_WORKDIR", "/tmp/scout")
+PERSIST = os.environ.get("SCOUT_PERSIST", "0") not in ("0", "", "no", "false")
 
 _T0 = time.monotonic()
 
@@ -319,12 +326,28 @@ def run(cmd, cwd=None, timeout=60.0):
 
 def clone(full_name: str, default_branch: str, dest: str):
     """Shallow but not one-deep: 120 commits is enough to say how alive a repo is, and still
-    a few seconds. `--no-tags` because a decade of release tags is pure download."""
+    a few seconds. `--no-tags` because a decade of release tags is pure download.
+
+    REUSES AN EXISTING CHECKOUT when the workspace is persistent. `git fetch` on a repo we
+    already have is a couple of seconds against a clone that can be a minute and hundreds of
+    megabytes — which is the entire point of the per-discussion volume. The return value says
+    which happened (`reused`), because "did it re-clone?" is exactly the claim that needs
+    evidence rather than assertion.
+    """
     url = f"https://github.com/{full_name}.git"
+    if os.path.isdir(os.path.join(dest, ".git")):
+        rc, out = run(["git", "-C", dest, "fetch", "--depth", "120", "--quiet", "origin"],
+                      timeout=min(CLONE_TIMEOUT, max(20.0, left() - 15)))
+        if rc == 0:
+            run(["git", "-C", dest, "reset", "--hard", "--quiet", "FETCH_HEAD"], timeout=60)
+            log(f"reused existing checkout of {full_name}")
+            return True, "reused", True
+        log(f"refresh of {full_name} failed, re-cloning: {out[-200:]}")
+        shutil.rmtree(dest, ignore_errors=True)
     rc, out = run(["git", "clone", "--depth", "120", "--single-branch", "--no-tags",
                    "--quiet", url, dest],
                   timeout=min(CLONE_TIMEOUT, max(20.0, left() - 15)))
-    return rc == 0, out[-600:]
+    return rc == 0, out[-600:], False
 
 
 def walk_repo(repo_dir: str):
@@ -737,7 +760,8 @@ def evaluate(item: dict, workdir: str) -> dict:
                      "why": f"GitHub has no repository {full} ({item['_lookup_error']})",
                      "notes": [], "headline": ""})
         return cand
-    ok, out = clone(full, cand["default_branch"], dest)
+    ok, out, reused = clone(full, cand["default_branch"], dest)
+    cand["reused_checkout"] = bool(reused)
     if not ok:
         cand.update({"licence": {"spdx": "", "source": "clone failed"},
                      "evidence": {}, "clone_error": out,
@@ -764,7 +788,11 @@ def evaluate(item: dict, workdir: str) -> dict:
         cand["install"] = verify_install(dest)
     cand.update(score(cand))
     cand["headline"] = headline(cand)
-    shutil.rmtree(dest, ignore_errors=True)
+    if not PERSIST:
+        # Ephemeral tmpfs: clean up as we go so six candidates cannot fill it. On a
+        # persistent volume we deliberately KEEP the checkout — that is what it is for; the
+        # control plane reaps the whole directory when the discussion ends.
+        shutil.rmtree(dest, ignore_errors=True)
     return cand
 
 
@@ -802,7 +830,15 @@ def main() -> int:
     short = pinned + [i for i in items if i.get("full_name") not in pinned_names][:room]
     log(f"shortlist: {[i.get('full_name') for i in short]}")
 
-    with tempfile.TemporaryDirectory(dir=WORK) as td:
+    # A STABLE directory when the workspace persists, a throwaway one when it does not.
+    # The stable path is what lets turn 2 find what turn 1 cloned.
+    if PERSIST:
+        td = os.path.join(WORK, "repos")
+        os.makedirs(td, exist_ok=True)
+        ctx = contextlib.nullcontext(td)
+    else:
+        ctx = tempfile.TemporaryDirectory(dir=WORK)
+    with ctx as td:
         # Cloning is I/O, so it parallelises well; the inspection after it is cheap. Three at
         # a time keeps the tmpfs and the pids-limit comfortable.
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -813,6 +849,9 @@ def main() -> int:
                 except Exception as e:  # noqa: BLE001
                     it = futs[f]
                     log(f"evaluate {it.get('full_name')} failed: {e}")
+    result["reused"] = sorted(c["full_name"] for c in result["candidates"]
+                              if c.get("reused_checkout"))
+    result["persistent_workspace"] = PERSIST
 
     order = {"adopt": 0, "adopt-with-work": 1, "reject": 2}
     result["candidates"].sort(key=lambda c: (order.get(c.get("verdict"), 3),

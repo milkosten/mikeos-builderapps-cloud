@@ -37,6 +37,16 @@ from server.db import pool
 
 logger = logging.getLogger(__name__)
 
+
+def _reap_workspace(discussion_id: str) -> None:
+    """Delete this room's persistent clone cache (phase 35). Imported lazily and swallowed
+    on failure: reclaiming disk must never be able to fail a delete or a build."""
+    try:
+        from server import priorart
+        priorart.reap_workspace(discussion_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("workspace reap failed for %s", discussion_id, exc_info=True)
+
 # The canvas' shape, in the order it is rendered and briefed. `list` fields accumulate.
 FIELDS: Dict[str, str] = {
     "name": "str",
@@ -205,13 +215,20 @@ async def link_project(discussion_id: str, project_id: str) -> None:
     await pool().execute(
         "UPDATE builderapps.projects SET discussion_id=$2 WHERE id=$1",
         project_id, discussion_id)
+    # The room's clone cache has done its job — the decision is made and the build has its
+    # own checkout. Reap it here rather than on a sweeper: the moment a discussion becomes a
+    # project is the moment those gigabytes stop being useful to anyone.
+    _reap_workspace(discussion_id)
 
 
 async def delete(discussion_id: str, user_id: str) -> bool:
     res = await pool().execute(
         "DELETE FROM builderapps.discussions WHERE id=$1 AND user_id=$2",
         discussion_id, user_id)
-    return res.endswith(" 1")
+    deleted = res.endswith(" 1")
+    if deleted:
+        _reap_workspace(discussion_id)
+    return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +482,15 @@ wants alternatives. It takes 30-60 seconds, so use it when it decides something 
 it found in plain terms.
 * **The licence is a hard gate on anything we would build on: MIT, Apache-2.0, BSD, ISC or \
 Unlicence only.** GPL/AGPL/LGPL would make the user's own app copyleft forever, so never \
-offer one as a starting point however good it looks — say plainly why it is out. Judgement, not reflex: a link mentioned in passing, or one they are telling \
+offer one as a starting point however good it looks — say plainly why it is out.
+* **NEVER STATE A FACT ABOUT A REPOSITORY THAT WAS NOT MEASURED.** Its licence, its size, its \
+language, whether it has a server, whether it has a Dockerfile — every one of those may ONLY \
+come from the MEASURED PROJECTS block below or from an `inspect_open_source` result in this \
+turn. You cannot know them otherwise, and a licence you guessed at is the most damaging thing \
+you could possibly say here: it is the basis on which someone decides what they are allowed \
+to ship. If you are asked about a repository you have no measurement for, CALL THE TOOL. If \
+you cannot, say plainly that you have not looked at it — never fill the gap. "I have not \
+measured that one" is a good answer; a confident wrong licence is not. Judgement, not reflex: a link mentioned in passing, or one they are telling \
 you they DISLIKE, does not need fetching unless its content would change the build. Rules \
 you may not break: only claim to have read something the tool actually returned; if it was \
 refused or failed, SAY SO plainly in `reply` and carry on without it; and when a fact came \
@@ -506,6 +531,44 @@ def _render_canvas(canvas: dict) -> str:
         mark = " [AGREED — do not change without a revision]" if cell.get("agreed") else " [draft]"
         text = v if isinstance(v, str) else "; ".join(v)
         lines.append(f"- {FIELD_LABELS[name]}{mark}: {text}")
+    return "\n".join(lines)
+
+
+def render_measured(prior_art: dict) -> str:
+    """The projects THIS ROOM has actually cloned and measured, rendered for the prompt.
+
+    This exists because of a real, bad turn. Asked to compare three repositories, the model
+    answered in 13 seconds — i.e. without calling the sandbox at all — and invented the facts:
+    it called an MIT project GPL-3.0 and said a project with its own Express server was a
+    static front-end with no licence. Every one of those facts had already been measured; they
+    were sitting in the discussion row, and the model simply could not see them, because a
+    tool result from four turns ago is not in the window any more.
+
+    So the measurements are PERCEPTION, not memory: they are re-sent every turn, compactly,
+    exactly like the canvas is. An agent that has to remember a fact will eventually invent it.
+    """
+    cands = (prior_art or {}).get("candidates") or []
+    if not cands:
+        return ""
+    lines = ["PROJECTS THIS ROOM HAS ALREADY CLONED AND MEASURED. These are measurements, not "
+             "recollections. When you talk about any of these repositories you MUST use these "
+             "numbers and nothing else; do not restate them from memory and do not soften or "
+             "round them. Any repository NOT in this list has not been looked at."]
+    for c in cands[:12]:
+        ev = c.get("evidence") or {}
+        lic = (c.get("licence") or {}).get("spdx") or "NO LICENCE FOUND"
+        shape = ("has its own server" if ev.get("has_server")
+                 else "static front-end only" if ev.get("static_only")
+                 else "nothing obvious to serve")
+        lines.append(
+            f"- {c.get('full_name')}: licence {lic} (from "
+            f"{(c.get('licence') or {}).get('source') or '?'}); "
+            f"{ev.get('primary_language') or 'unknown language'}; {shape}; "
+            f"{'has a Dockerfile' if ev.get('has_dockerfile') else 'no Dockerfile'}; "
+            f"~{ev.get('loc') or 0} lines; {ev.get('dependencies') or 0} deps; "
+            f"last commit {(ev.get('last_commit') or '?')[:10]}; "
+            f"VERDICT {c.get('verdict')}"
+            + (f" — {c.get('why')}" if c.get("why") else ""))
     return "\n".join(lines)
 
 
@@ -953,10 +1016,12 @@ async def turn(disc: dict, user_text: str = "", answers: Optional[List[dict]] = 
             "needs, what you would leave out), then ask 3-5 questions that actually change "
             "what gets built. Fill the canvas with your draft."})
     else:
+        measured = render_measured(disc.get("prior_art") or {})
         convo.append({"role": "user", "content":
             f"Original one-line idea: \"{disc.get('seed') or ''}\"\n\n"
             f"The canvas as it stands:\n{_render_canvas(canvas)}\n\n"
-            "What follows is the conversation so far. Continue it."})
+            + (measured + "\n\n" if measured else "")
+            + "What follows is the conversation so far. Continue it."})
         # The turn being answered is ALREADY the last message in `messages` (it is written
         # before the model is called, so a model failure cannot lose it). Render the history
         # WITHOUT it and then append it in its framed form, or the model reads the user's

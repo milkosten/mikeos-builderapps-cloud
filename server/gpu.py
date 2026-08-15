@@ -79,6 +79,16 @@ def set_usage_sink(fn) -> None:
     _usage_sink = fn
 
 
+def get_usage_sink():
+    """The installed sink, for providers that do NOT go through `chat()`.
+
+    `server/claude.py` talks to Anthropic directly (different wire format, different auth),
+    but its tokens must land in the same `llm_usage` table priced the same way — a second
+    accounting path is a second thing to drift, and the one that drifts is always the one
+    nobody is watching."""
+    return _usage_sink
+
+
 def _report_usage(usage: Dict[str, Any], model: str) -> Dict[str, Any]:
     """Normalise a provider usage block, cost it, and hand it to the sink."""
     try:

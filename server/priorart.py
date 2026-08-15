@@ -37,10 +37,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from typing import Any, Dict, List, Optional
 
-from server import gpu, usage
+from server import claude, gpu, usage
 from server.db import pool
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,22 @@ SCOUT_MEM = os.environ.get("SCOUT_MEM", "1g")
 SCOUT_CPUS = os.environ.get("SCOUT_CPUS", "2")
 SCOUT_PIDS = os.environ.get("SCOUT_PIDS", "256")
 SCOUT_TMPFS = os.environ.get("SCOUT_TMPFS", "1500m")
+# THE PERSISTENT PER-DISCUSSION WORKSPACE.
+#
+# The container stays ephemeral (`--rm`) — that is the safety boundary and it does not move.
+# What persists is a DIRECTORY mounted into it, one per discussion, so a repository cloned to
+# answer turn 3 is still there for turn 7. Without it, "does that repo have a Dockerfile?"
+# followed by "what are its npm scripts?" is two full clones of the same 800 MB, and the
+# second answer is slower than the first for no reason.
+#
+# On /data (the 117 TB array), not the NVMe root: these are other people's repositories, they
+# are bulk, and 242's root is the latency-sensitive tier.
+DISCUSS_ROOT = os.environ.get("DISCUSS_WORKSPACES_ROOT", "/data/builderapps/discuss")
+# Per-discussion cap. Enforced by MEASURING and pruning before each run rather than by a
+# filesystem quota: a quota needs a loopback image per discussion, and the failure mode of
+# this cap (we re-clone) is cheap, while the failure mode of no cap (an abandoned discussion
+# holding 4 GB of somebody's game assets, times a thousand) is the box filling up.
+DISCUSS_MAX_MB = int(os.environ.get("DISCUSS_WORKSPACE_MAX_MB", "3000"))
 ENABLED = os.environ.get("PRIOR_ART_ENABLED", "1").strip() not in ("0", "false", "no")
 
 # ONE scout container at a time across the box, for the same reason there is one beat slot:
@@ -214,6 +231,60 @@ async def _docker(cmd: List[str], timeout: float) -> tuple[int, str]:
     return proc.returncode, (out or b"").decode("utf-8", "replace")
 
 
+def workspace_dir(discussion_id: str) -> str:
+    """The per-discussion clone cache. `None`-safe: an untagged call gets no workspace and
+    simply runs against the container's tmpfs, exactly as before."""
+    did = re.sub(r"[^A-Za-z0-9_-]", "", str(discussion_id or ""))[:64]
+    return os.path.join(DISCUSS_ROOT, did) if did else ""
+
+
+def _dir_mb(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+        if total > DISCUSS_MAX_MB * 1024 * 1024 * 2:
+            break
+    return total // (1024 * 1024)
+
+
+def prepare_workspace(discussion_id: str) -> str:
+    """Create (and size-check) the workspace. Returns "" when there is none to give."""
+    d = workspace_dir(discussion_id)
+    if not d:
+        return ""
+    try:
+        os.makedirs(d, exist_ok=True)
+        size = _dir_mb(d)
+        if size > DISCUSS_MAX_MB:
+            logger.warning("discuss workspace %s is %d MB (cap %d) — pruning it",
+                           discussion_id, size, DISCUSS_MAX_MB)
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d, exist_ok=True)
+        # The container runs unprivileged; the directory has to be writable by that uid.
+        os.chown(d, RUN_UID, RUN_UID)
+    except PermissionError:
+        logger.debug("could not chown %s (not root?)", d)
+    except Exception as e:  # noqa: BLE001 — no workspace is a slower scout, not a failure
+        logger.warning("discuss workspace %s unusable (%s) — running without one",
+                       discussion_id, e)
+        return ""
+    return d
+
+
+def reap_workspace(discussion_id: str) -> None:
+    """Delete a discussion's clone cache. Called when the discussion is BUILT or DELETED —
+    a stale multi-gigabyte checkout per abandoned conversation would quietly eat the box, and
+    242 already runs ~190 containers."""
+    d = workspace_dir(discussion_id)
+    if d and os.path.isdir(d):
+        shutil.rmtree(d, ignore_errors=True)
+        logger.info("reaped the discuss workspace for %s", discussion_id)
+
+
 async def scout(queries: List[str], *, repos: Optional[List[str]] = None,
                 tag: str = "") -> dict:
     """Run ONE scout container to completion and return its document.
@@ -246,8 +317,15 @@ async def scout(queries: List[str], *, repos: Optional[List[str]] = None,
         # same `--rm`, same caps, same absence of credentials, different instruction.
         "-e", f"SCOUT_REPOS={json.dumps(repos or [])}",
         "-e", f"SCOUT_DEADLINE_SEC={SCOUT_DEADLINE_SEC}",
-        IMAGE, "/app/scout.py",
     ]
+    ws = prepare_workspace(tag)
+    if ws:
+        # The ONE writable mount, and it holds nothing but clones of public repositories.
+        # Note what is still absent from this argv: no Docker socket, and no credential of
+        # any kind — the persistent workspace changes what survives the container, not what
+        # the container is trusted with.
+        cmd += ["-v", f"{ws}:/work", "-e", "SCOUT_WORKDIR=/work", "-e", "SCOUT_PERSIST=1"]
+    cmd += [IMAGE, "/app/scout.py"]
     t0 = time.monotonic()
     async with _slot:
         try:
@@ -385,24 +463,51 @@ async def propose(seed: str, canvas_hint: str, cand: dict) -> dict:
     offer assembled from the evidence if the model is unavailable — an offer written from
     measurements is worse prose and exactly as true."""
     out = {"headline": "", "already": "", "we_add": "", "cost": "", "reply": "",
-           "cost_usd": 0.0}
+           "cost_usd": 0.0, "model": ""}
     user = (f'What they asked for: "{(seed or "")[:800]}"\n\n'
             + (f"What the discussion has settled so far:\n{canvas_hint[:1500]}\n\n"
                if canvas_hint else "")
             + "THE EVIDENCE the scout measured (this is all you know about it):\n"
             + evidence_block(cand))
+    data: Dict[str, Any] = {}
+
+    # CLAUDE FIRST, KIMI ALWAYS BEHIND IT.
+    #
+    # This is the one call in the whole feature where the better model earns its cost: it
+    # reads a repository's measurements and decides how to put an offer to a person — a
+    # judgement about prose and trade-offs, made ONCE per scout. Ordinary conversation turns
+    # stay on Kimi, where ~$0.02 and instant is the right answer and always will be.
+    #
+    # The credential is a SUBSCRIPTION OAuth token shared with a human's own Claude usage, so
+    # 429 is routine rather than exceptional (`server/claude.py` documents the live evidence).
+    # `judge()` returning None is therefore a normal outcome and the Kimi path below is not a
+    # fallback for emergencies — it is the path this takes whenever Mike is busy.
     try:
         with usage.capture() as recs:
-            raw = await gpu.chat(
-                [{"role": "system", "content": _PROPOSE_SYSTEM},
-                 {"role": "user", "content": user}],
-                schema={"type": "object"}, temperature=0.5, num_predict=1200,
-                timeout=120, max_retries=2)
-        out["cost_usd"] = sum(float(r.get("cost_usd") or 0) for r in recs)
-        data = _extract_json(raw)
+            res = await claude.judge(_PROPOSE_SYSTEM, user, max_tokens=1600)
+        if res:
+            out["cost_usd"] = sum(float(r.get("cost_usd") or 0) for r in recs)
+            out["model"] = res["model"]
+            data = claude.extract_json(res["text"])
     except Exception as e:  # noqa: BLE001
-        logger.info("prior-art proposal fell back to the evidence: %s", e)
+        logger.info("prior-art proposal: Claude pass unusable (%s) — using the default model",
+                    e)
         data = {}
+
+    if not data:
+        try:
+            with usage.capture() as recs:
+                raw = await gpu.chat(
+                    [{"role": "system", "content": _PROPOSE_SYSTEM},
+                     {"role": "user", "content": user}],
+                    schema={"type": "object"}, temperature=0.5, num_predict=1200,
+                    timeout=120, max_retries=2)
+            out["cost_usd"] += sum(float(r.get("cost_usd") or 0) for r in recs)
+            out["model"] = out["model"] or gpu.LLM_MODEL
+            data = _extract_json(raw)
+        except Exception as e:  # noqa: BLE001
+            logger.info("prior-art proposal fell back to the evidence: %s", e)
+            data = {}
     out["headline"] = str(data.get("headline") or "")[:200]
     out["already"] = str(data.get("already") or "")[:800]
     out["we_add"] = str(data.get("we_add") or "")[:800]
@@ -539,6 +644,7 @@ def summary(pa: dict) -> dict:
         "cost_usd": round(float(pa.get("cost_usd") or 0), 4),
         "seconds": pa.get("seconds") or 0,
         "research_seconds": pa.get("research_seconds") or 0,
+        "proposal_model": pa.get("proposal_model") or "",
         "considered": pa.get("considered") or 0,
         "decided_at": pa.get("decided_at") or 0,
         "error": pa.get("error") or "",
@@ -645,7 +751,11 @@ async def run_for_discussion(discussion_id: str, seed: str, canvas_hint: str = "
 
         prop = await propose(seed, canvas_hint, pick)
         pa["cost_usd"] = round(float(pa["cost_usd"]) + float(prop.get("cost_usd") or 0), 6)
+        # WHICH MODEL WROTE THIS. The room now runs two of them; a cost number with no model
+        # beside it is a number nobody can check.
+        pa["proposal_model"] = prop.get("model") or ""
         prop.pop("cost_usd", None)
+        prop.pop("model", None)
         pa.update({"status": "proposed", "pick": pick.get("full_name"),
                    "candidate": slim(pick), "proposal": prop})
         pa["seconds"] = round(time.monotonic() - t0, 1)
