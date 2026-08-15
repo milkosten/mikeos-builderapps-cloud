@@ -81,13 +81,15 @@ def _row(row) -> Optional[dict]:
     if row is None:
         return None
     d = dict(row)
-    for k in ("messages", "canvas", "draft_answers"):
+    for k in ("messages", "canvas", "draft_answers", "prior_art"):
         v = d.get(k)
         if isinstance(v, str):
             try:
                 d[k] = json.loads(v)
             except Exception:  # noqa: BLE001 — a corrupt cell must not 500 the room
                 d[k] = [] if k == "messages" else {}
+    if not isinstance(d.get("prior_art"), dict):
+        d["prior_art"] = {}
     d["cost_usd"] = float(d.get("cost_usd") or 0)
     return d
 
@@ -309,6 +311,58 @@ def merge_canvas(canvas: dict, proposal: dict, decided: List[str],
 
 
 # ---------------------------------------------------------------------------
+# phase 35 — the STARTING POINT, on the canvas
+# ---------------------------------------------------------------------------
+# `basis` is a canvas cell the MODEL CANNOT TOUCH. It is deliberately not in `FIELDS`, so
+# `merge_canvas` never proposes it, never overwrites it and never lists it in `decided` — it
+# is written in exactly one place, by the human's own click on the prior-art proposal, and it
+# survives every later turn untouched. (`changelog` is already a non-FIELDS key on the canvas
+# for the same structural reason.)
+#
+# Both answers are recorded, not just yes. "We looked, and you chose to build it fresh" is a
+# decision the pipeline and a later reader are owed just as much as "we started from X" — and
+# a declined suggestion that leaves no trace is one that gets made again next week.
+def record_basis(canvas: dict, *, adopted: bool, candidate: Optional[dict] = None) -> dict:
+    canvas = dict(canvas or {})
+    changelog = list(canvas.get("changelog") or [])
+    if adopted and candidate:
+        lic = (candidate.get("licence") or {}).get("spdx") or "unknown licence"
+        repo = candidate.get("full_name") or ""
+        value = f"Adopted from {repo} ({lic}) and extended"
+        canvas["basis"] = {
+            "value": value, "agreed": True, "source": "prior_art", "adopted": True,
+            "repo": repo, "url": candidate.get("url") or "",
+            "licence": lic,
+            "licence_source": (candidate.get("licence") or {}).get("source") or "",
+            "commit": candidate.get("head_sha") or "",
+            "verdict": candidate.get("verdict") or "",
+            "headline": candidate.get("headline") or "",
+        }
+        changelog.append({
+            "field": "basis", "label": "Starting point",
+            "from": "Built from scratch", "to": value,
+            "because": f"you accepted the prior-art proposal — {candidate.get('headline') or ''}",
+        })
+    else:
+        repo = (candidate or {}).get("full_name") or ""
+        value = "Built from scratch" + (f" — declined starting from {repo}" if repo else "")
+        canvas["basis"] = {"value": value, "agreed": True, "source": "prior_art",
+                           "adopted": False, "repo": repo,
+                           "url": (candidate or {}).get("url") or ""}
+        changelog.append({
+            "field": "basis", "label": "Starting point", "from": "", "to": value,
+            "because": "you chose to build it from scratch",
+        })
+    canvas["changelog"] = changelog[-25:]
+    return canvas
+
+
+def basis(canvas: dict) -> dict:
+    cell = (canvas or {}).get("basis")
+    return cell if isinstance(cell, dict) else {}
+
+
+# ---------------------------------------------------------------------------
 # the model turn
 # ---------------------------------------------------------------------------
 _SYSTEM = """You are the founding product lead running a short PRE-BUILD discussion with \
@@ -405,6 +459,13 @@ def _render_canvas(canvas: dict) -> str:
         text = v if isinstance(v, str) else "; ".join(v)
         lines.append(f"- {FIELD_LABELS[name]}{mark}: {text}")
     return "\n".join(lines)
+
+
+def canvas_hint(canvas: dict) -> str:
+    """The canvas as plain lines, for callers outside this module (the prior-art scout's
+    classifier and its proposal writer). Public wrapper so the scout does not reach into a
+    private renderer that exists to build a prompt for a different model."""
+    return _render_canvas(canvas) if has_content(canvas) else ""
 
 
 def _render_thread(messages: List[dict], limit: int = 24) -> List[Dict[str, str]]:
@@ -779,6 +840,28 @@ def compose_brief(disc: dict) -> str:
                      + "\n".join(f"- {f}" for f in features))
     if stack:
         parts.append(f"\nData, accounts and stack: {stack}")
+
+    # PHASE 35 — the starting point. When the user accepted prior art, the pipeline must be
+    # told before it writes a single document, because every later step changes: the vision is
+    # about an app that already half-exists, the backlog is the DELTA rather than the whole
+    # product, and "build a login page" may already be done. A brief that omitted this would
+    # have the strategy pass cheerfully re-specify the thing we just imported.
+    bas = basis(canvas)
+    if bas.get("adopted") and bas.get("repo"):
+        parts.append(
+            f"\nSTARTING POINT — THIS APP IS NOT BEING BUILT FROM SCRATCH.\n"
+            f"It is adopted from the open-source project {bas['repo']} "
+            f"({bas.get('licence') or 'licence unknown'}"
+            + (f", upstream commit {bas['commit']}" if bas.get("commit") else "") + "), "
+            f"{bas.get('url') or ''}\n"
+            "That code is ALREADY IMPORTED, deployed and green before any of the work below "
+            "starts. Treat everything it already does as DONE: do not re-plan it, do not "
+            "re-specify it, and do not rewrite it. The work is the owner's features ON TOP of "
+            "it, and any change must fit the existing code rather than replace it.")
+    elif bas.get("repo") and not bas.get("adopted"):
+        parts.append(
+            f"\nStarting point: FROM SCRATCH. The owner was offered {bas['repo']} as an "
+            "existing base and declined it — build this fresh.")
     if out_of_scope:
         parts.append("\nExplicitly OUT OF SCOPE — do not build these:\n"
                      + "\n".join(f"- {f}" for f in out_of_scope))

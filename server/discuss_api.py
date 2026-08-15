@@ -15,6 +15,7 @@ of the thread — the bug class that made the builder thread lose history three 
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import List, Optional
@@ -22,12 +23,39 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from server import discuss
+from server import discuss, priorart
 from server.identity import authenticate
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Background scouts, keyed by discussion. Held so a second `POST /api/discussions` for the
+# same room (a double-click, a retried request) cannot start a second container, and so the
+# task is not garbage-collected mid-flight — an asyncio task nobody holds a reference to can
+# be collected while it is awaiting, which is a genuinely miserable bug to find.
+_scouts: dict[str, asyncio.Task] = {}
+
+
+def _scout_in_background(discussion_id: str, seed: str, canvas_hint: str = "") -> None:
+    """Start the prior-art scout for a room WITHOUT making the user wait for it.
+
+    The opening turn is ~15 seconds and is the product; the scout is 1-2 minutes of cloning
+    strangers' repositories. Blocking one on the other would make every first turn — including
+    the overwhelming majority where the classifier says "just build it" — feel broken.
+
+    So the room answers immediately and the scout lands later, as its own event. The SPA polls
+    `prior_art.status` and shows the proposal when (and only when) there is one.
+    """
+    if not priorart.ENABLED:
+        return
+    old = _scouts.get(discussion_id)
+    if old and not old.done():
+        return
+    task = asyncio.create_task(
+        priorart.run_for_discussion(discussion_id, seed, canvas_hint))
+    _scouts[discussion_id] = task
+    task.add_done_callback(lambda t: _scouts.pop(discussion_id, None))
 
 
 class StartBody(BaseModel):
@@ -64,6 +92,24 @@ async def _uid(request: Request) -> str:
     if not uid:
         raise HTTPException(status_code=401, detail="unauthorized")
     return uid
+
+
+def _public(disc: dict) -> dict:
+    """The discussion as the BROWSER sees it: `prior_art` replaced by its summary.
+
+    Every route in this router returns the whole row, and the SPA restores a room from exactly
+    the payload it got back from the last turn — that contract is what stops a reload and a
+    live turn disagreeing about the thread. Phase 35 hangs a research dossier off that row
+    (five candidates, their evidence and the reasons each was rejected), and shipping all of
+    it on every turn would quietly multiply the size of the single most frequent response in
+    the product. The summary carries the proposal, the decision and a one-line "we also looked
+    at" for the rest — which is everything the UI renders.
+    """
+    if not isinstance(disc, dict):
+        return disc
+    out = dict(disc)
+    out["prior_art"] = priorart.summary(disc.get("prior_art") or {})
+    return out
 
 
 async def _owned(discussion_id: str, request: Request) -> dict:
@@ -135,6 +181,10 @@ async def start_discussion(body: StartBody, request: Request):
     opening = [{"role": "user", "text": seed[:4000], "ts": int(time.time() * 1000)}]
     disc = await discuss.save(disc["id"], messages=opening, canvas={},
                               title=_title_for(disc)) or disc
+    # PHASE 35 — go and look for prior art, quietly, while the opening turn is being written.
+    # Started BEFORE the turn so the two run concurrently: the scout's minute is mostly spent
+    # waiting on GitHub and on `git clone`, which is exactly the minute the model is thinking.
+    _scout_in_background(disc["id"], seed)
     try:
         disc = await _apply_turn(disc)
     except Exception as e:  # noqa: BLE001 — the room must exist even if the model was down
@@ -146,7 +196,7 @@ async def start_discussion(body: StartBody, request: Request):
         disc = await discuss.save(disc["id"], messages=messages, canvas={},
                                   title=_title_for(disc)) or disc
         logger.warning("discussion %s opened without a draft: %s", disc["id"], e)
-    return disc
+    return _public(disc)
 
 
 @router.get("/api/discussions")
@@ -160,7 +210,7 @@ async def list_discussions(request: Request):
 
 @router.get("/api/discussions/{discussion_id}")
 async def get_discussion(discussion_id: str, request: Request):
-    return await _owned(discussion_id, request)
+    return _public(await _owned(discussion_id, request))
 
 
 @router.post("/api/discussions/{discussion_id}/messages")
@@ -201,16 +251,16 @@ async def say(discussion_id: str, body: SayBody, request: Request):
         except Exception:  # noqa: BLE001 — a stale scratchpad must never fail a real turn
             logger.warning("could not clear the answer draft for %s", discussion_id)
     try:
-        return await _apply_turn(disc, "" if answers else text, answers or None)
+        return _public(await _apply_turn(disc, "" if answers else text, answers or None))
     except Exception as e:  # noqa: BLE001
         logger.exception("turn failed for %s", discussion_id)
         messages = list(disc.get("messages") or [])
         messages.append({"role": "assistant", "ts": int(time.time() * 1000), "error": True,
                          "text": "That didn't get through to the model — try again in a "
                                  f"moment. ({e})"[:400]})
-        return await discuss.save(disc["id"], messages=messages,
-                                  canvas=disc.get("canvas") or {},
-                                  title=disc.get("title") or "") or disc
+        return _public(await discuss.save(disc["id"], messages=messages,
+                                          canvas=disc.get("canvas") or {},
+                                          title=disc.get("title") or "") or disc)
 
 
 @router.put("/api/discussions/{discussion_id}/answer_draft")
@@ -227,6 +277,59 @@ async def save_answer_draft(discussion_id: str, body: DraftBody, request: Reques
     except ValueError:
         raise HTTPException(status_code=413, detail="answer draft too large")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# phase 35 — the prior-art proposal
+# ---------------------------------------------------------------------------
+class PriorArtBody(BaseModel):
+    """`accept` or `decline`. Nothing else: the user is not choosing between five repos, they
+    are answering one yes/no about one candidate the scout already argued for with evidence.
+    A repo picker would be a worse product AND a much larger attack surface — the URL that
+    gets cloned into someone's account would then come from the browser."""
+    action: str = Field(..., pattern="^(accept|decline)$")
+
+
+@router.get("/api/discussions/{discussion_id}/prior_art")
+async def get_prior_art(discussion_id: str, request: Request):
+    """What the scout found, if anything. POLLED by the SPA while `status` is `classifying`
+    or `scouting`, so the payload is the SUMMARY — the full evidence for every rejected
+    candidate on every poll would be tens of kilobytes of JSON for a card nobody has opened."""
+    disc = await _owned(discussion_id, request)
+    return {"id": disc["id"], "prior_art": priorart.summary(disc.get("prior_art") or {})}
+
+
+@router.post("/api/discussions/{discussion_id}/prior_art")
+async def decide_prior_art(discussion_id: str, body: PriorArtBody, request: Request):
+    """Accept or decline the proposal. Both answers are terminal and both are recorded.
+
+    DECLINING MUST NOT DERAIL THE CONVERSATION. It writes one canvas cell and returns; it
+    does not take a model turn, does not post a message, does not ask why, and does not
+    re-open the question later. The user said no to a suggestion, which is the single most
+    likely thing they will do with it — that path has to be one click and then silence.
+    """
+    disc = await _owned(discussion_id, request)
+    pa = dict(disc.get("prior_art") or {})
+    if pa.get("status") not in ("proposed", "accepted", "declined"):
+        raise HTTPException(status_code=409,
+                            detail="there is no prior-art proposal on this discussion")
+    cand = pa.get("candidate") or {}
+    accepted = body.action == "accept"
+    pa["status"] = "accepted" if accepted else "declined"
+    pa["decision"] = body.action
+    pa["decided_at"] = int(time.time() * 1000)
+    await priorart.save(discussion_id, pa)
+
+    # THE CHOICE GOES ON THE CANVAS, both ways — see `discuss.record_basis`. It is the one
+    # decision in this room that changes which PIPELINE runs, so it cannot live only in a
+    # jsonb column the brief never reads.
+    canvas = discuss.record_basis(disc.get("canvas") or {}, adopted=accepted,
+                                  candidate=cand)
+    saved = await discuss.save(discussion_id, messages=disc.get("messages") or [],
+                               canvas=canvas, title=disc.get("title") or "")
+    out = dict(saved or disc)
+    out["prior_art"] = pa
+    return _public(out)
 
 
 @router.get("/api/discussions/{discussion_id}/brief")

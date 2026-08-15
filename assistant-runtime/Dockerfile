@@ -71,6 +71,17 @@ RUN useradd -r -u 10001 -m -d /home/assistant -s /bin/bash assistant \
 COPY beat.py /app/beat.py
 RUN chmod 0555 /app/beat.py
 
+# THE PRIOR-ART SCOUT (phase 35). A SECOND program in the same image, reached with
+# `--entrypoint python3 … /app/scout.py`, because it wants the identical workbench (git, node,
+# npm, ripgrep, a real filesystem) and none of the identity.
+#
+# It is launched with NO credential at all — no ASSISTANT_TOKEN, no CONTROL_URL, no GitHub
+# token, no workspace key. It clones strangers' repositories to decide whether one of them is
+# a good starting point for a user's app, so the only safe assumption is that everything it
+# touches is hostile. Its entire output is a JSON document on stdout.
+COPY scout.py /app/scout.py
+RUN chmod 0555 /app/scout.py
+
 # THE BROWSER. `curl` in this image proves a process answered; `mikeweb` proves the page
 # actually works — it drives a real headless Chrome and reports rendered text, JS console
 # errors and failed requests. Deliberately in addition to curl, never instead of it.

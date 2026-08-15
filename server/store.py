@@ -85,6 +85,33 @@ async def set_project_title(project_id: str, title: str) -> None:
     )
 
 
+async def set_project_adopted(project_id: str, adopted: dict) -> None:
+    """Phase 35 — record that this app is DERIVED WORK, in the platform's own database.
+
+    Deliberately not only a NOTICE file in the repo: a file can be deleted by the next agent
+    that tidies the tree, and then nothing in the product says where the code came from. This
+    column is what makes "where did this come from?" answerable months later, and it is
+    verified like every other write here rather than trusted.
+    """
+    res = await pool().execute(
+        "UPDATE builderapps.projects SET adopted=$2::jsonb, updated_at=now() WHERE id=$1",
+        project_id, json.dumps(adopted or {}),
+    )
+    if res != "UPDATE 1":
+        raise RuntimeError(f"set_project_adopted affected {res!r} for {project_id}")
+
+
+async def get_project_adopted(project_id: str) -> dict:
+    raw = await pool().fetchval(
+        "SELECT adopted FROM builderapps.projects WHERE id=$1", project_id)
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return {}
+    return raw or {}
+
+
 async def set_project_status(project_id: str, status: str) -> None:
     res = await pool().execute(
         "UPDATE builderapps.projects SET status=$2, updated_at=now() WHERE id=$1",

@@ -23,10 +23,11 @@ import hashlib
 import logging
 import os
 import secrets
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from server import deployer, gitea, naming, store, workspace
+from server import adopt, chrome, deployer, gitea, naming, store, workspace
 from server import workspace_store as W
 from server.harness import backlog as backlog_mod
 from server.harness import agentic, codegen, engine, runtime_qa
@@ -683,6 +684,278 @@ async def run_create(project_id: str, run_id: int, user_id: str, email: Optional
 
             # Assemble the remainder (data layer + features + deploy + QA + finalize) and run,
             # continuing the same run_id at the next idx.
+            tail_steps: list[Step] = [("data_layer", _s_data_layer(brief))]
+            for i, feat in enumerate(backlog_items):
+                tail_steps.append((f"build_{i+1:02d}", _s_feature(i, feat, brief)))
+            tail_steps.append(("final_deploy", _s_deploy("redeploying the finished stack",
+                                                         "deploying", final=True)))
+            tail_steps.append(("runtime_qa", _s_qa(brief)))
+            tail_steps.append(("finalize", _s_finalize()))
+
+            total = len(prelude_steps) + len(tail_steps)
+            await store.set_run_total(run_id, total)
+            state = await engine.run_partial(project_id, run_id, tail_steps, emit,
+                                             base_idx=len(prelude_steps), state=state,
+                                             finish=True, total=total)
+            return state
+        except Exception:
+            await store.set_project_status(project_id, "failed")
+            raise
+
+
+# --------------------------------------------------------------------------
+# phase 35 — the ADOPT & EXTEND pipeline
+#
+# Same engine, same events, same backlog loop. Four steps replace the "repo from template ->
+# deploy skeleton" prelude, and their ORDER is the single most important thing in this phase:
+#
+#     import_upstream   the real history into the user's Gitea, licence and NOTICE and all
+#     fit_contract      a thin adapter, NOT a rewrite (server/adopt.py)
+#     upstream_green    DEPLOY THE UNMODIFIED UPSTREAM AND PROVE IT WORKS
+#     provenance        the permanent record, on the board and in the database
+#     ... then strategy / backlog / build_NN / final_deploy / qa / finalize, unchanged.
+#
+# `upstream_green` before any feature work is not a nicety. If the adopted project cannot
+# boot on this platform, that is a fact worth two minutes and a clear failure — not something
+# to discover after twelve LLM features have been layered on top of it, when nobody can tell
+# whether we adopted something broken or broke something that worked.
+# --------------------------------------------------------------------------
+def _s_import_upstream(cand: dict, title: str, email: Optional[str]):
+    async def step(ctx: Ctx):
+        ctx.emit({"type": "progress", "stage": "adopt",
+                  "detail": f"importing {cand.get('full_name')} into your own repository, "
+                            "with its history and its licence"})
+        info = await gitea.create_empty_repo(ctx.state["gitea_user"], ctx.project_id)
+        ctx.state["repo"] = info["repo"]
+        ctx.emit({"type": "repo", "full_name": info["full_name"]})
+        imp = await adopt.import_upstream(
+            ctx.project_id,
+            gitea_user=ctx.state["gitea_user"], repo=info["repo"],
+            token=ctx.state["gitea_token"],
+            upstream_url=cand.get("url") or "",
+            author_name=ctx.state["gitea_user"],
+            author_email=email or f"{ctx.state['gitea_user']}@builderapps.osmike.com")
+        ctx.state["workspace"] = str(workspace.path_for(ctx.project_id))
+        ctx.state["import"] = imp
+        ctx.emit({"type": "commit",
+                  "message": f"imported {cand.get('full_name')} @ "
+                             f"{(imp.get('upstream_commit') or '')[:8]}"})
+        return (f"imported {cand.get('full_name')} @ {(imp.get('upstream_commit') or '')[:8]} "
+                f"— {imp.get('commits')} commits of real history, {imp.get('size_mb')} MB")
+    return step
+
+
+def _s_adopt_checkout(email: Optional[str]):
+    """Idempotent re-entry point. The import already left a checkout in place; this exists so
+    a RESUMED run (which skips the import) still has one."""
+    async def step(ctx: Ctx):
+        p = workspace.path_for(ctx.project_id)
+        if (p / ".git").is_dir():
+            ctx.state["workspace"] = str(p)
+            return f"checkout already present at {p}"
+        ws = await workspace.checkout(
+            ctx.project_id, ctx.state["gitea_user"], ctx.state["repo"],
+            ctx.state["gitea_token"], author_name=ctx.state["gitea_user"],
+            author_email=email or f"{ctx.state['gitea_user']}@builderapps.osmike.com")
+        ctx.state["workspace"] = str(ws)
+        return f"re-checked out to {ws}"
+    return step
+
+
+def _s_fit_contract(cand: dict):
+    async def step(ctx: Ctx):
+        ctx.emit({"type": "progress", "stage": "adopt",
+                  "detail": "fitting it to the platform contract — /health, port 3000, the "
+                            "preview CSP and the migration runner, added ALONGSIDE the "
+                            "upstream code rather than into it"})
+        proj = await store.get_project(ctx.project_id)
+        sv = await adopt.fit_contract(ctx.project_id, cand, ctx.state.get("import") or {},
+                                      (proj or {}).get("title") or "")
+        ctx.state["adapter"] = sv
+        if not sv.get("licence_preserved"):
+            # Not fatal — the scout already proved the licence — but it must be SAID, because
+            # "we kept the licence" is a promise this phase makes to the user.
+            logger.warning("adopt %s: no LICENSE file found in the upstream tree",
+                           ctx.project_id)
+        await _commit(ctx, "chore: fit the platform contract (adapter only; upstream "
+                           "source unchanged)")
+        return (f"adapter mode={sv.get('mode')}"
+                + (f", static roots {sv.get('static_roots')}" if sv.get("mode") == "static"
+                   else f", upstream entry {sv.get('server_entry') or 'npm start'}")
+                + (f", build step `{sv.get('build_script')}`" if sv.get("has_build") else "")
+                + (f", LICENSE preserved ({sv.get('licence_file')})"
+                   if sv.get("licence_preserved") else ", NO LICENSE FILE FOUND"))
+    return step
+
+
+async def _page_is_real(project_id: str) -> dict:
+    """Is there actually a page there? `/health` proves the ADAPTER answered — and in adopt
+    mode the adapter is ours, so a green health check proves almost nothing about the app we
+    just imported. This is the check that does."""
+    import httpx
+    url = f"https://{project_id}.{deployer.SITES_BASE}/"
+    out = {"url": url, "status": 0, "bytes": 0, "ok": False, "error": ""}
+    try:
+        async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as c:
+            r = await c.get(url)
+        out["status"] = r.status_code
+        body = r.content or b""
+        out["bytes"] = len(body)
+        out["ok"] = r.status_code < 400 and len(body) >= 200
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:200]
+    return out
+
+
+def _s_upstream_green():
+    """THE ORDERING GUARANTEE. Deploy what we imported, unchanged, and refuse to go further
+    until it is actually serving something."""
+    async def step(ctx: Ctx):
+        await _load_secrets_into_state(ctx)
+        await store.set_project_status(ctx.project_id, "deploying")
+        ctx.emit({"type": "progress", "stage": "deploy",
+                  "detail": "deploying the UNMODIFIED upstream — before a single feature is "
+                            "added, so that a project that cannot boot is discovered now"})
+        proj = await store.get_project(ctx.project_id)
+        res = await deployer.deploy(
+            ctx.project_id, Path(ctx.state["workspace"]),
+            db_password=ctx.state["db_password"], app_secret=ctx.state["app_secret"],
+            title=(proj or {}).get("title", ""))
+        ctx.state["public_health"] = res["public_health"]
+        ctx.emit({"type": "deploy", "url": f"https://{ctx.project_id}.{deployer.SITES_BASE}/",
+                  "health": res["public_health"]})
+
+        page = await _page_is_real(ctx.project_id)
+        ctx.state["upstream_page"] = page
+        if not page["ok"]:
+            raise RuntimeError(
+                "the imported project deployed but is not serving a page: "
+                f"GET / -> HTTP {page['status']}, {page['bytes']} bytes"
+                + (f" ({page['error']})" if page["error"] else "")
+                + ". Stopping here rather than building features on top of an app that does "
+                  "not run.")
+
+        # Best-effort, and it is EVIDENCE rather than a gate: a real browser saying "1,842
+        # characters rendered, no console errors" is what makes "green" mean something to a
+        # human reading the run afterwards.
+        seen = ""
+        try:
+            qa = await chrome.qa_run(f"https://{ctx.project_id}.{deployer.SITES_BASE}/",
+                                     exercise=False)
+            text = str((qa or {}).get("text") or "")
+            errs = (qa or {}).get("errors") or []
+            ctx.state["upstream_qa"] = {"chars": len(text), "console_errors": len(errs)}
+            seen = (f"; browser: {len(text)} chars rendered, "
+                    f"{len(errs)} console error(s)")
+        except Exception as e:  # noqa: BLE001
+            logger.info("adopt %s: browser check skipped (%s)", ctx.project_id, e)
+
+        await W.upsert_by_ext_key(
+            ctx.project_id, "upstream_green", _WS_ACTOR, kind="testcase",
+            title="The unmodified upstream deploys and serves a page",
+            body_md=(f"Deployed the imported project with no feature work on top.\n\n"
+                     f"- `/health`: {res['public_health']}\n"
+                     f"- `GET /`: HTTP {page['status']}, {page['bytes']} bytes\n"
+                     f"{seen}\n\n"
+                     "This ran BEFORE the backlog, on purpose: if the adopted project cannot "
+                     "boot here, that is a two-minute failure rather than a twelve-feature "
+                     "mystery."),
+            status="done")
+        return (f"UPSTREAM GREEN — health {res['public_health']}, "
+                f"GET / -> HTTP {page['status']} ({page['bytes']} bytes){seen}")
+    return step
+
+
+def _s_provenance(cand: dict, discussion_id: str = ""):
+    """Permanent, in three places: the projects table, the shared board, and the NOTICE file
+    that `fit_contract` already wrote into the repo."""
+    async def step(ctx: Ctx):
+        imp = ctx.state.get("import") or {}
+        sv = ctx.state.get("adapter") or {}
+        lic = (cand.get("licence") or {}).get("spdx") or ""
+        record = {
+            "repo": cand.get("full_name") or "",
+            "url": cand.get("url") or imp.get("upstream_url") or "",
+            "licence": lic,
+            "licence_source": (cand.get("licence") or {}).get("source") or "",
+            "upstream_commit": imp.get("upstream_commit") or "",
+            "upstream_branch": imp.get("upstream_branch") or "",
+            "upstream_commits": imp.get("commits") or 0,
+            "stars": cand.get("stars") or 0,
+            "loc": (cand.get("evidence") or {}).get("loc") or 0,
+            "verdict": cand.get("verdict") or "",
+            "headline": cand.get("headline") or "",
+            "adapter_mode": sv.get("mode") or "",
+            "licence_preserved": bool(sv.get("licence_preserved")),
+            "discussion_id": discussion_id or "",
+            "imported_at": int(time.time() * 1000),
+        }
+        await store.set_project_adopted(ctx.project_id, record)
+        body = (
+            f"**This app is derived work.** It was built by adopting an existing open-source "
+            f"project and adding features on top of it.\n\n"
+            f"- Upstream: [{record['repo']}]({record['url']})\n"
+            f"- Licence: **{lic}** (found in {record['licence_source']}) — permissive, which "
+            "is why it could be adopted at all; a GPL/AGPL base would have been refused "
+            "because it would have made this app copyleft too.\n"
+            f"- Upstream commit: `{record['upstream_commit']}` on `"
+            f"{record['upstream_branch']}` ({record['upstream_commits']} commits of history, "
+            "imported in full)\n"
+            f"- What the scout measured: {record['headline']}\n"
+            f"- How it runs here: the platform adapter in `platform/server.js` "
+            f"(mode `{record['adapter_mode']}`). The upstream source was NOT modified to fit "
+            "the platform.\n\n"
+            "The upstream `LICENSE` is preserved in the repository and `NOTICE` records the "
+            "same facts next to the code. The original authors did not endorse this app.")
+        await W.upsert_by_ext_key(ctx.project_id, "provenance", _WS_ACTOR, kind="doc",
+                                  title=f"Adopted from {record['repo']} ({lic})",
+                                  body_md=body, status="done")
+        return f"provenance recorded: {record['repo']} @ {record['upstream_commit'][:8]} ({lic})"
+    return step
+
+
+async def run_adopt(project_id: str, run_id: int, user_id: str, email: Optional[str],
+                    candidate: dict, emit: Callable[[dict], None], *,
+                    discussion_id: str = "", resume: bool = False) -> dict:
+    """The adopt-&-extend create pipeline. Same two-pass assembly as `run_create` (the step
+    list must be known up front for stable indices, and the backlog only exists after the
+    strategy pass has written the technical plan)."""
+    proj = await store.get_project(project_id)
+    brief = (proj or {}).get("prompt", "") or ""
+    title = (proj or {}).get("title") or ""
+    resumed_state = await rehydrate_state(project_id, user_id, email) if resume else None
+
+    lk = workspace.lock(project_id)
+    async with lk:
+        try:
+            prelude_steps: list[Step] = [
+                ("ensure_gitea_account", _s_ensure_gitea(user_id, email)),
+                ("import_upstream", _s_import_upstream(candidate, title, email)),
+                ("adopt_checkout", _s_adopt_checkout(email)),
+                ("allocate_secrets", _s_secrets()),
+                ("fit_contract", _s_fit_contract(candidate)),
+                # …and only now, with nothing of ours in it but an adapter:
+                ("upstream_green", _s_upstream_green()),
+                ("provenance", _s_provenance(candidate, discussion_id)),
+                ("strategy_artifacts", _s_strategy(brief)),
+                ("parse_backlog", _s_parse_backlog()),
+            ]
+            state = await engine.run_partial(project_id, run_id, prelude_steps, emit,
+                                             base_idx=0, state=resumed_state)
+            backlog_items = state.get("backlog", [])
+            if not backlog_items:
+                run_row = await store.get_run(run_id)
+                stored_total = int((run_row or {}).get("total_steps") or 0)
+                backlog_items = backlog_mod.parse_backlog(
+                    state.get("tech_plan", "") or "", cap=_MAX_FEATURES)
+                backlog_items = _stabilize_backlog(backlog_items, stored_total,
+                                                   len(prelude_steps))
+                if not backlog_items:
+                    raise RuntimeError(
+                        "cannot resume: no backlog and no TECHNICAL-PLAN.md to derive one")
+                state["backlog"] = backlog_items
+            state["feature_total"] = len(backlog_items)
+
             tail_steps: list[Step] = [("data_layer", _s_data_layer(brief))]
             for i, feat in enumerate(backlog_items):
                 tail_steps.append((f"build_{i+1:02d}", _s_feature(i, feat, brief)))

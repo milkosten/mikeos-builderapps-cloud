@@ -49,6 +49,15 @@ _STEP_TIMEOUTS: dict[str, float] = {
     "ship_checkout": 600,
     "ship_deploy": 3600,
     "ship_record": 120,
+    # adopt & extend (phase 35). `import_upstream` is a FULL clone of a stranger's repository
+    # plus a push into Gitea; `upstream_green` is a docker build of somebody else's project
+    # (which may run their bundler) followed by the health gate AND a real page fetch — about
+    # a normal deploy plus a build step.
+    "import_upstream": 900,
+    "adopt_checkout": 600,
+    "fit_contract": 300,
+    "upstream_green": 2400,
+    "provenance": 120,
 }
 
 
@@ -77,6 +86,10 @@ CRITICAL_STEPS = frozenset({
     # ship-HEAD: every step is load-bearing — you cannot skip the checkout, the health gate
     # or the record and still have shipped anything.
     "ship_checkout", "ship_deploy", "ship_record",
+    # adopt & extend: ALL critical, and `upstream_green` most of all. The whole point of that
+    # step is to stop the run when the adopted project cannot boot; a version of it that could
+    # be skipped would be a version that lets twelve features be built on top of a dead app.
+    "import_upstream", "adopt_checkout", "fit_contract", "upstream_green", "provenance",
 })
 _FEATURE_RE = re.compile(r"^build_\d+")
 

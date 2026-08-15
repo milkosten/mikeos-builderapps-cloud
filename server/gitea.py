@@ -150,6 +150,44 @@ async def create_project_repo(gitea_user: str, shortid: str) -> dict:
             "default_branch": info.get("default_branch") or "main"}
 
 
+async def create_empty_repo(gitea_user: str, shortid: str) -> dict:
+    """Phase 35 — an EMPTY `app-<shortid>` for the adopt-&-extend path.
+
+    Deliberately not `create_project_repo`: that generates from the Node template, and pushing
+    an upstream project's history into a repo that already has an unrelated initial commit
+    means either a force-push over it or a merge of two unrelated histories. Neither leaves a
+    log a human can read. An empty repo takes the imported history verbatim, so
+    `git log --reverse` in the user's Gitea starts at the upstream author's first commit —
+    which is the point of importing rather than copying.
+
+    Idempotent, and verified by a follow-up GET like everything else here.
+    """
+    repo_name = f"app-{shortid}"
+    body = {"name": repo_name, "private": True, "auto_init": False,
+            "default_branch": "main",
+            "description": f"builderapps project {shortid} (adopted from open source)"}
+    headers = {**_admin_headers(), "Sudo": gitea_user}
+    async with httpx.AsyncClient(timeout=60.0) as c:
+        r = await c.post(f"{GITEA_API}/user/repos", headers=headers, json=body)
+        if r.status_code not in (201, 200):
+            txt = r.text.lower()
+            if r.status_code == 409 or "exist" in txt:
+                logger.info("repo %s/%s already exists", gitea_user, repo_name)
+            else:
+                raise RuntimeError(
+                    f"gitea create empty repo failed HTTP {r.status_code}: {r.text[:300]}")
+        rr = await c.get(f"{GITEA_API}/repos/{gitea_user}/{repo_name}",
+                         headers=_admin_headers())
+        if rr.status_code != 200:
+            raise RuntimeError(f"repo {gitea_user}/{repo_name} not present after create")
+        info = rr.json()
+    return {"owner": gitea_user, "repo": repo_name,
+            "full_name": info.get("full_name"),
+            "clone_url": info.get("clone_url"),
+            "empty": bool(info.get("empty")),
+            "default_branch": info.get("default_branch") or "main"}
+
+
 def clone_url_for(gitea_user: str, repo: str, token: str) -> str:
     """Token-over-HTTPS clone URL (no SSH). Token is URL-safe already."""
     base = GITEA_URL.split("://", 1)[-1]

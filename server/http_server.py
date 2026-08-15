@@ -283,6 +283,20 @@ async def create_project(body: CreateBody, request: Request):
         # the product after the persona it imagined. Here it has been told.
         title_hint = discuss.field(disc.get("canvas") or {}, "name") or body.title
 
+    # PHASE 35 — the ADOPT & EXTEND branch. When the discussion carried a prior-art proposal
+    # and the user ACCEPTED it, this build does not start from the Node template: it starts
+    # from that open-source project, imported into their own Gitea with its history, its
+    # licence and a NOTICE, deployed unmodified and proved green BEFORE any feature work.
+    #
+    # The candidate is read from the DISCUSSION ROW, never from the request body. It carries a
+    # URL that is about to be cloned onto this box, so it may only come from a document the
+    # server itself wrote; taking a repo URL from a browser would be a clone-anything endpoint.
+    adopt_candidate = None
+    if disc:
+        pa = disc.get("prior_art") or {}
+        if pa.get("status") == "accepted" and (pa.get("candidate") or {}).get("url"):
+            adopt_candidate = pa["candidate"]
+
     shortid = await store.alloc_shortid()
     gitea_user = gitea.gitea_username_for(user_id)
     repo_name = f"app-{shortid}"
@@ -295,7 +309,7 @@ async def create_project(body: CreateBody, request: Request):
     await store.create_project(
         id=shortid, user_id=user_id, gitea_owner=gitea_user, gitea_repo=repo_name,
         subdomain=f"{shortid}.{SITES_BASE}", title=title, prompt=prompt,
-        status="creating", pipeline="create",
+        status="creating", pipeline=("adopt" if adopt_candidate else "create"),
     )
     if disc:
         try:
@@ -310,6 +324,21 @@ async def create_project(body: CreateBody, request: Request):
                     cost_usd=float(disc["cost_usd"]), cost_estimated=False)
         except Exception:  # noqa: BLE001 — bookkeeping must never fail a build
             logger.exception("linking discussion %s to %s failed", disc.get("id"), shortid)
+    if adopt_candidate:
+        run_id = await store.create_run(shortid, "adopt", prompt, total_steps=9)
+        emit = runner.emitter(run_id)
+        await runner.start(
+            run_id, shortid,
+            lambda: pipeline.run_adopt(shortid, run_id, user_id, email, adopt_candidate,
+                                       emit, discussion_id=(disc or {}).get("id") or ""))
+        logger.info("project %s adopts %s (%s)", shortid,
+                    adopt_candidate.get("full_name"),
+                    (adopt_candidate.get("licence") or {}).get("spdx"))
+        return _observe(run_id, head={"type": "created", "id": shortid,
+                                      "url": f"https://{shortid}.{SITES_BASE}/",
+                                      "run_id": run_id,
+                                      "adopted": adopt_candidate.get("full_name")})
+
     run_id = await store.create_run(shortid, "create", prompt, total_steps=7)
 
     emit = runner.emitter(run_id)
