@@ -89,8 +89,34 @@ def get_usage_sink():
     return _usage_sink
 
 
+def _report_tokens(usage: Optional[Dict[str, Any]], model: Optional[str] = None) -> None:
+    """Best-effort: report this LLM call's tokens to telemetry-api (grafana.osmike.com).
+
+    Never raises — telemetry must never break a build. Accepts either an OpenAI-style
+    usage block (prompt_tokens/completion_tokens — OpenRouter, Ollama) or an
+    Anthropic-style one (input_tokens/output_tokens — server.claude), mapping both to
+    input_tokens/output_tokens."""
+    key = os.environ.get("SVC_TELEMETRY_KEY")
+    if not key or not usage:
+        return
+    try:
+        input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        httpx.post(
+            "https://telemetry-api.osmike.com/v1/ingest",
+            headers={"X-API-KEY": key, "Content-Type": "application/json"},
+            json={"source_type": "service", "source_id": "builderapps", "box": "242",
+                  "model": model or LLM_MODEL,
+                  "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}},
+            timeout=5,
+        )
+    except Exception:  # noqa: BLE001 — telemetry is best-effort
+        pass
+
+
 def _report_usage(usage: Dict[str, Any], model: str) -> Dict[str, Any]:
     """Normalise a provider usage block, cost it, and hand it to the sink."""
+    _report_tokens(usage, model)  # fleet telemetry (grafana.osmike.com), best-effort
     try:
         prompt = int(usage.get("prompt_tokens") or 0)
         completion = int(usage.get("completion_tokens") or 0)

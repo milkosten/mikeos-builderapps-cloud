@@ -43,6 +43,8 @@ services:
       # OpenRouter (Kimi) — AUTHORIZED for builderapps. Key lives in .env on the host only.
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       BUILDERAPPS_LLM_MODEL: ${BUILDERAPPS_LLM_MODEL:-moonshotai/kimi-k3}
+      # fleet LLM-token telemetry -> telemetry-api.osmike.com (grafana.osmike.com). Value in .env.
+      SVC_TELEMETRY_KEY: ${SVC_TELEMETRY_KEY:-}
       CHROME_POOL_URL: ${CHROME_POOL_URL:-https://chrome-pool.osmike.com}
       CHROME_POOL_USER: ${CHROME_POOL_USER:-mikeos}
       CHROME_POOL_PASS: ${CHROME_POOL_PASS:-uB49VXwMDy7R2JE0H7mI}

@@ -124,6 +124,7 @@ def _account(model: str, usage: Dict[str, Any]) -> float:
     cost = (pt * pin + ct * pout) / 1_000_000.0
     rec = {"model": model, "prompt_tokens": pt, "completion_tokens": ct,
            "cached_tokens": cached, "cost_usd": round(cost, 6), "cost_estimated": True}
+    gpu._report_tokens(usage, model)  # fleet telemetry (grafana.osmike.com), best-effort
     try:
         sink = gpu.get_usage_sink()
         if sink:
