@@ -89,29 +89,45 @@ def get_usage_sink():
     return _usage_sink
 
 
-def _report_tokens(usage: Optional[Dict[str, Any]], model: Optional[str] = None) -> None:
-    """Best-effort: report this LLM call's tokens to telemetry-api (grafana.osmike.com).
+_telemetry_tasks: set = set()
 
-    Never raises — telemetry must never break a build. Accepts either an OpenAI-style
-    usage block (prompt_tokens/completion_tokens — OpenRouter, Ollama) or an
-    Anthropic-style one (input_tokens/output_tokens — server.claude), mapping both to
-    input_tokens/output_tokens."""
+
+def _report_tokens(usage: Optional[Dict[str, Any]], model: Optional[str] = None) -> None:
+    """Send provider counts without blocking the event loop or project attribution."""
     key = os.environ.get("SVC_TELEMETRY_KEY")
     if not key or not usage:
         return
     try:
-        input_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-        output_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-        httpx.post(
-            "https://telemetry-api.osmike.com/v1/ingest",
-            headers={"X-API-KEY": key, "Content-Type": "application/json"},
-            json={"source_type": "service", "source_id": "builderapps", "box": "242",
-                  "model": model or LLM_MODEL,
-                  "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}},
-            timeout=5,
-        )
-    except Exception:  # noqa: BLE001 — telemetry is best-effort
-        pass
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        completion_details = usage.get("completion_tokens_details") or {}
+        cached = int(prompt_details.get("cached_tokens") or
+                     usage.get("cache_read_input_tokens") or 0)
+        prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        if "input_tokens" in usage:  # Anthropic excludes cache reads/writes from input
+            prompt += cached + int(usage.get("cache_creation_input_tokens") or 0)
+        payload = {"source_type": "service", "source_id": "builderapps", "box": "242",
+                   "model": model or LLM_MODEL,
+                   "usage": {"input_tokens": prompt, "cached_input_tokens": cached,
+                             "output_tokens": int(usage.get("completion_tokens") or
+                                                  usage.get("output_tokens") or 0),
+                             "reasoning_output_tokens": int(completion_details.get("reasoning_tokens") or 0)}}
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_send_tokens(key, payload))
+        _telemetry_tasks.add(task)
+        task.add_done_callback(_telemetry_tasks.discard)
+    except Exception:
+        logger.debug("telemetry scheduling failed", exc_info=True)
+
+
+async def _send_tokens(key: str, payload: dict) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.post(
+                "https://telemetry-api.osmike.com/v1/ingest",
+                headers={"X-API-KEY": key}, json=payload)
+            response.raise_for_status()
+    except Exception:
+        logger.warning("token telemetry delivery failed", exc_info=True)
 
 
 def _report_usage(usage: Dict[str, Any], model: str) -> Dict[str, Any]:
@@ -159,7 +175,7 @@ async def _openrouter_chat(messages: List[Dict[str, Any]], schema: Optional[Dict
     """One OpenRouter (Kimi) call. Kimi-k3 is a reasoning model, so give generous
     max_tokens (reasoning tokens count toward the completion budget) — small steps like
     the classifier are bounded lower to save cost."""
-    or_max = 2000 if num_predict <= 1024 else max(int(num_predict), 12000)
+    or_max = max(1, int(num_predict))
     body: Dict[str, Any] = {
         "model": LLM_MODEL,
         "messages": messages,
@@ -300,6 +316,7 @@ async def _chat_impl(
                     continue
                 resp.raise_for_status()
                 data = resp.json()
+                _ollama_usage(data, model or TEXT_MODEL)
                 content = (data.get("message") or {}).get("content", "")
                 if not content.strip():
                     last_err = RuntimeError("GPU returned empty content")
@@ -355,7 +372,7 @@ async def _openrouter_tools(messages: List[Dict[str, Any]], tools: List[Dict[str
         "model": LLM_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max(int(num_predict), 4000),
+        "max_tokens": max(1, int(num_predict)),
         "tools": tools,
         "reasoning": {"enabled": False},
         "provider": {"sort": "throughput"},
@@ -388,6 +405,7 @@ async def _openrouter_tools(messages: List[Dict[str, Any]], tools: List[Dict[str
                 raise RuntimeError(str(data["error"]))
             choice = (data.get("choices") or [{}])[0] or {}
             msg = choice.get("message") or {}
+            accounted = _report_usage(data.get("usage") or {}, data.get("model") or LLM_MODEL)
             calls = _normalize_tool_calls(msg)
             content = msg.get("content") or ""
             # Empty content is NORMAL while the model is calling a tool — only a reply with
@@ -398,8 +416,7 @@ async def _openrouter_tools(messages: List[Dict[str, Any]], tools: List[Dict[str
                 continue
             return {"content": content, "tool_calls": calls,
                     "finish_reason": choice.get("finish_reason") or "", "raw": msg,
-                    "usage": _report_usage(data.get("usage") or {},
-                                           data.get("model") or LLM_MODEL)}
+                    "usage": accounted}
         except httpx.HTTPStatusError as e:
             last_err = e
             logger.warning("OpenRouter(tools) HTTP %s (attempt %d)",
@@ -437,6 +454,7 @@ async def _ollama_tools(messages: List[Dict[str, Any]], tools: List[Dict[str, An
                     continue
                 resp.raise_for_status()
                 data = resp.json()
+                accounted = _ollama_usage(data, TEXT_MODEL)
                 msg = data.get("message") or {}
                 calls = _normalize_tool_calls(msg)
                 content = msg.get("content") or ""
@@ -446,7 +464,7 @@ async def _ollama_tools(messages: List[Dict[str, Any]], tools: List[Dict[str, An
                     continue
                 return {"content": content, "tool_calls": calls,
                         "finish_reason": data.get("done_reason") or "", "raw": msg,
-                        "usage": {}}
+                        "usage": accounted}
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 logger.warning("GPU tool call failed (attempt %d): %s", attempt + 1, e)
@@ -509,13 +527,15 @@ def assistant_tool_message(reply: Dict[str, Any]) -> Dict[str, Any]:
 async def _openrouter_stream(messages: List[Dict[str, Any]], temperature: float,
                              num_predict: int, timeout: float) -> AsyncIterator[str]:
     """Stream content deltas from OpenRouter (Kimi). Yields text chunks as they arrive."""
-    or_max = 2000 if num_predict <= 1024 else max(int(num_predict), 12000)
+    or_max = max(1, int(num_predict))
     body: Dict[str, Any] = {
         "model": LLM_MODEL,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": or_max,
         "stream": True,
+        "stream_options": {"include_usage": True},
+        "usage": {"include": True},
         "reasoning": {"enabled": False},
         "provider": {"sort": "throughput"},
     }
@@ -540,6 +560,8 @@ async def _openrouter_stream(messages: List[Dict[str, Any]], temperature: float,
                     continue
                 if data.get("error"):
                     raise RuntimeError(str(data["error"]))
+                if data.get("usage"):
+                    _report_usage(data["usage"], data.get("model") or LLM_MODEL)
                 delta = (((data.get("choices") or [{}])[0] or {}).get("delta") or {})
                 chunk = delta.get("content")
                 if chunk:
@@ -582,6 +604,7 @@ async def _ollama_stream(messages: List[Dict[str, Any]], temperature: float,
                     if chunk:
                         yield chunk
                     if data.get("done"):
+                        _ollama_usage(data, TEXT_MODEL)
                         break
 
 
@@ -604,3 +627,8 @@ async def stream_chat(
         async for chunk in _ollama_stream(messages, temperature, num_ctx, num_predict,
                                           timeout, keep_alive):
             yield chunk
+
+
+def _ollama_usage(data: dict, model: str) -> dict:
+    return _report_usage({"prompt_tokens": data.get("prompt_eval_count", 0),
+                          "completion_tokens": data.get("eval_count", 0), "cost": 0}, model)

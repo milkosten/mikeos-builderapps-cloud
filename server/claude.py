@@ -173,12 +173,12 @@ async def judge(system: str, user: str, *, max_tokens: int = 1500,
         except Exception as e:  # noqa: BLE001
             last = f"{model}: unparseable ({e})"
             continue
+        cost = _account(model, data.get("usage") or {})
         if not text.strip():
             # A refusal or an empty completion is not something to dress up as an answer.
             last = f"{model}: empty completion (stop_reason={data.get('stop_reason')})"
             logger.info("anthropic %s returned nothing: %s", model, last)
             continue
-        cost = _account(model, data.get("usage") or {})
         return {"text": text, "model": model, "cost_usd": cost}
     logger.info("anthropic unavailable, falling back to the default model (%s)", last)
     return None
