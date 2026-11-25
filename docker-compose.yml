@@ -45,6 +45,12 @@ services:
       # mounted into this control plane. Legacy backends (openrouter/ollama) only if their own
       # credential env is set again.
       BUILDERAPPS_LLM_BACKEND: ${BUILDERAPPS_LLM_BACKEND:-codex}
+      # 2026-11-25: the runner jail gets a DUMMY login (this host dir) and talks to
+      # osmike-codex-proxy (172.17.0.1:8780), which holds the real tokens. Empty = old mounts.
+      # CODEX_PROXY_FALLBACK=1: use the old mounts if the proxy is not healthy.
+      CODEX_PROXY_HOME: ${CODEX_PROXY_HOME:-/opt/osmike-codex/clients/builderapps}
+      CODEX_PROXY_URL: ${CODEX_PROXY_URL:-http://172.17.0.1:8780}
+      CODEX_PROXY_FALLBACK: ${CODEX_PROXY_FALLBACK:-1}
       # fleet LLM-token telemetry -> telemetry-api.osmike.com (grafana.osmike.com). Value in .env.
       SVC_TELEMETRY_KEY: ${SVC_TELEMETRY_KEY:-}
       CHROME_POOL_URL: ${CHROME_POOL_URL:-https://chrome-pool.osmike.com}

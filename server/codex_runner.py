@@ -8,7 +8,13 @@ The jail (`osmike-codex-runner:latest`, built from /opt/osmike-codex-runner on 2
     fleet `codex-failover` wrapper: a usage-limit answer reruns the prompt on the other ChatGPT
     account, and the account that works stays sticky). The wrapper itself is in the image too,
     but it buffers all output until the run ends, which would kill live streaming in the UIs.
-  * The two ChatGPT logins are bind-mounted RW (token refresh rewrites auth.json):
+  * Tokens: since 2026-11-25 the jail holds NO real ChatGPT token. It mounts a dummy CODEX_HOME
+    (CODEX_PROXY_HOME, e.g. /opt/osmike-codex/clients/<service>: auth.json with a per-service
+    proxy key, config.toml pointing openai_base_url at osmike-codex-proxy on 172.17.0.1:8780).
+    The proxy holds the two logins, injects the real token, refreshes it and does the A->B
+    switch on a usage limit (osmike-cli/codex-proxy). Fallback (CODEX_PROXY_FALLBACK=1, the
+    default for now): if the proxy is not healthy, the old way below is used.
+  * Old way (no CODEX_PROXY_HOME, or proxy down): the two ChatGPT logins are bind-mounted RW
     /opt/osmike-codex/a -> /root/.codex-osmike, /opt/osmike-codex/b -> /root/.codex-westisland.
   * ONLY the one workspace the run is about is mounted (at /work, read-only when asked). No docker
     socket, no service env, no database, default bridge network, all capabilities dropped.
@@ -22,6 +28,7 @@ import json
 import logging
 import os
 import threading
+import time
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -37,6 +44,33 @@ MAX_PARALLEL = int(os.environ.get("CODEX_MAX_PARALLEL", "3"))
 MEMORY = os.environ.get("CODEX_RUNNER_MEMORY", "2g")
 CPUS = os.environ.get("CODEX_RUNNER_CPUS", "2")
 SOURCE_ID = os.environ.get("CODEX_TELEMETRY_SOURCE", "codex-service")
+PROXY_HOME = os.environ.get("CODEX_PROXY_HOME", "")          # host path of the dummy CODEX_HOME
+PROXY_URL = os.environ.get("CODEX_PROXY_URL", "http://172.17.0.1:8780").rstrip("/")
+PROXY_FALLBACK = os.environ.get("CODEX_PROXY_FALLBACK", "1") == "1"
+_proxy_ok_until = 0.0
+
+
+def _use_proxy() -> bool:
+    """Proxy mode when configured and healthy (health cached 30 s). Without the fallback the
+    proxy is used even when it looks down, so a run fails instead of touching real tokens."""
+    global _proxy_ok_until
+    if not PROXY_HOME:
+        return False
+    if not PROXY_FALLBACK:
+        return True
+    now = time.monotonic()
+    if now < _proxy_ok_until:
+        return True
+    try:
+        with urllib.request.urlopen(PROXY_URL + "/healthz", timeout=3) as r:
+            ok = r.status == 200 and json.loads(r.read()).get("ok")
+    except Exception:  # noqa: BLE001
+        ok = False
+    if ok:
+        _proxy_ok_until = now + 30
+        return True
+    logger.error("osmike-codex-proxy at %s not healthy; falling back to mounted logins", PROXY_URL)
+    return False
 
 _sem: Optional[asyncio.Semaphore] = None
 
@@ -88,6 +122,7 @@ def _report_tokens(usage: Dict[str, int], source_id: str) -> None:
 
 
 HOMES = ["/root/.codex-osmike", "/root/.codex-westisland"]  # account A, account B
+PROXY_JAIL_HOME = "/root/.codex"  # the dummy CODEX_HOME inside the jail (proxy mode)
 _current = 0  # sticky: index into HOMES of the account that last worked
 _LIMIT_WORDS = ("usage limit", "hit your usage")
 
@@ -97,10 +132,15 @@ def _docker_argv(name: str, home: str, workdir: Optional[str], readonly: bool,
     argv = ["docker", "run", "--rm", "-i", "--name", name, "-e", f"CODEX_HOME={home}",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--memory", MEMORY, "--cpus", CPUS, "--pids-limit", "512",
-            "--label", "osmike.role=codex-run",
-            "-v", f"{AUTH_A}:/root/.codex-osmike",
-            "-v", f"{AUTH_B}:/root/.codex-westisland",
-            "-v", f"{STATE_DIR}:/data"]
+            "--label", "osmike.role=codex-run"]
+    if home == PROXY_JAIL_HOME:
+        # dummy login only; the proxy adds the real token outside the jail
+        argv += ["-v", f"{PROXY_HOME}:{PROXY_JAIL_HOME}",
+                 "-e", f"CODEX_REFRESH_TOKEN_URL_OVERRIDE={PROXY_URL}/oauth/token"]
+    else:
+        argv += ["-v", f"{AUTH_A}:/root/.codex-osmike",
+                 "-v", f"{AUTH_B}:/root/.codex-westisland",
+                 "-v", f"{STATE_DIR}:/data"]
     if workdir:
         argv += ["-v", f"{workdir}:/work" + (":ro" if readonly else "")]
     codex = ["exec", "--json", "--ephemeral", "--dangerously-bypass-approvals-and-sandbox",
@@ -137,6 +177,12 @@ async def run(prompt: str, *, workdir: Optional[str] = None, readonly: bool = Fa
     item (agent_message, command_execution, file_change, ...). Never raises on a model failure:
     check `result.ok` / `result.error`."""
     global _current
+    if await asyncio.to_thread(_use_proxy):
+        async with _semaphore():
+            res = await _run_once(PROXY_JAIL_HOME, prompt, workdir, readonly, timeout, effort,
+                                  schema, on_event)
+        _report_tokens(res.usage, source_id or SOURCE_ID)
+        return res
     async with _semaphore():
         first = _current
         res = await _run_once(HOMES[first], prompt, workdir, readonly, timeout, effort, schema,
