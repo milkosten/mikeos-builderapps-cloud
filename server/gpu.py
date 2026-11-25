@@ -1,15 +1,14 @@
 """LLM client for the designer harness.
 
-Two backends, chosen at runtime:
+Backend chosen by `BUILDERAPPS_LLM_BACKEND` (2026-11-25):
 
-* **OpenRouter (preferred when `OPENROUTER_API_KEY` is set)** — used for the *designer
-  project only*. Routes to `BUILDERAPPS_LLM_MODEL` (default `moonshotai/kimi-k3`, a strong
-  reasoning model with a 1M context) via the OpenAI-compatible chat/completions API.
-* **Ollama fallback** — the shared free `qwen3:8b` at `OLLAMA_GPU_URL` (self-signed,
-  HTTP-Basic, `think:false`, serialized to one in-flight call).
+* **codex (default)** — Codex on Mike's flat-rate ChatGPT plan (`server/codex_llm.py`), one
+  stateless `codex exec` per call in a throwaway jail container. Mike's standing rule: flat-rate
+  subscriptions only (Codex / ZAI), never a pay-per-request key.
+* `openrouter` — LEGACY per-token OpenRouter (Kimi); only if `OPENROUTER_API_KEY` is set.
+* `ollama` — LEGACY self-hosted Ollama at `OLLAMA_GPU_URL`; only if that is set.
 
-`chat()` has the same signature for both, so the rest of the harness is unchanged.
-The OpenRouter key is scoped to this service's env only — never committed, never shared.
+`chat()`, `chat_tools()` and `stream_chat()` keep their signatures, so the harness is unchanged.
 """
 import asyncio
 import base64
@@ -23,23 +22,35 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # --- OpenRouter (Kimi) -----------------------------------------------------
+from server import codex_llm
+
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 LLM_MODEL = os.environ.get("BUILDERAPPS_LLM_MODEL", "moonshotai/kimi-k3").strip()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # --- Ollama fallback -------------------------------------------------------
-OLLAMA_GPU_URL = os.environ.get(
-    "OLLAMA_GPU_URL",
-    "ollama://mikeos:uB49VXwMDy7R2JE0H7mI@81.8.177.182:11443",
-)
+OLLAMA_GPU_URL = os.environ.get("OLLAMA_GPU_URL", "").strip()  # legacy; no built-in default
 TEXT_MODEL = os.environ.get("OLLAMA_TEXT_MODEL", "qwen3:8b")
 
 # Only ONE shared-GPU request in flight at a time (Ollama path only).
 _gpu_sem = asyncio.Semaphore(1)
 
 
+BACKEND = os.environ.get("BUILDERAPPS_LLM_BACKEND", "codex").strip().lower()
+if BACKEND == "openrouter" and not OPENROUTER_API_KEY:
+    BACKEND = "codex"
+if BACKEND == "ollama" and not OLLAMA_GPU_URL:
+    BACKEND = "codex"
+if BACKEND == "codex":
+    LLM_MODEL = codex_llm.MODEL_LABEL  # what the UI names as "the model that wrote it"
+
+
 def backend() -> str:
-    return f"openrouter:{LLM_MODEL}" if OPENROUTER_API_KEY else f"ollama:{TEXT_MODEL}"
+    if BACKEND == "openrouter":
+        return f"openrouter:{LLM_MODEL}"
+    if BACKEND == "ollama":
+        return f"ollama:{TEXT_MODEL}"
+    return "codex:chatgpt-plan"
 
 
 def _endpoint() -> tuple[str, Dict[str, str]]:
@@ -130,9 +141,10 @@ async def _send_tokens(key: str, payload: dict) -> None:
         logger.warning("token telemetry delivery failed", exc_info=True)
 
 
-def _report_usage(usage: Dict[str, Any], model: str) -> Dict[str, Any]:
+def _report_usage(usage: Dict[str, Any], model: str, telemetry: bool = True) -> Dict[str, Any]:
     """Normalise a provider usage block, cost it, and hand it to the sink."""
-    _report_tokens(usage, model)  # fleet telemetry (grafana.osmike.com), best-effort
+    if telemetry:  # codex_runner reports its own runs to fleet telemetry
+        _report_tokens(usage, model)  # fleet telemetry (grafana.osmike.com), best-effort
     try:
         prompt = int(usage.get("prompt_tokens") or 0)
         completion = int(usage.get("completion_tokens") or 0)
@@ -282,8 +294,12 @@ async def _chat_impl(
     max_retries: int = 4,
 ) -> str:
     """`schema` requests JSON output (plan/classify steps). Returns the assistant message
-    content. Routes to OpenRouter/Kimi when configured, else Ollama."""
-    if OPENROUTER_API_KEY:
+    content. Routes to Codex (default), or the legacy OpenRouter / Ollama backends."""
+    if BACKEND == "codex":
+        r = await codex_llm.text(messages, schema=schema, timeout=timeout)
+        _report_usage(r["usage"], codex_llm.MODEL_LABEL, telemetry=False)
+        return r["content"]
+    if BACKEND == "openrouter":
         return await _openrouter_chat(messages, schema, temperature, num_predict,
                                       timeout, max_retries)
 
@@ -489,9 +505,15 @@ async def chat_tools(
     never wedge the run. The caller feeds each result back as a `role:"tool"` message and
     calls this again — the loop, its budget and its transcript live in the harness.
     """
+    if BACKEND == "codex":
+        reply = await asyncio.wait_for(
+            codex_llm.tool_turn(messages, tools, tool_choice=tool_choice, timeout=timeout),
+            timeout=_deadline(timeout))
+        reply["usage"] = _report_usage(reply["usage"], codex_llm.MODEL_LABEL, telemetry=False)
+        return reply
     impl = (_openrouter_tools(messages, tools, temperature, num_predict, timeout,
                               max_retries, tool_choice)
-            if OPENROUTER_API_KEY else
+            if BACKEND == "openrouter" else
             _ollama_tools(messages, tools, temperature, num_ctx, num_predict,
                           timeout, max_retries))
     return await asyncio.wait_for(impl, timeout=_deadline(timeout))
@@ -618,9 +640,16 @@ async def stream_chat(
     keep_alive: str = "30m",
 ) -> AsyncIterator[str]:
     """Stream a chat completion, yielding content deltas as they arrive. Routes to
-    OpenRouter/Kimi when configured, else Ollama. On a stream error, callers should treat
-    the accumulated text as the (possibly partial) result — the harness re-sanitizes it."""
-    if OPENROUTER_API_KEY:
+    Codex by default (one chunk: a Codex run returns whole messages), or the legacy backends.
+    On a stream error, callers should treat the accumulated text as the (possibly partial)
+    result — the harness re-sanitizes it."""
+    if BACKEND == "codex":
+        r = await codex_llm.text(messages, timeout=timeout)
+        _report_usage(r["usage"], codex_llm.MODEL_LABEL, telemetry=False)
+        if r["content"]:
+            yield r["content"]
+        return
+    if BACKEND == "openrouter":
         async for chunk in _openrouter_stream(messages, temperature, num_predict, timeout):
             yield chunk
     else:

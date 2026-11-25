@@ -1,5 +1,8 @@
 """Claude (Anthropic), for the judgement calls that earn it — control plane only.
 
+DISABLED 2026-11-25: the token file is no longer mounted, so `judge()` returns None and every
+caller falls through to its default model, which is now Codex (Mike's flat-rate rule).
+
 ## Where the credential lives, and where it does not
 
 The token sits on the HOST at `/opt/builderapps/.anthropic-key` (0600, root), mounted

@@ -24,6 +24,14 @@ credential it already holds — its per-assistant `asst_…` token — and the p
     proxy stops answering with model output and returns a plain completion telling the agent
     to stop, which ends Pi's loop cleanly instead of crashing it mid-edit.
 
+## Codex (2026-11-25)
+
+The default backend is now Codex on Mike's flat-rate ChatGPT plan (`server.codex_llm`), not
+OpenRouter — Mike's rule is flat-rate subscriptions only. Each request becomes ONE Codex turn
+(tools emulated through a strict output schema, see `codex_llm.tool_turn`) and is answered in
+the OpenAI shape Pi expects, streamed or not. A flat rate costs nothing per call, so the per-beat
+backstop is a CALL cap (`ASSISTANT_BEAT_MAX_CALLS`) instead of the dollar cap.
+
 ## Streaming is not optional
 
 Pi's `openai-completions` client always sends `stream: true` with
@@ -58,6 +66,9 @@ REASONING = os.environ.get("ASSISTANT_LLM_REASONING", "0").strip() in ("1", "tru
 # is it. Generous enough for a real feature, small enough that a runaway is a rounding error.
 BEAT_COST_CAP = float(os.environ.get("ASSISTANT_BEAT_COST_CAP_USD", "1.50"))
 REQUEST_TIMEOUT = float(os.environ.get("ASSISTANT_LLM_TIMEOUT_SEC", "600"))
+# Codex backend: the backstop is a number of model calls per beat (a flat rate has no $ cost).
+BEAT_MAX_CALLS = int(os.environ.get("ASSISTANT_BEAT_MAX_CALLS", "80"))
+_beat_calls: dict[int, int] = {}
 
 # beat_id -> USD spent through this proxy. In-memory on purpose: the control plane is a
 # single process (one uvicorn worker, see the Dockerfile) and a beat lives for minutes, so
@@ -77,6 +88,7 @@ def forget_beat(beat_id: Optional[int]) -> float:
     """Read the beat's proxy spend and drop the counter. Called once the beat is recorded."""
     if beat_id is None:
         return 0.0
+    _beat_calls.pop(int(beat_id), None)
     return round(_beat_cost.pop(int(beat_id), 0.0), 6)
 
 
@@ -133,7 +145,8 @@ def _stop_stream(model: str, text: str):
 async def list_models(authorization: str = Header("")) -> dict:
     await _assistant_from_auth(authorization)
     return {"object": "list",
-            "data": [{"id": "kimi-k3", "object": "model", "owned_by": "builderapps"}]}
+            "data": [{"id": "codex" if gpu.BACKEND == "codex" else "kimi-k3",
+                      "object": "model", "owned_by": "builderapps"}]}
 
 
 @router.post("/api/assistant/llm/v1/chat/completions",
@@ -168,6 +181,9 @@ async def chat_completions(request: Request, authorization: str = Header(""),
                 f"finish your turn now.")
         return (_stop_stream(PINNED_MODEL, text) if body.get("stream")
                 else _stop_completion(PINNED_MODEL, text))
+
+    if gpu.BACKEND == "codex":
+        return await _codex_completion(body, aid, project_id, beat_id)
 
     if not gpu.OPENROUTER_API_KEY:
         raise HTTPException(status_code=503,
@@ -252,3 +268,105 @@ async def chat_completions(request: Request, authorization: str = Header(""),
     return StreamingResponse(relay(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------------------
+# Codex backend (default since 2026-11-25)
+# ---------------------------------------------------------------------------
+CODEX_MODEL = "codex"
+
+
+async def _codex_completion(body: dict, aid: int, project_id: str, beat_id: Optional[int]):
+    import asyncio
+    import time
+    import uuid as _uuid
+
+    if beat_id is not None:
+        n = _beat_calls.get(beat_id, 0) + 1
+        _beat_calls[beat_id] = n
+        if len(_beat_calls) > _MAX_TRACKED:
+            for old in list(_beat_calls)[: len(_beat_calls) - _MAX_TRACKED]:
+                _beat_calls.pop(old, None)
+        if n > BEAT_MAX_CALLS:
+            logger.warning("assistant %s beat %s hit the %d-call cap — stopping it",
+                           aid, beat_id, BEAT_MAX_CALLS)
+            text = (f"STOP. This beat has made {n - 1} model calls, which is its limit of "
+                    f"{BEAT_MAX_CALLS}. Do not call any more tools. Summarise what you changed "
+                    f"so far and finish your turn now.")
+            return (_stop_stream(CODEX_MODEL, text) if body.get("stream")
+                    else _stop_completion(CODEX_MODEL, text))
+
+    messages = body["messages"]
+    tools = body.get("tools") or []
+
+    async def call() -> dict:
+        usage.set_context(project_id, None, f"assistant:{aid}")
+        try:
+            if tools:
+                return await gpu.chat_tools(messages, tools, tool_choice=body.get("tool_choice"),
+                                            timeout=REQUEST_TIMEOUT)
+            text = await gpu.chat(messages, timeout=REQUEST_TIMEOUT)
+            return {"content": text, "tool_calls": [], "finish_reason": "stop", "usage": {}}
+        finally:
+            usage.clear_context()
+
+    cid = f"chatcmpl-{_uuid.uuid4().hex[:20]}"
+    created = int(time.time())
+
+    def shape_usage(reply: dict) -> dict:
+        u = reply.get("usage") or {}
+        pt, ct = int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
+        return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+
+    def tool_calls_out(reply: dict) -> list:
+        return [{"id": c["id"], "type": "function",
+                 "function": {"name": c["name"],
+                              "arguments": c["arguments"] if isinstance(c["arguments"], str)
+                              else json.dumps(c["arguments"])}}
+                for c in reply.get("tool_calls") or []]
+
+    if not body.get("stream"):
+        try:
+            reply = await call()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("codex completion failed for assistant %s: %s", aid, e)
+            raise HTTPException(status_code=502, detail=f"model call failed: {str(e)[:300]}")
+        msg: dict = {"role": "assistant", "content": reply.get("content") or ""}
+        tcs = tool_calls_out(reply)
+        if tcs:
+            msg["tool_calls"] = tcs
+        return {"id": cid, "object": "chat.completion", "created": created, "model": CODEX_MODEL,
+                "choices": [{"index": 0, "message": msg,
+                             "finish_reason": "tool_calls" if tcs else "stop"}],
+                "usage": shape_usage(reply)}
+
+    async def gen():
+        task = asyncio.create_task(call())
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=10)
+            if not done:
+                yield b": keepalive\n\n"  # SSE comment; clients ignore it
+        try:
+            reply = task.result()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("codex stream failed for assistant %s: %s", aid, e)
+            yield _sse({"error": {"message": f"model call failed: {str(e)[:300]}", "code": 502}})
+            yield b"data: [DONE]\n\n"
+            return
+        base = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                "model": CODEX_MODEL}
+        delta: dict = {"role": "assistant", "content": reply.get("content") or ""}
+        yield _sse({**base, "choices": [{"index": 0, "delta": delta}]})
+        tcs = tool_calls_out(reply)
+        for i, tc in enumerate(tcs):
+            yield _sse({**base, "choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": i, "id": tc["id"], "type": "function",
+                 "function": {"name": tc["function"]["name"],
+                              "arguments": tc["function"]["arguments"]}}]}}]})
+        yield _sse({**base, "choices": [{"index": 0, "delta": {},
+                                         "finish_reason": "tool_calls" if tcs else "stop"}],
+                    "usage": shape_usage(reply)})
+        yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

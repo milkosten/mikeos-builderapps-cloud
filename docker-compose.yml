@@ -39,15 +39,17 @@ services:
       GITEA_ADMIN_USER: ${GITEA_ADMIN_USER}
       GITEA_ADMIN_TOKEN: ${GITEA_ADMIN_TOKEN}
       GITEA_ADMIN_PW: ${GITEA_ADMIN_PW}
-      OLLAMA_GPU_URL: ${OLLAMA_GPU_URL:-ollama://mikeos:uB49VXwMDy7R2JE0H7mI@81.8.177.182:11443}
-      # OpenRouter (Kimi) — AUTHORIZED for builderapps. Key lives in .env on the host only.
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      BUILDERAPPS_LLM_MODEL: ${BUILDERAPPS_LLM_MODEL:-moonshotai/kimi-k3}
+      # LLM = Codex on Mike's flat-rate ChatGPT plan (2026-11-25; Mike's rule: flat-rate only,
+      # never pay-per-request). Every call is a throwaway `osmike-codex-runner` container started
+      # on the host daemon; the ChatGPT logins live in /opt/osmike-codex on the HOST and are never
+      # mounted into this control plane. Legacy backends (openrouter/ollama) only if their own
+      # credential env is set again.
+      BUILDERAPPS_LLM_BACKEND: ${BUILDERAPPS_LLM_BACKEND:-codex}
       # fleet LLM-token telemetry -> telemetry-api.osmike.com (grafana.osmike.com). Value in .env.
       SVC_TELEMETRY_KEY: ${SVC_TELEMETRY_KEY:-}
       CHROME_POOL_URL: ${CHROME_POOL_URL:-https://chrome-pool.osmike.com}
       CHROME_POOL_USER: ${CHROME_POOL_USER:-mikeos}
-      CHROME_POOL_PASS: ${CHROME_POOL_PASS:-uB49VXwMDy7R2JE0H7mI}
+      CHROME_POOL_PASS: ${CHROME_POOL_PASS:-}
       MIKEOSCOMPUTERS_URL: ${MIKEOSCOMPUTERS_URL:-https://account.osmike.com}
       ACCOUNT_OSMIKE_ISSUER: ${ACCOUNT_OSMIKE_ISSUER:-https://account.osmike.com}
       SECRETS_KEY: ${SECRETS_KEY}
@@ -113,11 +115,8 @@ services:
       # HOST path. On /data (the 117 TB array) because these are other people's repositories:
       # bulk, not latency-sensitive, and the NVMe root is the tier that is actually scarce.
       - /data/builderapps/discuss:/data/builderapps/discuss
-      # phase 35: the Anthropic subscription OAuth token. READ-ONLY, and it goes exactly this
-      # far — the control plane reads it and talks to api.anthropic.com itself. It is never
-      # put in an image, never passed in a `docker run --env`, and never reaches the scout
-      # container, which is the one holding a stranger's source tree.
-      - /opt/builderapps/.anthropic-key:/opt/builderapps/.anthropic-key:ro
+      # (phase 35 mounted /opt/builderapps/.anthropic-key here for server/claude.py; removed
+      # 2026-11-25 — without it claude.judge() returns None and the caller uses Codex.)
     networks: [deploy_default]
     mem_limit: 1g
     cpus: 2
